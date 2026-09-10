@@ -72,6 +72,22 @@ class FakeDevice:
     def release_all(self): self.released = True
 
 
+class ActionDrivenDevice(FakeDevice):
+    """页面只随指定动作切换；重复截图、轮询和启动时的 home 不消耗页面。"""
+    def __init__(self, frames, transitions):
+        super().__init__(frames)
+        self._state = 0
+        self._transitions = transitions
+
+    def _next(self):
+        self._i += 1
+        return self._frames[self._state][0]
+
+    def _act(self, name, *args):
+        super()._act(name, *args)
+        self._state = self._transitions.get((self._state, name), self._state)
+
+
 _CAND_LIKE = re.compile(r"^\s*[1-9]\s*\S")
 
 
@@ -112,6 +128,39 @@ def fake_env():
         frames = [frame_with_text(t, i + 1) for i, t in enumerate(frame_specs)]
         return FakeDevice(frames), perceiver_for(frames), frames
     return make
+
+
+@pytest.fixture
+def action_env():
+    """用于验证动作结果的状态机；保留原 fake_env 给需要逐帧动画的测试。"""
+    def make(frame_specs, transitions):
+        frames = [frame_with_text(t, i + 1) for i, t in enumerate(frame_specs)]
+        return ActionDrivenDevice(frames, transitions), perceiver_for(frames), frames
+    return make
+
+
+@pytest.fixture
+def settle_clock(monkeypatch, request):
+    """只替换 settle 模块的时钟，可模拟轮询超时唤醒，不改全局 time 或真实睡眠。"""
+    import iphone_agent.harness.settle as settle_mod
+
+    class Clock:
+        now_ms = 1000
+        overshoot_ms = request.param
+        polls = 0
+
+        def time(self):
+            return self.now_ms / 1000
+
+        def sleep(self, seconds):
+            self.now_ms += round(seconds * 1000)
+            if seconds > 0:
+                self.now_ms += self.overshoot_ms
+                self.polls += 1
+
+    clock = Clock()
+    monkeypatch.setattr(settle_mod, "time", clock)
+    return clock
 
 
 @pytest.fixture(autouse=True)

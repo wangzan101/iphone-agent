@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from iphone_agent.driver.injector import ActivateFailed
 from iphone_agent.harness.actions import Action
 from iphone_agent.harness.loop import run_task
@@ -554,14 +556,43 @@ def test_obs_parts_逐字符拼接结果与拆分前相同(fake_env, tmp_path, m
     assert "\n\n".join(t for _, t in obs_parts) == elements + "\n\n" + where + "\n\n" + plan
 
 
-def test_a_success_that_did_reach_it_gets_no_note(fake_env, tmp_path):
-    _seed_map(tmp_path, ["通用", "关于本机", "软件更新"], ["关于本机", "iOS版本"])
-    r, dev, m = run(fake_env,
-                    [["通用", "关于本机", "软件更新"]] * 3 + [["关于本机", "iOS版本"]] * 4,
-                    [[("tap", {"id": 2})], [("done", {"status": "success", "result": "18.3.1"})]],
-                    tmp_path, task_text="进入「关于本机」读版本号")
+def _run_audit_scenario(action_env, tmp_path, *, reaches_target):
+    from iphone_agent.workspace import Workspace
+
+    source, target = ["通用", "关于本机", "软件更新"], ["关于本机", "iOS版本"]
+    _seed_map(tmp_path, source, target)
+    dev, per, _ = action_env([source, target], {(0, "tap"): 1} if reaches_target else {})
+    model = ScriptedModel([
+        [("tap", {"id": 2})],
+        [("done", {"status": "success", "result": "18.3.1"})],
+    ])
+    result = run_task("进入「关于本机」读版本号", dev, per, model, tmp_path,
+                      store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
+    assert result.end_reason == "done_success"
+    assert [name for name, *_ in dev.actions] == ["tap"]
+    observations = [[e["text"] for e in step["observation"]["elements"]]
+                    for step in RunLog.read_steps(result.run_dir)]
+    assert observations == [source, target if reaches_target else source]
+    return result
+
+
+@pytest.mark.parametrize("settle_clock", [0, 40], indirect=True, ids=["normal-poll", "slow-poll"])
+def test_a_success_that_did_reach_it_gets_no_note(action_env, tmp_path, settle_clock):
+    # 旧用例把页面切换绑定到截图次数，慢机器提前判稳时，实际上从未走到目标页。
+    # 按动作切页，且先验证日志确实记录了目标页，再验证审计结论。
+    r = _run_audit_scenario(action_env, tmp_path, reaches_target=True)
+    assert settle_clock.polls > 0
     meta = json.loads((r.run_dir / "run.json").read_text(encoding="utf-8"))
     assert "audit" not in meta or not meta["audit"].get("never_reached"), meta.get("audit")
+
+
+@pytest.mark.parametrize("settle_clock", [0, 40], indirect=True, ids=["normal-poll", "slow-poll"])
+def test_a_reported_success_that_stayed_on_source_still_gets_audit_note(action_env, tmp_path, settle_clock):
+    # 反例：点击没有切页时仍必须告警，不能为了消除 flaky test 放松审计。
+    r = _run_audit_scenario(action_env, tmp_path, reaches_target=False)
+    assert settle_clock.polls > 0
+    meta = json.loads((r.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert meta["audit"]["never_reached"] == ["关于本机"]
 
 
 def test_on_start_hands_over_the_run_dir_before_any_step(fake_env, tmp_path):

@@ -38,10 +38,10 @@ Explore the [animated product walkthrough on the website](https://iphone-agent.c
 A simple first task is:
 
 ```sh
-iphone run "打开设置，进通用，进关于本机，告诉我 iOS 版本号"
+iphone run "Open Settings, go to General > About, and tell me the iOS version."
 ```
 
-That asks the agent to open Settings → General → About and report the iOS version. The sequence below explains the intended loop; it is not a captured execution trace:
+The sequence below illustrates the intended loop; it is not a captured execution trace:
 
 ```text
 You:       Tell me the iOS version.
