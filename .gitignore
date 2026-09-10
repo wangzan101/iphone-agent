@@ -1,0 +1,17 @@
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.iphone/
+runs/
+.env
+.env.*
+!.env.example
+.DS_Store
+*_marked.png
+gate_*.json

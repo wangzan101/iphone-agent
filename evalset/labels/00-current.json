@@ -1,0 +1,209 @@
+{
+  "_provenance": "Synthetic fixture: invented app arrangement, regular geometry, no captured screenshot or personal data.",
+  "size": [
+    624,
+    1388
+  ],
+  "elements": [
+    {
+      "label": "相机",
+      "kind": "app",
+      "text_center": [
+        105,
+        290
+      ]
+    },
+    {
+      "label": "照片",
+      "kind": "app",
+      "text_center": [
+        243,
+        290
+      ]
+    },
+    {
+      "label": "时钟",
+      "kind": "app",
+      "text_center": [
+        381,
+        290
+      ]
+    },
+    {
+      "label": "天气",
+      "kind": "app",
+      "text_center": [
+        519,
+        290
+      ]
+    },
+    {
+      "label": "地图",
+      "kind": "app",
+      "text_center": [
+        105,
+        440
+      ]
+    },
+    {
+      "label": "音乐",
+      "kind": "app",
+      "text_center": [
+        243,
+        440
+      ]
+    },
+    {
+      "label": "邮件",
+      "kind": "app",
+      "text_center": [
+        381,
+        440
+      ]
+    },
+    {
+      "label": "文件",
+      "kind": "app",
+      "text_center": [
+        519,
+        440
+      ]
+    },
+    {
+      "label": "计算器",
+      "kind": "app",
+      "text_center": [
+        105,
+        592
+      ]
+    },
+    {
+      "label": "图书",
+      "kind": "app",
+      "text_center": [
+        243,
+        592
+      ]
+    },
+    {
+      "label": "播客",
+      "kind": "app",
+      "text_center": [
+        381,
+        592
+      ]
+    },
+    {
+      "label": "家庭",
+      "kind": "app",
+      "text_center": [
+        519,
+        592
+      ]
+    },
+    {
+      "label": "备忘录",
+      "kind": "app",
+      "text_center": [
+        105,
+        742
+      ]
+    },
+    {
+      "label": "提醒事项",
+      "kind": "app",
+      "text_center": [
+        243,
+        742
+      ]
+    },
+    {
+      "label": "快捷指令",
+      "kind": "app",
+      "text_center": [
+        381,
+        742
+      ]
+    },
+    {
+      "label": "健康",
+      "kind": "app",
+      "text_center": [
+        519,
+        742
+      ]
+    },
+    {
+      "label": "设置",
+      "kind": "app",
+      "text_center": [
+        105,
+        893
+      ]
+    },
+    {
+      "label": "通讯录",
+      "kind": "app",
+      "text_center": [
+        243,
+        893
+      ]
+    },
+    {
+      "label": "钱包",
+      "kind": "app",
+      "text_center": [
+        381,
+        893
+      ]
+    },
+    {
+      "label": "日历",
+      "kind": "app",
+      "text_center": [
+        519,
+        893
+      ]
+    },
+    {
+      "label": "示例应用甲",
+      "kind": "app",
+      "text_center": [
+        105,
+        1043
+      ]
+    },
+    {
+      "label": "示例应用乙",
+      "kind": "app",
+      "text_center": [
+        243,
+        1043
+      ]
+    },
+    {
+      "label": "示例应用丙",
+      "kind": "app",
+      "text_center": [
+        381,
+        1043
+      ]
+    },
+    {
+      "label": "Telegram",
+      "kind": "app",
+      "text_center": [
+        519,
+        1043
+      ]
+    },
+    {
+      "label": "搜索",
+      "kind": "button",
+      "center": [
+        312,
+        1150
+      ]
+    }
+  ]
+}

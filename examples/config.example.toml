@@ -1,0 +1,3 @@
+# Copy to .iphone/config.toml; supply your own provider key through its
+# environment variable or the local settings UI. No credential is embedded.
+model = "alibaba:qwen3.7-plus"

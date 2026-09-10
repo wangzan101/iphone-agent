@@ -1,0 +1,39 @@
+[
+  {
+    "content": "sys",
+    "role": "system"
+  },
+  {
+    "content": [
+      {
+        "text": "prefix-1",
+        "type": "text"
+      }
+    ],
+    "role": "user"
+  },
+  {
+    "content": [
+      {
+        "text": "prefix-2",
+        "type": "text"
+      }
+    ],
+    "role": "user"
+  },
+  {
+    "content": [
+      {
+        "text": "state text",
+        "type": "text"
+      },
+      {
+        "image_url": {
+          "url": "data:image/png;base64,imgS"
+        },
+        "type": "image_url"
+      }
+    ],
+    "role": "user"
+  }
+]

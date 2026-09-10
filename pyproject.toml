@@ -1,0 +1,73 @@
+[project]
+name = "iphone-agent"
+version = "0.0.1"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+description = "让 agent 操作你的 iPhone（macOS iPhone 镜像）"
+requires-python = ">=3.12"
+dependencies = [
+    "pypinyin",   # 中文→拼音；纯 Python、零传递依赖。汉字没有 keycode，只能驱动 iOS 输入法
+  "pyobjc-framework-Quartz>=10.3",
+  "pyobjc-framework-Vision>=10.3",
+  "pyobjc-framework-Cocoa>=10.3",
+  "pyobjc-framework-ApplicationServices>=10.3",
+  "openai>=1.40",
+  "Pillow>=10.0",
+]
+
+[project.urls]
+Homepage = "https://iphone-agent.com"
+Repository = "https://github.com/wangzan101/iphone-agent"
+Issues = "https://github.com/wangzan101/iphone-agent/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+repl = ["prompt_toolkit>=3.0", "rich>=13.0"]
+
+[project.scripts]
+iphone = "iphone_agent.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["iphone_agent*"]
+
+# 界面的静态资源必须随包走 —— `pip install` 之后 `iphone serve` 就该能打开，
+# 不能只在源码树里有。**没有构建步骤**：这些文件原样发出去（设计说明）。
+[tool.setuptools.package-data]
+iphone_agent = ["web/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error", "ignore:.*getdata.*:DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+# 只选真正有意义的：pyflakes（未用变量/导入、未定义名）、真语法错、import 排序、
+# bugbear（真 bug 模式）、pyupgrade、comprehension、simplify。
+#
+# ⚠ 不开 ALL。ruff 0.16 无配置时会把 788 条规则全打开，产出的数字没人看，
+#   而这个项目有些「违规」是**故意的、写了理由的**（比如宽捕获 BLE001 ——
+#   见 executor.py / recap.py 里的注释）。让 lint 干净成为一个有意义的信号，
+#   前提是它检查的东西这个项目真的认同。
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "C4", "SIM"]
+ignore = [
+  "E701", "E702",  # 紧凑单行（dev.key("home"); dev.release_all()）本项目一直这么写
+  "B008",          # 测试里拿 Rect() 当默认值，是不可变的，无副作用
+  "SIM105",        # contextlib.suppress 不比 try/except/pass 更清楚
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E402"]   # 脚本必须先 sys.path.insert 再 import 本包
+"tests/*" = ["E402"]     # 测试里在函数内 import 是刻意的（隔离、延迟加载）
+# 一次性探针与标定脚本：它们是**某条事实当初怎么验出来的**的证据，
+# 保留原样比让它们符合今天的风格更重要。清理零收益，还有改变原意的风险。
+"scripts/probe_*.py" = ["ALL"]
+"scripts/calibrate_*.py" = ["ALL"]
+"scripts/acceptance.py" = ["B023"]
+"scripts/spike_*.py" = ["ALL"]

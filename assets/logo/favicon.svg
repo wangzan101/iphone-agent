@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="iPhone Agent">
+  <rect width="64" height="64" rx="15" fill="#FAF8F3"/>
+  <path d="M28 22c-7-5-15-4-20 5-7 13 0 29 13 33 5 2 8 0 11-3 3 3 6 5 11 3 13-4 20-20 13-33-5-9-13-10-20-5" fill="none" stroke="#242426" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M32 21c0-4-1-7-3-10" fill="none" stroke="#242426" stroke-width="4.5" stroke-linecap="round"/>
+  <path fill="#242426" d="M35 17c3-5 8-8 14-7-1 6-6 9-14 7Z"/>
+</svg>

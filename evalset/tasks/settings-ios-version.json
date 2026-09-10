@@ -1,0 +1,29 @@
+{
+  "id": "settings-ios-version",
+  "prompt": "打开设置，进「通用」再进「关于本机」，告诉我 iOS 版本号",
+  "category": "readonly",
+  "strength": "strong",
+  "device_note": "Illustrative fixture only. Set the expected version and UI labels for your own phone before real-device evaluation.",
+  "checks": [
+    {
+      "type": "answer_contains",
+      "any_of": [
+        "18.3.1"
+      ]
+    },
+    {
+      "type": "screen_reached",
+      "texts": [
+        "关于本机",
+        "iOS 版本"
+      ]
+    },
+    {
+      "type": "action_not_taken",
+      "texts": [
+        "软件更新",
+        "更新到"
+      ]
+    }
+  ]
+}

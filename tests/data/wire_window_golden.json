@@ -1,0 +1,71 @@
+[
+  {
+    "content": "sys",
+    "role": "system"
+  },
+  {
+    "content": [
+      {
+        "text": "prefix-1",
+        "type": "text"
+      }
+    ],
+    "role": "user"
+  },
+  {
+    "content": [
+      {
+        "text": "prefix-2",
+        "type": "text"
+      }
+    ],
+    "role": "user"
+  },
+  {
+    "content": [
+      {
+        "text": "obs #1\n[元素列表已省略]",
+        "type": "text"
+      },
+      {
+        "text": "[图已滑窗]",
+        "type": "text"
+      }
+    ],
+    "role": "user"
+  },
+  {
+    "content": "thinking",
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "function": {
+          "arguments": "{\"id\":1}",
+          "name": "tap"
+        },
+        "id": "c1",
+        "type": "function"
+      }
+    ]
+  },
+  {
+    "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+    "role": "tool",
+    "tool_call_id": "c1"
+  },
+  {
+    "content": [
+      {
+        "text": "obs #2\n[2] b",
+        "type": "text"
+      },
+      {
+        "image_url": {
+          "url": "data:image/png;base64,img2"
+        },
+        "type": "image_url"
+      }
+    ],
+    "role": "user"
+  }
+]
