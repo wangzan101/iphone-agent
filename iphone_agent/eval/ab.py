@@ -20,11 +20,13 @@ from iphone_agent.workspace import RunConfig
 
 ARMS = {"on": "always", "off": "on_demand"}      # 沿用 curve 的工作区名：on 目录 = A 组（always）
 REGULAR = ("settings-ios-version", "settings-storage-free", "notes-recent-titles", "reminders-list-counts")
-# ⚠ 2026-09-16：硬闸题原来用 write/yimu-add-expense-lunch，真机预跑里跑不通 —— 记账页会记住上次没填完的
-# 金额（起点不干净），而无人值守下「删除/退格」是危险词被拒，模型无路可退，把小键盘的「×」当成清空键，
-# 金额变成 341×13111。换成同一个 App 的只读版 yimu-account-list：不写数据、起点稳定，考点不变
-# （页面元素多、入口是无字图标、账户名就是当年「工资账户」那类列表项）。
-HARD = (("vision", "yimu-account-list"), ("vision", "weather-city-list"), ("vision", "settings-camera-grid"))
+# ⚠ 2026-09-16：硬闸题原来用一道记账类写入任务，真机预跑里跑不通 —— 那个 App 的记账入口页会
+# 记住上次没填完的金额（起点不干净），而无人值守下「删除/退格」是危险词被拒，模型无路可退，把小
+# 键盘的清空键当成别的键按，把金额改错了。换成同一个 App 的只读版 ledger-account-list：不写数
+# 据、起点稳定，考点不变（页面元素多、入口是无字图标、账户名就是常见的「工资账户」那类列表项）。
+# 注：这三道硬闸题的 task 文件不随公开仓库分发（仓库自带的 evalset 只保留公开精选题），
+# `iphone eval ab` 要跑硬闸组，需要使用者自己补上对应的 task 文件。
+HARD = (("vision", "ledger-account-list"), ("vision", "weather-city-list"), ("vision", "settings-camera-grid"))
 LAYERS = ("as_is", "no_coord")
 
 
