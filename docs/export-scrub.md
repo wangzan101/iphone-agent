@@ -31,7 +31,7 @@ replaces the app name with generic wording:
 - `tests/test_candidates.py`: the IME candidate-bar fixture used the app's
   pinyin name as a typed-text token; public uses a neutral pinyin token
   (`ceshi`) instead. The fixture's behavior (candidate-bar parsing) is
-  unaffected — the token is typed text, not a候选 assertion target.
+  unaffected — the token is typed text, not an assertion target.
 - `iphone_agent/eval/ab.py`: the ⚠ comment explaining why the hard-gate
   write task was swapped for a read-only one no longer names the app; it
   describes the failure generically (the write task's entry page keeps
@@ -41,8 +41,10 @@ replaces the app name with generic wording:
 
 ## 3. Hard-gate task ids
 
-`HARD` in `iphone_agent/eval/ab.py` renamed `yimu-account-list` to the
-neutral `ledger-account-list`.
+`HARD` in `iphone_agent/eval/ab.py` uses the neutral id
+`ledger-account-list`. The Lab id names the bookkeeping app the task runs
+against; rename it on every export. Do not write the Lab id here — this
+file is public.
 
 These hard-gate task files (and the write-task variant referenced in the
 comment) are **not shipped** in the public repo — `evalset/` here only
@@ -54,11 +56,16 @@ files under `tasks/vision/`.
 ## 4. Run paths and internal design-doc paths
 
 Lab comments sometimes cite concrete run directories (e.g. an
-`evalset/.../off/runs/...` path) or internal design-doc paths as evidence for
-a bug writeup. These do not ship publicly — keep the technical explanation
-(what went wrong, why) and drop the path. See `iphone_agent/model/coords.py`
-for the pattern: the norm1000-vs-pixel conversion failure modes are kept,
-the Lab run-directory citations are not.
+`evalset/.../off/runs/...` path) as evidence for a bug writeup. Run paths do
+not ship — keep the technical explanation (what went wrong, why) and drop the
+path. See `iphone_agent/model/coords.py` for the pattern: the
+norm1000-vs-pixel conversion failure modes are kept, the Lab run-directory
+citations are not.
+
+Internal design-doc paths (`docs/superpowers/...`) are a different case: they
+carry no private content, and they mark where a rule came from, so comments
+and test docstrings keep them. Be aware they are dead links in this repo —
+those documents stay in Lab.
 
 ## General rule
 
