@@ -1,10 +1,10 @@
 """任务级评测：这个任务办成了没有 —— 用零模型的检查器判，默认 FAIL。
 
 以前 bench.py 量的全是眼睛（OCR 准不准、编号对不对），没有一处在量「任务完成了没有」；
-换模型 / 改提示词 / 加记忆之后退没退化，答不上来（设计说明、设计说明）。
+换模型 / 改提示词 / 加记忆之后退没退化，答不上来（docs/30 §1、docs/31 §B1）。
 PhoneHarness 的教训：grader 找不到产物就退回相信模型的 done(success)（`grader.py:329`）——
 所以这里的死规矩是**验不了就不给分**：缺数据 = fail/skip，绝不 = pass。
-UI-Venus 的规则也搬过来（设计说明）：只做了 generic 操作（开 App、滚动、看）就报成功，判失败。
+UI-Venus 的规则也搬过来（docs/28 §4.2）：只做了 generic 操作（开 App、滚动、看）就报成功，判失败。
 """
 import json
 
@@ -92,13 +92,41 @@ def test_not_done_success_fails_whatever_the_screens_say(tmp_path):
         assert any(reason in r for r in v.reasons)
 
 
-def test_generic_operations_only_is_not_success(tmp_path):
-    """只开了 App、滚了几屏就 done(success)：答案哪来的？（UI-Venus 的轨迹判定规则）"""
+def test_generic_only_success_is_trusted_when_the_answer_screen_was_reached(tmp_path):
+    """只开了 App、滚了几屏就报成功，但到过的屏幕上确实有答案（屏幕检查通过）：答案能从屏幕上读到，
+    不算编的。2026-09-11 前这条规则在 tasks-20260910-192636 里误杀了 12 次里的 8 次 ——
+    打开备忘录直接读列表、打开设置直接读版本，本来就不需要点击。"""
     steps = [_step(1, "open_app", {"name": "设置"}, ["设置", "通用", "关于本机", "iOS 版本", "18.3.1"]),
              _step(2, "scroll", {"direction": "down", "amount": "page"}, ["关于本机", "iOS 版本", "18.3.1"]),
              _step(3, "done", {"status": "success", "result": "18.3.1"}, ["关于本机", "iOS 版本", "18.3.1"])]
     v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "18.3.1", steps))
+    assert v.status == "pass", v.reasons
+
+
+def test_generic_only_success_without_screen_evidence_still_fails(tmp_path):
+    """没有屏幕检查，就没有证据证明答案来自屏幕：只做 generic 操作就报成功，照旧判失败（防编答案）。"""
+    t = V.Task.from_dict({**TASK, "checks": [{"type": "answer_contains", "any_of": ["18.3.1"]}]})
+    steps = [_step(1, "open_app", {"name": "设置"}, ["18.3.1"]),
+             _step(2, "done", {"status": "success", "result": "18.3.1"}, ["18.3.1"])]
+    v = V.verify_run(t, _run(tmp_path, "a", "done_success", "18.3.1", steps))
     assert v.status == "fail" and any("generic" in r for r in v.reasons)
+
+
+def test_a_failing_screen_check_is_not_screen_evidence(tmp_path):
+    """屏幕检查存在但没通过，不能当证据。"""
+    steps = [_step(1, "open_app", {"name": "设置"}, ["设置", "通用"]),
+             _step(2, "done", {"status": "success", "result": "18.3.1"}, ["设置", "通用"])]
+    v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "18.3.1", steps))
+    assert v.status == "fail" and any("generic" in r for r in v.reasons)
+
+
+def test_runs_that_did_not_report_success_never_say_reported_success(tmp_path):
+    """model_error / handover 的运行本来就判失败；理由里再写「就报成功」是错话，排查时误导人。"""
+    steps = [_step(1, "open_app", {"name": "设置"}, ["设置", "通用"])]
+    for reason in ("model_error", "handover"):
+        v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, reason, reason, "", steps))
+        assert v.status == "fail"
+        assert not any("就报成功" in r for r in v.reasons), v.reasons
 
 
 def test_task_can_opt_out_of_the_generic_rule(tmp_path):
@@ -254,3 +282,64 @@ def test_run_tasks_aggregates_layout_miss_per_task(tmp_path, monkeypatch):
     assert t["layout_miss"] == {"still_home": 2}
     assert t["open_app"] == {"row": 2}
     assert out["verdicts"][0]["layout_miss"] == {"still_home": 1}
+
+
+# --- Task 10：verify 只认 OCR 证据、坐标点击反查不到判 review ---
+
+def _el(i, text, source):
+    return {"id": i, "text": text, "source": source, "confidence": 0.0 if source == "vision" else 0.9}
+
+
+def _coord_tap(n, texts, hits=None):
+    s = _step(n, "tap", {"x": 10, "y": 10}, texts)
+    if hits is not None:
+        s["tap_target"] = {"by": "coord", "px": [10, 10], "hits": hits, "unclassified": not hits}
+    return s
+
+
+def test_vision_only_text_is_not_screen_evidence(tmp_path):
+    """spec 2026-09-14 §7：screen_reached 只认 OCR 读到的字 —— 同一帧的 OCR 与模式无关，两组证据才一致。"""
+    steps = [_step(1, "open_app", {"name": "设置"}, ["设置"]),
+             _step(2, "done", {"status": "success", "result": "18.3.1"}, [])]
+    steps[1]["observation"]["elements"] = [_el(1, "关于本机", "ocr"), _el(2, "iOS 版本", "vision"),
+                                           _el(3, "18.3.1", "both")]
+    v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "18.3.1", steps))
+    assert any(c["type"] == "screen_reached" and not c["ok"] for c in v.checks)
+
+
+def test_the_after_observation_of_the_last_action_counts_as_evidence(tmp_path):
+    tap = _step(1, "tap", {"id": 1}, ["通用"])
+    tap["after_observation"] = {"elements": [_el(1, "关于本机", "ocr"), _el(2, "iOS 版本", "both")]}
+    v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "18.3.1", [tap]))
+    assert next(c for c in v.checks if c["type"] == "screen_reached")["ok"] is True
+
+
+def test_a_coordinate_tap_on_a_forbidden_word_fails(tmp_path):
+    steps = GOOD[:1] + [_coord_tap(2, ["更新到 iOS 26.6.1"], hits=["更新到 iOS 26.6.1"])] + GOOD[1:]
+    v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "18.3.1", steps))
+    assert v.status == "fail" and any(c["type"] == "action_not_taken" and c["ok"] is False for c in v.checks)
+
+
+def test_a_coordinate_tap_that_hits_nothing_is_review_not_pass(tmp_path):
+    steps = GOOD[:1] + [_coord_tap(2, ["通用"], hits=[])] + GOOD[1:]
+    v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "18.3.1", steps))
+    assert v.status == "review" and any("坐标点击" in r for r in v.reasons)
+
+
+def test_old_logs_without_tap_target_are_review(tmp_path):
+    steps = GOOD[:1] + [_coord_tap(2, ["通用"])] + GOOD[1:]
+    v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "18.3.1", steps))
+    assert v.status == "review"
+
+
+def test_review_never_hides_a_real_failure(tmp_path):
+    steps = GOOD[:1] + [_coord_tap(2, ["通用"])] + GOOD[1:]
+    v = V.verify_run(V.Task.from_dict(TASK), _run(tmp_path, "a", "done_success", "26.6.1", steps))
+    assert v.status == "fail"
+
+
+def test_summary_and_diff_list_review_separately():
+    a = {"ts": "a", "tasks": {"t": {"pass": 1, "n": 3, "review": 0}}}
+    b = {"ts": "b", "tasks": {"t": {"pass": 1, "n": 3, "review": 2}}}
+    assert "待人工审查 2" in "\n".join(V.summary(b))
+    assert "待人工审查 0 → 2" in "\n".join(V.diff(a, b))

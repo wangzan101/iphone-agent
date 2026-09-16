@@ -32,13 +32,13 @@ PROC = {
 
 SCEN_MD = """---
 name: daily-expense
-description: 把今天的支付记录记进一木记账
-apps: ["alipay", "yimujizhang"]
+description: 把今天的支付记录记进记账本
+apps: ["alipay", "jizhangben"]
 risk: write
 status: manual
 ---
 1. 用 alipay/today-bills 读今天的支付记录。
-2. 每一笔用 yimujizhang/add-expense(金额, 分类, 备注) 记一笔。
+2. 每一笔用 jizhangben/add-expense(金额, 分类, 备注) 记一笔。
 """
 
 
@@ -96,10 +96,10 @@ def test_step_hash_ignores_expect_but_not_text_or_how():
 
 def test_scenario_roundtrip_and_apps_must_be_list():
     s = m.scenario_from_markdown(SCEN_MD, stem="daily-expense")
-    assert s.apps == ("alipay", "yimujizhang") and s.status == "manual"
+    assert s.apps == ("alipay", "jizhangben") and s.status == "manual"
     assert m.scenario_from_markdown(m.scenario_to_markdown(s), "daily-expense") == s
     with pytest.raises(m.SkillError):
-        m.scenario_from_markdown(SCEN_MD.replace('apps: ["alipay", "yimujizhang"]', "apps: alipay"), "daily-expense")
+        m.scenario_from_markdown(SCEN_MD.replace('apps: ["alipay", "jizhangben"]', "apps: alipay"), "daily-expense")
 
 
 def test_scenario_risk_takes_the_highest_of_three_sources():

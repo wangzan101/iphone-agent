@@ -8,7 +8,7 @@ from pathlib import Path as _Path
 from iphone_agent.model.errors import ConfigError  # noqa: F401  旧路径别名，外部 import 不断
 
 # 熔断与时限（spec M11）
-# ⚠ 这两个是**保险丝**，不是「任务该多长」的设计假设。上下文这套结构（设计说明）按步数无界设计，
+# ⚠ 这两个是**保险丝**，不是「任务该多长」的设计假设。上下文这套结构（docs/19）按步数无界设计，
 #   每步发给模型的东西大小固定；这里只防失控烧钱。原来 30 / 600 是按早期的简单任务定的
 #   （历史里成功 run 中位数 6 步），拿它反过来限制复杂任务是本末倒置。按任务传 max_steps 覆盖。
 MAX_STEPS = 100
@@ -35,11 +35,16 @@ RECOVERY_MAX_RESTARTS = 2
 # open_app 打不出字时的退路：回主屏、翻页找图标。只用**点击和滚动**，不用打字。
 # 2026-09-08 批跑实测：打字整条通道死掉时（39/40 失败），点击和滚动是好的
 # （日历 6/6、音乐 9/10）—— 所以退路必须走**另一条通道**才有意义。
+# ⚠ 2026-09-14：翻主屏不再是退路，排在 Spotlight 前面（executor._open_app 的 docstring）；
+#   这个上限管的是 twin/scan.walk_home_pages 最多看几页主屏 —— open_app 找 App 和 iphone twin scan 共用。
 HOME_PAGES_MAX = 6
 # ⚠ 横向翻页之后必须多等一下再点，否则点击会落到错的地方。
 #   2026-09-07 实测：翻到有「设置」的那一页，标签在 (104,894)，**2 秒后再观察
 #   它仍在 (104,894)**（页面确实已经静止），可紧接着点却打开了另一个 App，
 #   等 2 秒再点才对。连续三次复现 —— settle 检测不到这段，只能硬等。
+# ⚠ 2026-09-14：它管的是「翻页后多久才能**点**」。原来每翻一页都硬等，只翻页找、不点的那几页也等，
+#   6 页白等 12 秒。现在翻页只 settle，要点之前才把剩下的等满（executor.wait_out_page_flip，
+#   从那一页翻停的时刻算，和原来 settle 之后才开始硬等是同一个起点）。
 AFTER_PAGE_FLIP_S = 2.0
 MAX_CONSECUTIVE_REJECTIONS = 5  # 校验失败/同屏重复/多工具调用连续拒绝这么多次即终止（不占用总步数预算）
 WEB_CONFIRM_TIMEOUT_S = 120     # 网页上等人确认写操作的时限；没人应答按拒绝 —— 「无人只读」在网页这头的形态
@@ -78,7 +83,7 @@ COLLECT_MAX_CHARS = LATEST_TOOL_RESULT_MAX_CHARS - 4000
 
 # 待标定（spec §11）。初值仅供起步，标定脚本跑完后覆盖并写明来源。
 # 阈值标定（2026-09-07，macOS 15.6.1，窗口 322x718，
-#   原始数据见 内部标定记录（未公开））
+#   原始数据见 runs/calibration-20260907-121553.json）
 #
 #   判据            噪声上限(35样本)   真实变化(9样本)
 #   文本集合差异          2              27 - 51
@@ -114,21 +119,56 @@ STATUS_BAR_CROP_RATIO = 0.11
 INJECT_MODE = os.environ.get("IPHONE_USE_INJECT", "background")
 
 # ---- 屏幕解析（perceive/screen.py）----
-# 每次观察多花一次视觉模型调用，换来 OCR 给不出的图标/无字按钮/开关状态。
-# 关掉就是 2026-09-09 之前的纯 OCR 行为，一行不差 —— 这条降级路要一直留着：
-# 端点会抽风、会超时，而它只是增强，不是命脉。
-# 每次观察都让视觉模型把整屏读成结构化元素。**默认开着**，因为它是成功的直接条件：
+# 整屏解析跑不跑，由 perceive/policy.py 按模式决定（spec 2026-09-14 §3）。三档：
+#   always     每次观察都整屏解析（代码默认；和 2026-09-14 之前一样）
+#   on_demand  观察只跑 OCR；模型调 observe、程序兜底时才整屏解析；孪生靠一次短标注
+#   off        只跑 OCR（孪生不长）
 #
-#   回归场景（名称为合成示例）：OCR 漏掉「示例银行」列表项，视觉解析能补全。
-#   若解析输出被 max_tokens 截断，结构化元素可能全部丢失（见 transports 注释）。
-#
-#   我一度把它默认关掉、改用 zoom 按需放大，理由是它慢（每步 20~34s）。那是错的：
-#   zoom 解决「看不清」，不解决「不知道有」—— 模型得先知道列表里有「示例银行」，
-#   才谈得上去放大哪一块。功能优先于速度，慢可以再优化，丢了元素就是任务失败。
-#
-#   关掉它（IPHONE_SCREEN_PARSE=off）会退回纯 OCR：快很多，但 OCR 读不到的图标、
-#   无字按钮、以及像上面那样被 OCR 漏掉的列表项，模型就只剩 zoom 和估坐标两条路。
-SCREEN_PARSE = os.environ.get("IPHONE_SCREEN_PARSE", "on").lower() not in ("0", "off", "false")
+# ⚠ 2026-09-09 真机，「记一笔账单…工资账户」连挂三次，第四次成功。成功那次的关键两步
+#   用的元素来源是 vision ——「工资账户」这一项 OCR 根本读不到，只有整屏解析给得出。
+#   我一度把它默认关掉、改用 zoom 按需放大，那是错的：zoom 解决「看不清」，不解决「不知道有」。
+#   所以默认值本期不改，要等 on_demand 过了 A/B 硬闸题（spec §10.3）才另起一次改动切换。
+# ⚠ 2026-09-14：原来的开关是 import 时读 env 的布尔 SCREEN_PARSE，Session 和 loop 各自读一遍；
+#   现在只有一条链路：env → screen_parse_mode → RunConfig.screen_parse → Perceiver.task_scope。
+
+
+def screen_parse_mode(raw: str | None = None) -> str:
+    """IPHONE_SCREEN_PARSE 的唯一解析入口（spec 2026-09-14 §8.4）。raw=None 时在**调用时**读 env。
+
+    唯一的调用方是 RunConfig.from_env（tests/test_screen_parse_policy.py 钉着）。
+    空 / 未设置 → policy.DEFAULT_MODE；旧值 on/1/true → always（保留「每帧都解析」的原意），
+    0/off/false → off；其他值报错并写明可选值 —— 不静默回退，写错了要让人当场知道。
+    """
+    from iphone_agent.perceive import policy
+    v = (os.environ.get("IPHONE_SCREEN_PARSE", "") if raw is None else raw).strip().lower()
+    if not v:
+        return policy.DEFAULT_MODE
+    if v in policy.MODES:
+        return v
+    if v in ("on", "1", "true"):
+        return "always"
+    if v in ("0", "false"):
+        return "off"
+    raise ValueError(f"IPHONE_SCREEN_PARSE={v!r} 不认识：可选 always / on_demand / off"
+                     "（旧值 on/1/true 等于 always，0/off/false 等于 off）")
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """布尔开关环境变量的唯一解析规则（CLAUDE.md §7 一个规则一个入口）。
+    ⚠ 2026-09-11 final review：IPHONE_TWIN_HINTS 曾经在这里和 workspace.py.RunConfig.from_env
+    各解析一遍，两处对 .strip() 已经不一致（config.py 不 strip，workspace.py 会 strip）——
+    同一个 " OFF " 在两处可能给出不同结果。调用时读（不是 import 时），空/缺失退回 default，
+    去空白、转小写后 "0"/"off"/"false" 记为 False，其余（包括非空但奇怪的值）记为 True。
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "off", "false")
+
+
+# 【位置】【路线】由数字孪生出（spec 2026-09-11 §6.4）；off 回到旧的 screenmap 提示，给对照评测用。
+# 进程级默认值；每次运行以 RunConfig.twin_hints 为准（写进 run.json 的配置快照）。
+TWIN_HINTS = env_flag("IPHONE_TWIN_HINTS", True)
 
 # ---- 从 OCR 结构派生无文字目标（2026-09-08 真机实测）----
 # 列表行的版式很规整：文字在左、chevron/开关/数值在右、图标在最左，都在同一个 y 上。
@@ -169,7 +209,7 @@ CAND_BAND_TOL_RATIO = 0.01
 #   于是中文输入在 App 内容框里 8 次尝试 8 次全挂。详见 executor._candidates 的注释。
 
 
-# ---- 记忆系统（spec 内部标定记录（未公开））----
+# ---- 记忆系统（spec docs/superpowers/specs/2026-09-07-记忆系统-design.md）----
 # 记忆目录不再是常量：位置由 Workspace 决定（MemoryStore(root=None) → 默认工作区）。
 
 # ⚠ 只收小写 ASCII。大写在 macOS 默认不区分大小写的文件系统上会和小写撞；
@@ -184,11 +224,11 @@ MEMORY_RESERVED_NAMES = frozenset({"memory", "trash", "index"})
 MEMORY_DESC_MAX = 100     # 描述直接进 frontmatter 和索引，必须单行且短
 # ⚠ 400 是按 window 模式（旧的滑窗视图）标定的：一条记忆要跨好几步用，所以按
 #   TOOL_RESULT_MAX_CHARS（更老结果那一档，500）留余量定的。state 模式下
-#   （设计说明，CONTEXT_MODE=state）recall 的正文**只在返回的那一步出现一次**——
+#   （docs/19，CONTEXT_MODE=state）recall 的正文**只在返回的那一步出现一次**——
 #   它不进历史消息、不会被滑窗反复截断，模型要用就得当场把要点抄进 memory 字段。
-#   400 字符装不下一条像样的操作步骤说明，改成 2000（设计说明 B2）。
+#   400 字符装不下一条像样的操作步骤说明，改成 2000（docs/20 B2）。
 MEMORY_BODY_MAX = 2000
-# ⚠ 这是保险丝，不是「记忆库该有多大」的设计假设（设计说明 B1）：索引现算、不落盘，
+# ⚠ 这是保险丝，不是「记忆库该有多大」的设计假设（docs/20 B1）：索引现算、不落盘，
 #   entries 数量只影响 index() 单次扫描目录的开销，不存在「装不下」的硬上限。
 #   50 是早期按「索引全部注入 prompt、不截断」的假设定的；随着规模扩大，注入方式
 #   本身会先变（分页/相关性截断），届时这个数字该配合注入策略一起再调。
@@ -214,9 +254,9 @@ MEMORY_INJECT_TOPK = 20
 SEARCH_MEMORY_TOPK = 10
 # 网页对话里往回带几轮。带太多会稀释当前任务，带太少就没有「对话」的感觉。
 CHAT_HISTORY_TURNS = 6
-# ---- 发给模型的上下文视图（设计说明）----
+# ---- 发给模型的上下文视图（docs/19）----
 # window：现在的滑窗，每步改历史消息。state：冻结前缀 + 每步重建一份有界状态报告。
-# 默认 window：对照实验（设计说明 第 6 步）跑完之前不换默认。
+# 默认 window：对照实验（docs/19 §5 第 6 步）跑完之前不换默认。
 # ⚠ 这是 RunConfig.from_env() 的**默认值来源**，不是运行时开关：loop 读的是
 #   RunConfig.context_mode，同一进程里两种视图可以并存（对照实验要的就是这个）。
 CONTEXT_MODE = os.environ.get("IPHONE_USE_CONTEXT", "window")
@@ -229,7 +269,7 @@ WEB_PORT = 8765          # 只监听 127.0.0.1：这个界面能操作你的真�
 RECAP_RUNS = 5            # 注入时附最近几次运行的摘要
 RECALL_RUNS_MAX = 20
 
-# ---- skill 层（spec 内部标定记录（未公开））----
+# ---- skill 层（spec docs/superpowers/specs/2026-09-08-skill层-design.md）----
 # ---- 知识与技能的两层目录（2026-09-09 重排）----
 # 知识 = 关于 App 的通用描述（APP.md）；技能 = 怎么做一件事（SKILL.md + 可选 procedure.json）。
 # 两者各有结构层（进 git，人写）和个人层（不进 git，自动沉淀落这里），加载时合并、同名个人层优先。
@@ -254,7 +294,7 @@ SCENARIO_RISK_WORDS = {
                      "pay", "payment", "transfer", "delete", "purchase", "buy", "place an order"),
 }
 # run_summaries 扫描 runs/ 时，目录名（时间戳）倒序只看前这么多个就去读 run.json，
-# 不管全目录下总共有多少个（计划 B Task 4，设计说明 C5）。⚠ 这也是保险丝不是设计
+# 不管全目录下总共有多少个（计划 B Task 4，docs/20 C5）。⚠ 这也是保险丝不是设计
 # 假设：目录数量本身无界，扫全量、读每个 run.json、再排序丢掉大半，是纯浪费的
 # O(全部 run 数) 开销，而调用方最终只要最近/最相关的 limit 条。200 留了足够宽的
 # 余量——正常一天几十次运行也要连续跑好几天才会把真正想找的那条推出扫描窗口，

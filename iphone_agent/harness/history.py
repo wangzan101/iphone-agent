@@ -93,7 +93,15 @@ def row_from_record(record: dict, elements_by_id: dict[int, str] | None = None) 
     # 模型的自评字段从来没人填（2026-09-09 统计 103 次运行一次没有），这一列永远 unknown。
     # 判官看图判了「变了但没达到预期」时用它补上，并标明是看图判的 —— 模型自己答了以它为准。
     judged = result.get("judged") or {}
-    if expected == "unknown" and result.get("changed") and judged.get("worked") is False:
+    ec = result.get("expect_check") or {}
+    if expected == "unknown" and ec.get("met") is not None:
+        # 2026-09-11：点击的预期由程序核对（executor 的 expect_check），这一列按它填、标明怎么核的。
+        # 模型自己答了 eval 仍以它为准（上面的 expected 已经不是 unknown）。
+        expected = ("yes" if ec["met"] else "no") + ("(文字)" if ec.get("by") == "text" else "(看图)")
+        if not ec["met"]:
+            note = note or judged.get("why")
+    elif expected == "unknown" and result.get("changed") and judged.get("worked") is False:
+        # 老留档没有 expect_check：判官看图判了「变了但没达到预期」时照旧补上。
         expected = "no(看图)"
         note = note or judged.get("why")
     if not note:
@@ -153,7 +161,7 @@ def summarize_omitted(rows: list[HistoryRow], list_max: int = config.EARLIER_LIS
 
     ⚠ 为什么必须有这一层：MAX_STEPS 已经是 100，HISTORY_KEEP 是 12。没有它，
     第 90 步的模型看到的是「第 1 步 + 一句省略 + 最近 11 步」，中间 77 步的证据
-    全靠它自己曾经塞进 600 字备忘（设计说明 B5+B6）。这里零模型调用，纯机械。
+    全靠它自己曾经塞进 600 字备忘（docs/20 B5+B6）。这里零模型调用，纯机械。
     保留的四样东西按信息价值排：试过但没成的（别再试）、被拒的（别再犯）、
     花步数换来的读数（recall/collect，丢了就得重做）、动作分布（知道自己在哪转过）。
     """
@@ -184,7 +192,9 @@ def summarize_omitted(rows: list[HistoryRow], list_max: int = config.EARLIER_LIS
             s += f"…（共 {len(items)} 条，列前 {list_max}）"
         lines.append(f"{label}：{s}")
 
-    _entries(lambda r: r.expected == "no", "没达到预期的")
+    # ⚠ startswith 不是 ==：expected 实际写的是「no(看图)」（row_from_record 按 expect_check 填），裸「no」
+    #   只有模型自评时才有。只认 == "no" 时这一节从来没命中过，走错页的步被静默压掉（终审 2026-09-11）。
+    _entries(lambda r: r.expected.startswith("no"), "没达到预期的")
     rejected = Counter(_reject_key(r.note) for r in rows if r.executed == "rejected")
     if rejected:
         shown = rejected.most_common(list_max)

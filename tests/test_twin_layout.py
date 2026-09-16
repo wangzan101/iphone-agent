@@ -1,4 +1,4 @@
-"""主屏布局：从一帧观察算网格（设计说明、§2.2）。
+"""主屏布局：从一帧观察算网格（docs/32 §1.5、§2.2）。
 
 用 evalset/labels/00-current.json 里真机标出来的标签位置当输入 ——
 24 个图标 4 列 × 6 行，dock 4 个无标签，底部一个「搜索」按钮。
@@ -253,6 +253,50 @@ def test_find_app_prefers_exact_match_on_a_later_page_over_a_loose_match_on_an_e
                                 order=2))
     hit = lay.find_app("设置")
     assert hit is not None and hit.page_order == 2 and hit.label == "设置"
+
+
+# --- 一个 App 名匹配规则（2026-09-14）：查表和在当前帧上找标签共用 match_label ---
+
+def test_match_label_exact_beats_contains():
+    """精确（norm_label 相等）优先：哪怕包含匹配的那个排在前面。"""
+    assert L.match_label("设置", ["设置助手", "设置"]) == "设置"
+    assert L.match_label("App Store", ["App store"]) == "App store", "精确按 norm_label：不分大小写、去空格"
+
+
+def test_match_label_contains_only_when_exactly_one_candidate_contains_it():
+    assert L.match_label("Safari", ["Safari 浏览器", "日历"]) == "Safari 浏览器"
+    assert L.match_label("备忘", ["备忘录", "语音备忘录"]) is None, "两个都包含 = 说不清是哪个，不猜"
+    assert L.match_label("小红", ["小红书", "小红书"]) == "小红书", "同一个标签读到两次不算两个候选"
+
+
+def test_match_label_never_contains_matches_a_single_character():
+    assert L.match_label("天", ["今天无日程"]) is None
+    assert L.match_label("M", ["Gmail"]) is None
+    assert L.match_label("M", ["M", "Gmail"]) == "M", "单字精确照样命中"
+
+
+def test_match_label_does_not_pick_widget_text_over_the_app_label():
+    """主屏第 1 页真实读到的小组件文字（2026-09-14 layout.json：「今天无日程」「大部晴朗无云」）。
+    旧的 `name in e.text` 按元素顺序取第一个 —— 小组件在上面，先被它命中。"""
+    elements = ["今天天气晴", "今天无日程", "天气", "日历"]
+    assert L.match_label("天气", elements) == "天气"
+    assert L.match_label("天气", ["今天天气晴", "天气预报"]) is None, "两个都含「天气」：不猜"
+
+
+def test_match_label_takes_a_key_function_and_returns_the_candidate():
+    from types import SimpleNamespace
+    els = [SimpleNamespace(text="今天无日程"), SimpleNamespace(text="日历")]
+    assert L.match_label("日历", els, key=lambda e: e.text) is els[1]
+    assert L.match_label("", ["设置"]) is None
+
+
+def test_find_app_ambiguous_contains_across_pages_is_no_hit(tmp_path):
+    """find_app 用同一条规则：两页各有一个含「设置」的标签、都不精确 → 不猜。"""
+    lay = L.Layout.load(tmp_path / "layout.json")
+    lay.upsert_page(_page_with(["设置助手", "照片", "日历", "备忘录", "时钟", "计算器", "天气", "相机"], order=1))
+    lay.upsert_page(_page_with(["设置向导", "微信", "支付宝", "淘宝", "抖音", "小红书", "美团", "京东"], order=2))
+    assert lay.find_app("设置") is None
+    assert lay.find_app("设置向导").page_order == 2
 
 
 def test_load_with_corrupted_revision_is_an_empty_layout_that_self_heals_on_save(tmp_path):

@@ -82,3 +82,22 @@ def test_as_dicts_is_json_shaped():
 @pytest.mark.parametrize("status,ok", [(PASS, True), (INFO, True), (FAIL, False)])
 def test_ok_property(status, ok):
     assert Check(id="x", title="x", status=status).ok is ok
+
+
+def test_the_ocr_check_is_ocr_only_and_leaves_a_running_tasks_parse_stats_alone(fake_env):
+    """doctor 的「文字识别」只查 OCR（按需看图终审发现 2，2026-09-15）：不在 scope 里时代码默认是 always，
+    原来走 observe 会打一次整屏解析；serve 的 /api/doctor 在 HTTP 线程上跑，任务正挂着 scope 时还会记进它的统计。"""
+    from types import SimpleNamespace
+
+    from tests.conftest import CountingAsker
+    dev, per, _ = fake_env([["通用", "关于本机"]] * 3)
+    per.asker = CountingAsker()
+    s = SimpleNamespace(dev=dev, per=per)
+    assert health.check_ocr(s).status == PASS and per.asker.calls == 0
+    with per.task_scope(None, "on_demand"):
+        before = per.stats()
+        health.check_ocr(s)
+        after = per.stats()
+    assert per.asker.calls == 0, "文字识别自检不该调视觉"
+    for k in ("mode", "observations", "parse_by", "ms", "label", "vision_failures"):
+        assert after[k] == before[k], k

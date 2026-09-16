@@ -43,11 +43,14 @@ bench 每次都真跑 Perceiver.observe：OCR 本地几百毫秒，视觉调用�
 ## 用法
 
     iphone eval bench                 跑全部，存 evalset/results/<ts>.json，打印摘要
+    iphone eval bench --label-agree   另外比短标注和整屏解析的标注（第一次要真调视觉，见 spec 2026-09-14 §10.2）
     iphone eval diff <a.json> <b.json>  两次结果对比，列出翻转的样本
 """
 from __future__ import annotations
 
+import contextlib
 import glob
+import hashlib
 import json
 import math
 import os
@@ -81,10 +84,16 @@ def affordance_guess(elements: list[dict]) -> str:
 
 
 class Perception:
-    """对一张帧跑 agent 的感知，同一次 bench 里同一帧只跑一次。"""
+    """对一张帧跑 agent 的感知，同一次 bench 里同一帧只跑一次。
 
-    def __init__(self, perceiver):
+    ocr_only=False：整屏那一列。在 task_scope(None, "always") 里跑 observe —— 测的就是看全屏交回的东西；
+      ⚠ 2026-09-14（spec 按需看图 §10.2）：改动前后这一列的指标必须完全不变（按中心和 kind 匹配，不看编号）。
+    ocr_only=True：observe_text，也就是 on_demand 默认的元素表。不调视觉、零成本，只报告不设门槛。
+    """
+
+    def __init__(self, perceiver, ocr_only: bool = False):
         self.per = perceiver
+        self.ocr_only = ocr_only
         self._memo: dict[str, list[dict]] = {}
 
     def elements(self, frame_path: str) -> list[dict]:
@@ -95,7 +104,13 @@ class Perception:
         from iphone_agent.driver.geometry import Frame, Rect
         img = Image.open(frame_path).convert("RGB")
         W, H = img.size
-        obs = self.per.observe(Frame(img, W, H, Rect(0, 0, W, H), 0.0, 0))
+        frame = Frame(img, W, H, Rect(0, 0, W, H), 0.0, 0)
+        if self.ocr_only:
+            obs = self.per.observe_text(frame)
+        else:
+            scope = getattr(self.per, "task_scope", None)
+            with scope(None, "always") if scope is not None else contextlib.nullcontext():
+                obs = self.per.observe(frame)
         els = [{"id": e.id, "text": e.text, "center": list(e.center), "box": list(e.box),
                 "kind": e.kind, "state": e.state, "source": e.source} for e in obs.elements]
         self._memo[frame_path] = els
@@ -146,14 +161,15 @@ class Metric:
             self.misses.append(detail)
 
 
-def bench(root: Path, perceiver) -> dict:
-    """perceiver 是 Perceiver（或长得像它的东西）。它的 asker 该带 cache_dir，不然每帧真调模型。"""
-    per = Perception(perceiver)
-    m = {k: Metric(k) for k in ("tap_coverage", "dead_tap_precision", "switch_state_acc",
-                                 "clickable_precision", "text_readback", "affordance_acc")}
+METRICS = ("tap_coverage", "dead_tap_precision", "switch_state_acc",
+           "clickable_precision", "text_readback", "affordance_acc")
+
+
+def _score(root: Path, per: Perception) -> tuple[dict, dict, int]:
+    """六个指标 + affordance 混淆矩阵 + 看过的帧数（按样本行计）。逻辑与 2026-09-14 之前的 bench() 逐行相同。"""
+    m = {k: Metric(k) for k in METRICS}
     confusion: dict[str, dict[str, int]] = {}      # 真值 → {预测: 次数}
     frames_seen = 0
-    t0 = time.time()
 
     # ---- 执行验证 ----
     for taps in sorted(glob.glob(str(root / "explore" / "*" / "taps.jsonl"))):
@@ -213,28 +229,46 @@ def bench(root: Path, perceiver) -> dict:
                 rowtexts = _norm("".join(e["text"] for e in els if abs(e["center"][1] - cy) <= 25))
                 m["text_readback"].add(want in rowtexts, f"{tag} {g['label']} 要 {want!r} 行内读到 {rowtexts[:40]!r}")
 
+    return m, confusion, frames_seen
+
+
+def _dump(m: dict[str, Metric]) -> dict:
+    return {k: {"value": v.value, "hits": v.hits, "total": v.total, "misses": v.misses} for k, v in m.items()}
+
+
+def bench(root: Path, perceiver) -> dict:
+    """perceiver 是 Perceiver（或长得像它的东西）。它的 asker 该带 cache_dir，不然每帧真调模型。"""
+    t0 = time.time()
+    m, confusion, frames_seen = _score(root, Perception(perceiver))
     asker = getattr(perceiver, "asker", None)
-    out = {
+    vision = asker.stats() if asker is not None and hasattr(asker, "stats") else {}
+    m_ocr, confusion_ocr, _ = _score(root, Perception(perceiver, ocr_only=True))
+    return {
         "ts": time.strftime("%Y%m%d-%H%M%S"),
         "frames": frames_seen,
         "seconds": round(time.time() - t0, 1),
-        "vision": asker.stats() if asker is not None and hasattr(asker, "stats") else {},
-        "metrics": {k: {"value": v.value, "hits": v.hits, "total": v.total, "misses": v.misses}
-                    for k, v in m.items()},
+        "vision": vision,
+        "metrics": _dump(m),
         "affordance_confusion": confusion,
+        "ocr": {"metrics": _dump(m_ocr), "affordance_confusion": confusion_ocr},
     }
-    return out
+
+
+def _metric_lines(metrics: dict, indent: str = "  ") -> list[str]:
+    lines = []
+    for k, v in metrics.items():
+        if v["total"] == 0:
+            lines.append(f"{indent}{k:<20} —        （没有样本）")
+            continue
+        lines.append(f"{indent}{k:<20} {v['value'] * 100:5.1f}%   {v['hits']}/{v['total']}")
+    return lines
 
 
 def summary(res: dict) -> list[str]:
     v = res.get("vision") or {}
     lines = [f"# {res['frames']} 帧 · {res.get('seconds', 0)}s · 视觉调用 {v.get('calls', 0)} 次"
              f"（缓存命中 {v.get('cache_hits', 0)}）"]
-    for k, v in res["metrics"].items():
-        if v["total"] == 0:
-            lines.append(f"  {k:<20} —        （没有样本）")
-            continue
-        lines.append(f"  {k:<20} {v['value'] * 100:5.1f}%   {v['hits']}/{v['total']}")
+    lines += _metric_lines(res["metrics"])
     conf = res.get("affordance_confusion") or {}
     if conf:
         lines.append("  affordance 混淆（行=实际，列=预测）：")
@@ -243,23 +277,157 @@ def summary(res: dict) -> list[str]:
         for t in cols:
             if t in conf:
                 lines.append(f"    {t:>9}" + "".join(f"{conf[t].get(c, 0):>9}" for c in cols))
+    if "ocr" in res:
+        lines.append("  OCR 列（observe_text = on_demand 的默认元素表；只报告，不设门槛）：")
+        lines += _metric_lines(res["ocr"]["metrics"], indent="    ")
+    la = res.get("label_agree")
+    if la:
+        lines.append(f"  label_agree（孪生 {la['twin_revision']}；{la['both_ok']}/{la['frames']} 帧两边都标成，"
+                     f"候选为空 {la['candidates_empty']}）：")
+        for k, val in la["agree"].items():
+            lines.append(f"    {k:<8} " + ("—" if val is None else f"{val * 100:5.1f}%"))
+        lines.append(f"    不一致 {len(la['mismatches'])} 帧、标不成 {len(la['unavailable'])} 帧（明细在结果文件里）")
     return lines
 
 
-def diff(a: dict, b: dict) -> list[str]:
-    lines = [f"# {a['ts']} → {b['ts']}"]
-    for k in a["metrics"]:
-        va, vb = a["metrics"][k]["value"], b["metrics"].get(k, {}).get("value")
+def _diff_metrics(ma: dict, mb: dict) -> list[str]:
+    lines = []
+    for k in ma:
+        va, vb = ma[k]["value"], mb.get(k, {}).get("value")
         if va is None or vb is None:
             continue
         arrow = "↑" if vb > va + 1e-9 else ("↓" if vb < va - 1e-9 else "=")
         lines.append(f"  {k:<20} {va * 100:5.1f}% → {vb * 100:5.1f}%  {arrow}")
-        ma, mb = set(a["metrics"][k]["misses"]), set(b["metrics"][k]["misses"])
-        for x in sorted(mb - ma)[:8]:
+        a_miss, b_miss = set(ma[k]["misses"]), set(mb[k]["misses"])
+        for x in sorted(b_miss - a_miss)[:8]:
             lines.append(f"      新错: {x}")
-        for x in sorted(ma - mb)[:8]:
+        for x in sorted(a_miss - b_miss)[:8]:
             lines.append(f"      修好: {x}")
     return lines
+
+
+def diff(a: dict, b: dict) -> list[str]:
+    lines = [f"# {a['ts']} → {b['ts']}"] + _diff_metrics(a["metrics"], b["metrics"])
+    if "ocr" in a and "ocr" in b:        # 老结果没有 OCR 列：只比整屏那一列
+        lines.append("  [OCR 列]")
+        lines += _diff_metrics(a["ocr"]["metrics"], b["ocr"]["metrics"])
+    return lines
+
+
+LABEL_FIELDS = ("app", "name", "same_as", "anchors")
+
+
+def _bench_frames(root: Path) -> list[Path]:
+    """bench 用到的全部帧，去重、保持首次出现的顺序（与 _score 的遍历顺序一致）。"""
+    seen: dict[str, None] = {}
+    for taps in sorted(glob.glob(str(root / "explore" / "*" / "taps.jsonl"))):
+        app_dir = Path(taps).parent
+        for line in Path(taps).read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                fp = app_dir / "frames" / json.loads(line)["before"]
+                if fp.exists():
+                    seen.setdefault(str(fp))
+    for lp in sorted(glob.glob(str(root / "labels" / "*.json"))):
+        fp = root / "frames" / json.loads(Path(lp).read_text(encoding="utf-8"))["frame"]
+        if fp.exists():
+            seen.setdefault(str(fp))
+    return [Path(p) for p in seen]
+
+
+def twin_fingerprint(apps_dir: Path) -> str:
+    """孪生的版本记号：屏文件数 + 全部内容的哈希。label_agree 的候选取自当时的孪生，结果里要写明是哪一份。"""
+    apps_dir = Path(apps_dir)
+    files = sorted(p for p in apps_dir.rglob("*.json") if ".corrupt" not in p.parts) if apps_dir.exists() else []
+    if not files:
+        return "0:empty"
+    h = hashlib.sha256()
+    for p in files:
+        h.update(p.relative_to(apps_dir).as_posix().encode("utf-8"))
+        h.update(p.read_bytes())
+    return f"{len(files)}:{h.hexdigest()[:16]}"
+
+
+def _frame_app(root: Path, fp: Path) -> str:
+    """label_agree 分层抽样用的『App』分组：explore 帧按 App 目录名分组（root/explore/<app>/frames/…）；
+    直接看图标注的帧（root/frames/…）没有 App 目录，自成一组。"""
+    try:
+        rel = fp.relative_to(root).parts
+    except ValueError:
+        rel = fp.parts
+    if len(rel) >= 2 and rel[0] == "explore":
+        return rel[1]
+    return "_labels"
+
+
+def sample_label_agree_frames(root: Path, frames: list[Path], limit: int) -> list[Path]:
+    """终审 I3：--label-agree-limit 的取样器。按帧所属 App 分层、轮询取，确定性、不用随机数——
+    这样 N=60 的一次跑是公平、可复现的样本；N ≥ App 数时每个 App 至少有一帧代表。"""
+    if limit is None or limit <= 0 or len(frames) <= limit:
+        return list(frames)
+    groups: dict[str, list[Path]] = {}
+    for fp in frames:
+        groups.setdefault(_frame_app(root, fp), []).append(fp)
+    apps = sorted(groups)
+    idx = dict.fromkeys(apps, 0)
+    out: list[Path] = []
+    while len(out) < limit:
+        progressed = False
+        for a in apps:
+            if len(out) >= limit:
+                break
+            i = idx[a]
+            if i < len(groups[a]):
+                out.append(groups[a][i])
+                idx[a] = i + 1
+                progressed = True
+        if not progressed:
+            break
+    return out
+
+
+def label_agree(root: Path, perceiver, ctx, twin_revision: str, limit: int | None = None) -> dict:
+    """同一批帧、同一份真实候选，PROMPT_LABEL 与 PROMPT_SCREEN 的完整标注逐字段比（spec 2026-09-14 §10.2）。
+
+    候选按每帧的 OCR 文字经 ctx.candidates 挑（和实时一样）。缓存键包含提示词、所以也包含候选。
+    这是离线参考，不是闸门：错合、错归的零容忍闸门放在真机 A/B 上人工核对（§10.3）。
+    limit：终审 I3，--label-agree-limit。None（默认）不抽样，比全部帧。
+    """
+    from PIL import Image
+
+    from iphone_agent.driver.geometry import Frame, Rect
+    from iphone_agent.perceive.screen import label_screen, parse_screen_full
+    from iphone_agent.twin.identify import norm_text, plain_app_id
+    asker = perceiver.asker
+    agree = dict.fromkeys(LABEL_FIELDS, 0)
+    both, empty, unavailable, mismatches = 0, 0, [], []
+    all_frames = _bench_frames(root)
+    frames = sample_label_agree_frames(root, all_frames, limit) if limit is not None else all_frames
+    for fp in frames:
+        rel = fp.relative_to(root).as_posix()
+        img = Image.open(fp).convert("RGB")
+        W, H = img.size
+        obs = perceiver.observe_text(Frame(img, W, H, Rect(0, 0, W, H), 0.0, 0))
+        cands = list(ctx.candidates([e.text for e in obs.elements])) if ctx is not None else []
+        empty += not cands
+        short, short_status = label_screen(img, asker, cands)
+        full = parse_screen_full(img, asker, cands)
+        if short is None or full.label is None:
+            unavailable.append({"frame": rel, "label": short_status, "screen": full.label_status})
+            continue
+        both += 1
+        same = {"app": plain_app_id(short.app) == plain_app_id(full.label.app),
+                "name": norm_text(short.name) == norm_text(full.label.name),
+                "same_as": short.same_as == full.label.same_as,
+                "anchors": {norm_text(a) for a in short.anchors} == {norm_text(a) for a in full.label.anchors}}
+        for k, ok in same.items():
+            agree[k] += ok
+        if not all(same.values()):
+            mismatches.append({"frame": rel, "fields": [k for k, ok in same.items() if not ok],
+                               "label": short.to_json(), "screen": full.label.to_json(),
+                               "candidates": [c.to_json() for c in cands]})
+    return {"twin_revision": twin_revision, "frames": len(frames), "both_ok": both, "candidates_empty": empty,
+            "agree": {k: (agree[k] / both if both else None) for k in LABEL_FIELDS},
+            "unavailable": unavailable, "mismatches": mismatches}
 
 
 def save(res: dict, root: Path = Path("evalset")) -> Path:

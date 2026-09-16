@@ -544,16 +544,17 @@ def test_a_rescued_truncation_still_says_the_result_is_partial():
     assert "截断" in asker.last_error
 
 
-def test_full_screen_parsing_is_on_because_ocr_misses_things():
-    """整屏解析默认开：它是任务成功的直接条件，不是锦上添花。
+def test_full_screen_parsing_stays_the_default_because_ocr_misses_things():
+    """整屏解析默认仍是每帧都跑（always）：它是任务成功的直接条件，不是锦上添花。
 
-    回归场景（合成名称）：「示例银行」列表项被 OCR 漏掉，只有 vision 能补全。
-    我一度以它慢为由默认关掉、改用 zoom 按需放大，那是错的：
-    zoom 解决「看不清」，不解决「不知道有」。
+    2026-09-09 真机，「记一笔账单…工资账户」连挂三次、第四次成功。成功那次
+    解开死结的两步用的元素来源都是 vision —— **「工资账户」这一项 OCR 根本读不到**。
+    on_demand 要先过 A/B 硬闸题（spec 2026-09-14 §10.3），过了才另起一次改动切默认。
     """
     from iphone_agent import config
+    from iphone_agent.perceive import policy
 
-    assert config.SCREEN_PARSE is True
+    assert policy.DEFAULT_MODE == "always" and config.screen_parse_mode("") == "always"
     assert not hasattr(config, "SCREEN_PARSE_MAX_TOKENS"), \
         "输出长度不该由我们拍一个数；不传 max_tokens 就是不限制"
 
@@ -563,7 +564,7 @@ def test_ask_does_not_cap_output_by_default():
 
     一度默认拿 profile 的 m.max_tokens 顶上，而那个数是给「回一个工具调用」定的，
     屏幕解析列几十个元素一列就超，JSON 断在半句话、整屏归零 ——
-    而那一屏里「示例银行」只有视觉读得到，OCR 没有它。这会导致任务失败。
+    而那一屏里「工资账户」只有视觉读得到，OCR 没有它。任务因此连挂三次。
     """
     from types import SimpleNamespace
 
@@ -623,23 +624,21 @@ def test_far_apart_boxes_still_do_not_fuse():
 
 
 def test_the_full_screen_switch_does_not_disable_zoom(monkeypatch, fake_env):
-    """config.SCREEN_PARSE 只管「每次观察都整屏解析」。
+    """整屏解析模式只管「每次观察都整屏解析」。
 
     一度把它做在 VisionAsker.enabled 上，结果关掉整屏解析，连 zoom 的局部解析
     和各种看图复核一起废了 —— 而那些正是要留着的。两件事的成本差 6 倍。
     """
-    from iphone_agent import config
     from iphone_agent.perceive import observe as observe_mod
 
     calls = []
     monkeypatch.setattr(observe_mod, "parse_screen",
                         lambda img, asker: calls.append(img.size) or [])
-    monkeypatch.setattr(config, "SCREEN_PARSE", False)
 
     dev, per, _ = fake_env([["一屏"]])
     per.asker = object()          # 视觉能力可用
-    obs = per.observe(dev.capture())
-    assert calls == [], "整屏解析该被开关拦住"
-
-    per.zoom(obs, (0, 0, 200, 400))
+    with per.task_scope(None, "off"):
+        obs = per.observe(dev.capture())
+        assert calls == [], "整屏解析该被模式拦住"
+        per.zoom(obs, (0, 0, 200, 400))
     assert len(calls) == 1, "zoom 的局部解析不该被同一个开关拦住"

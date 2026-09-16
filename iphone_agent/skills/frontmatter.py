@@ -1,7 +1,7 @@
 """SKILL.md 式 frontmatter 的通用词法：`---` 包围、每行 `key: value`。
 
 不引 YAML：标准库没有，而这个项目的规矩是零新依赖。所以数组和对象必须写成
-JSON 字面量（`apps: ["alipay", "yimujizhang"]`），以 `[` 或 `{` 开头的值走 json.loads；
+JSON 字面量（`apps: ["alipay", "jizhangben"]`），以 `[` 或 `{` 开头的值走 json.loads；
 其余值原样字符串（去首尾空白）。
 
 ⚠ 不能直接复用 MemoryStore._parse_frontmatter：它硬要求记忆专属的五个字段。

@@ -58,7 +58,7 @@ def ensure_connected(dev, per, obs=None, handshake_s: float = 45.0, poll_s: floa
     手机被拿起返回 False —— 那是人的事，别徒劳点。
 
     ⚠ 点完「继续」之后**只看不点**，看满 `handshake_s` 还没回来才允许第二次。
-    iphone-use 真机记录（`iphone-use upstream: crates/server/src/main.rs:465-469`，2026-06-12）：
+    iphone-use 真机记录（`reference/iphone-use/crates/server/src/main.rs:465-469`，2026-06-12）：
     重连握手要 10–30 秒，握手中途落下的任何一次点击都会**取消**它 ——
     急着重试会把「能连上」变成「连上就断」。第一版这里只等 2.5 秒就点第二次，
     很可能正是我们看到「连接反复暂停」的一部分成因。45 秒取自它的 COOLDOWN。

@@ -83,7 +83,7 @@ def restart_mirror(timeout_s: float = 20.0) -> float:
 
     这是苹果自己的重连机制，程序调它没有越界 —— 2026-09-10 实测：打字通道时断时续
     （人和程序同死同活），用户手动重连两次都恢复了。手机侧不重启、画面停在原处、
-    重连不要求重新认证（设计说明）。调用方在这之后要重新 ensure_connected 等握手。
+    重连不要求重新认证（docs/14）。调用方在这之后要重新 ensure_connected 等握手。
     """
     import subprocess
     import time

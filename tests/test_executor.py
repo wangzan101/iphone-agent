@@ -373,8 +373,8 @@ def test_one_lost_scroll_does_not_end_the_collect_early(fake_env):
 
 # --- 中文输入：驱动 iOS 自己的输入法（发拼音 → 看候选 → 点选）---
 #
-# 为什么必须这样：镜像只转发 keycode、不读事件里的 unicode 载荷（设计说明），
-# 汉字没有 keycode 打不出来；粘贴这条路在本环境实测不通（设计说明）。
+# 为什么必须这样：镜像只转发 keycode、不读事件里的 unicode 载荷（docs/14），
+# 汉字没有 keycode 打不出来；粘贴这条路在本环境实测不通（docs/15）。
 #
 # ⚠ 假 OCR 把元素从上往下排、每个 +60px（高 800）。候选带的判据是 y > 640 且
 #   不是最底下那一行（最底下是输入框），所以候选必须排在倒数第二、第三位。
@@ -460,16 +460,16 @@ def test_open_app_types_pinyin_not_chinese(fake_env):
     """中文 App 名走拼音字母，**不走输入法**。
 
     2026-09-08 实测：Spotlight 自己按拼音匹配 App 名 —— 干净的搜索框里打
-    "yimujizhang"，「一木记账」直接出现在「最佳搜索结果」（空框里它不在，对照过）。
+    "jizhangben"，「记账本」直接出现在「最佳搜索结果」（空框里它不在，对照过）。
 
-    不能走输入法：「一木记账」不在词库里，候选是「以募集章」「一目几张」，
-    永远选不中；而 dev.type() 拿到中文会走粘贴，粘贴在本环境不通（设计说明）。
+    不能走输入法：「记账本」这种 App 名不在词库里，候选是同音的普通词组，
+    永远选不中；而 dev.type() 拿到中文会走粘贴，粘贴在本环境不通（docs/15）。
     """
-    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["Q 搜索", "一木记账"]] * 6)
+    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["Q 搜索", "记账本"]] * 6)
     obs = per.observe(dev.capture())
-    Executor(dev, per).run(act("open_app", name="一木记账"), obs)
+    Executor(dev, per).run(act("open_app", name="记账本"), obs)
     typed = [c[1] for c in dev.calls if c[0] == "type"]
-    assert typed == ["yimujizhang"], f"没打拼音，实际打了 {typed}"
+    assert typed == ["jizhangben"], f"没打拼音，实际打了 {typed}"
     assert not any("一木" in t for t in typed), "把中文直接发出去了（会走粘贴，本环境不通）"
 
 
@@ -483,10 +483,10 @@ def test_open_app_still_types_ascii_names_verbatim(fake_env):
 
 # --- 「一次都没动过」不是「滚到底了」 ---
 #
-# 2026-09-08 真机（runs/example-run）：在通用页 scroll_until 找「关于本机」，
+# 2026-09-08 真机（runs/20260908-022551-5204）：在通用页 scroll_until 找「关于本机」，
 # 滚了两次画面纹丝不动，工具报「滚不动了（到底/到顶）」。模型于是相信关于本机不在
 # 通用里，改去设置首页，把「更新到 iOS 26.6.1」这条**可更新版本**当成当前版本
-# 报了 done(success) —— 设备版本与报告不一致。误导性的诊断直接造出了一次假成功。
+# 报了 done(success) —— 真值是 18.3.1。误导性的诊断直接造出了一次假成功。
 
 def test_scroll_until_says_it_never_moved_instead_of_claiming_the_end(fake_env):
     dev, per, _ = fake_env([["甲", "乙"]] * 12)      # 每一屏都一样 = 根本没滚动
@@ -714,8 +714,10 @@ def test_open_app_that_could_not_type_is_a_keyboard_channel_failure(fake_env):
 # 于是整批任务卡死在"打不开 App"上。
 # 退路必须走**另一条通道**才有意义：回主屏、翻页、点图标，全程不打字。
 
-def test_open_app_falls_back_to_the_home_screen_icon(fake_env):
-    # Spotlight 那一屏没有目标；回主屏之后第一页上就有
+def test_open_app_tries_the_home_screen_icon_before_spotlight(fake_env):
+    """2026-09-14 起主屏在前、Spotlight 在后：第一页上就有，就不打字。
+    （原名 test_open_app_falls_back_to_the_home_screen_icon —— 那时它是 Spotlight 失败后的退路，
+    hint 说「Spotlight 那条路没走通」；现在 Spotlight 根本没走，那句话是假的，删了。）"""
     spotlight = ["Q 搜索", "Siri建议"]
     home = ["设置", "微信", "相机"]
     # Spotlight 帧给足：settle 会多抓几帧，给少了打字后的观察会漏到 home 帧，
@@ -741,27 +743,28 @@ def test_open_app_falls_back_to_the_home_screen_icon(fake_env):
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("open_app", name="设置"), obs)
     assert res.ok, res.hint
-    assert res.extra.get("via") == "home_icon", res.extra
-    assert "主屏" in (res.hint or "")
+    assert res.extra.get("via") == "home_icon" and res.extra["page"] == 1, res.extra
+    assert ("key", "spotlight") not in dev.calls and not any(c[0] == "type" for c in dev.calls)
 
 
 def test_the_fallback_never_types(fake_env):
     """⚠ 这是退路存在的**全部理由** —— 它必须走另一条通道。
     哪天有人在这条路上加了打字，它就白做了。"""
-    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["设置", "微信"]] * 8)
+    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["设置", "微信", "相机"]] * 8)
     obs = per.observe(dev.capture())
     ex = Executor(dev, per)
     before = len([c for c in dev.calls if c[0] == "type"])
-    ex._open_app_from_home("设置", obs, typed=False, query="shezhi")
+    ex._open_app_from_home("设置", obs, [])
     assert len([c for c in dev.calls if c[0] == "type"]) == before, "退路里打字了"
 
 
 def test_it_uses_icon_above_because_tapping_the_label_does_nothing(fake_env):
     """主屏幕上 OCR 只读得到图标**下面**的标签，点标签本身打不开 App。"""
-    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["设置"]] * 8)
+    # 第 1 页要认得出是主屏（≥3 个主屏特征词）才在上面找，2026-09-14
+    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["设置", "微信", "相机"]] * 8)
     obs = per.observe(dev.capture())
     ex = Executor(dev, per)
-    ex._open_app_from_home("设置", obs, typed=False, query="shezhi")
+    ex._open_app_from_home("设置", obs, [])
     taps = [c for c in dev.calls if c[0] == "tap"]
     assert taps, "没点"
     label = next(e for e in per.observe(dev.capture()).elements if "设置" in e.text)
@@ -769,7 +772,9 @@ def test_it_uses_icon_above_because_tapping_the_label_does_nothing(fake_env):
 
 
 def test_giving_up_says_both_why_spotlight_failed_and_that_pages_were_searched(fake_env):
-    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["别的 App"]] * 30)
+    # 2026-09-14：翻主屏的第 1 页得认得出是主屏才往下翻（「别的 App」那一屏认不出，
+    # 就不是「翻了几页没找到」而是「回主屏后认不出主屏」），所以这里给一屏像主屏的。
+    dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["微信", "相机", "照片"]] * 30)
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("open_app", name="不存在的应用"), obs)
     assert res.error == "app_not_found"
@@ -811,7 +816,7 @@ def test_spotlight_query_uses_the_latin_part_of_a_mixed_name():
     from iphone_agent.harness.executor import spotlight_query
     assert spotlight_query("Safari 浏览器") == "Safari"
     assert spotlight_query("Google Maps") == "Google Maps"
-    assert spotlight_query("一木记账") == "yimujizhang"
+    assert spotlight_query("记账本") == "jizhangben"
     assert spotlight_query("备忘录") == "beiwanglu"
 
 
@@ -903,7 +908,7 @@ def test_type_that_changes_nothing_anywhere_is_verified_false_without_a_tap(fake
 # 打字通道死了，Spotlight 搜索框里还留着上一个任务打的 beiwanglu。旧结果列表底部恰好有个
 # 分组标题「设置」。open_app("设置") 精确匹配中了这个标题：点它没反应（还在 Spotlight）→
 # 点它上方的「图标」→ 实际点进了一条备忘录 → 离开了 Spotlight → 报 ok via=icon_above。
-# 模型以为进了设置，此后十几步都在收拾这个局面（runs/example-run）。
+# 模型以为进了设置，此后十几步都在收拾这个局面（runs/20260910-193640-bfd7）。
 # 「离开 Spotlight / 离开主屏」只说明有东西被打开了，说明不了打开的是谁。
 
 def _app_of(texts):
@@ -916,17 +921,20 @@ def _app_of(texts):
 
 def test_open_app_that_lands_in_the_wrong_app_is_not_a_success(fake_env):
     """真机那一次的复现：打字没落屏 → 精确匹配中分组标题「设置」→ 点上方进了一条备忘录。
-    看图说不是设置 → 不报成功，走不打字的退路（回主屏点图标）→ 真进了设置。"""
+    看图说不是设置 → 不报成功。
+
+    2026-09-14 起主屏在 Spotlight 前面翻过了（这里主屏上没有设置），Spotlight 开错之后
+    不再回主屏翻第二遍 —— 同一次 open_app 里再翻只会得到同一个结论。原来这条测的是
+    「开错 → 退回主屏点图标 → 真进了设置」，那条退路现在排在前面了。"""
+    from iphone_agent.harness.executor import HOME_PRESSES
     from tests.conftest import FakeDevice, SeesApps, frame_with_text, perceiver_for
-    start = ["设置", "微信", "相机", "备忘录"]
+    start = ["微信", "相机", "备忘录", "照片"]          # 像主屏，但没有设置
     stale = ["最佳搜索结果", "备忘录", "语音备忘录", "beiwanglu", "新备忘录", "导入的备忘录", "设置", "在App中搜索"]
     note = ["返回", "Wiamzusr1lp"]
-    inside = ["通用", "关于本机", "辅助功能"]
     f_start = [frame_with_text(start, i) for i in range(1, 5)]
     f_stale = [frame_with_text(stale, i) for i in range(5, 40)]
     f_note = [frame_with_text(note, i) for i in range(40, 60)]
     f_home = [frame_with_text(start, i) for i in range(60, 90)]
-    f_in = [frame_with_text(inside, i) for i in range(90, 110)]
 
     class Dev(FakeDevice):
         def key(self, n):
@@ -940,17 +948,15 @@ def test_open_app_that_lands_in_the_wrong_app_is_not_a_success(fake_env):
             super().tap(x, y)
             if self._frames is f_stale and sum(c[0] == "tap" for c in self.calls) == 2:
                 self._frames, self._i = f_note, 0       # 第二下「图标」点进了一条备忘录
-            elif self._frames is f_home:
-                self._frames, self._i = f_in, 0
 
-    frames = f_start + f_stale + f_note + f_home + f_in
+    frames = f_start + f_stale + f_note + f_home
     dev, per, asker = Dev(f_start), perceiver_for(frames), SeesApps(frames, _app_of)
     res, new = Executor(dev, per, asker=asker).run(act("open_app", name="设置"), per.observe(dev.capture()))
-    assert res.ok and res.extra["via"] == "home_icon", res.to_json()
-    assert res.extra["identity"]["verified"] is True
+    assert not res.ok and res.error == "app_not_found", res.to_json()
     wrong = res.extra["wrong_app"]
     assert wrong[0]["via"] == "icon_above" and wrong[0]["seen"] == "备忘录", wrong
-    assert "关于本机" in new.text_set
+    assert res.extra["typed"] is False
+    assert dev.calls.count(("key", "home")) == HOME_PRESSES, "主屏只翻一轮"
 
 
 def _spotlight_opens_notes_env():
@@ -988,7 +994,7 @@ def test_open_app_says_whether_the_app_was_verified(fake_env):
 
     dev, per, frames = _spotlight_opens_notes_env()
     res, _ = Executor(dev, per).run(act("open_app", name="备忘录"), per.observe(dev.capture()))
-    assert res.ok and res.extra["identity"] == {"verified": None}, res.to_json()
+    assert res.ok and res.extra["identity"] == {"verified": None, "by": "judge"}, res.to_json()
 
 
 def test_home_icon_that_opens_another_app_is_reported_honestly(fake_env):
@@ -1018,3 +1024,82 @@ def test_home_icon_that_opens_another_app_is_reported_honestly(fake_env):
     assert "备忘录" in res.hint and "翻了" not in res.hint, res.hint
     assert res.extra["wrong_app"][-1]["via"] == "home_icon"
     assert res.extra["typed"] is False, "打字通道失效的判据要保住：阶梯靠它触发"
+
+
+# --- 主屏 / Spotlight 上模型自己发的 tap icon_above 也要核对打开的 App 身份 ---
+#
+# runs/20260907-142838-fbc1:2（2026-09-11 用户决定）：模型在主屏第 2 页的前帧上 tap
+# icon_above「设置」，点击那一刻手机其实已经翻回第 1 页（前帧过期），同一位置是
+# Gemini —— 打开了 Gemini，孪生按标签记成了「设置」。前帧里没有任何结构信号能发现
+# 这件事，只有核对打开后的身份才能抓到，跟 open_app 用同一条规则（CLAUDE.md §7）。
+
+def _icon_of(obs, text):
+    return next(e for e in obs.elements if e.text == text)
+
+
+def test_icon_above_tap_on_home_verifies_identity_when_it_leaves_home(fake_env):
+    """主屏帧上 tap icon_above 点「设置」、画面变了、看图说是 → verified True，ok 仍为真。"""
+    from tests.conftest import SeesApps
+    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 4 + [["通用", "关于本机"]] * 8)
+    obs = per.observe(dev.capture())
+    label = _icon_of(obs, "设置")
+    asker = SeesApps(frames, lambda texts: "设置" if "通用" in texts else "主屏")
+    res, new = Executor(dev, per, asker=asker).run(
+        act("tap", id=label.id, x=label.center[0], y=label.center[1], target="icon_above"), obs)
+    assert res.ok and res.changed, res.to_json()
+    assert res.extra["identity"]["verified"] is True, res.to_json()
+    assert "通用" in new.text_set
+
+
+def test_icon_above_tap_on_home_verified_false_does_not_change_ok_or_hint(fake_env):
+    """看图说不是「设置」→ verified False，但只记录：不改这次点击算不算成功、不改 hint。"""
+    from tests.conftest import SeesApps
+    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 4 + [["你好", "新建备忘录"]] * 8)
+    obs = per.observe(dev.capture())
+    label = _icon_of(obs, "设置")
+    asker = SeesApps(frames, lambda texts: "备忘录" if "你好" in texts else "主屏")
+    res, new = Executor(dev, per, asker=asker).run(
+        act("tap", id=label.id, x=label.center[0], y=label.center[1], target="icon_above"), obs)
+    assert res.ok and res.changed, res.to_json()
+    assert res.extra["identity"]["verified"] is False, res.to_json()
+    assert res.hint is None, "只记录核对结果，不改 hint"
+
+
+def test_icon_above_tap_off_home_and_off_spotlight_is_not_identity_checked(fake_env):
+    """App 内点底部 tab 图标（同样是 icon_above）：动作前那一帧不是主屏也不是 Spotlight，
+    不核身份、也不该问看图。"""
+    from tests.conftest import SeesApps
+    dev, per, frames = fake_env([["聊天", "通讯录", "发现", "我"]] * 4 + [["会话列表"]] * 8)
+    obs = per.observe(dev.capture())
+    label = _icon_of(obs, "我")
+    asker = SeesApps(frames, lambda texts: "会话")
+    res, new = Executor(dev, per, asker=asker).run(
+        act("tap", id=label.id, x=label.center[0], y=label.center[1], target="icon_above"), obs)
+    assert res.ok and res.changed, res.to_json()
+    assert "identity" not in res.extra, res.to_json()
+    assert asker.asked == [], "非主屏 / 非 Spotlight 不该问看图"
+
+
+def test_icon_above_tap_on_home_with_no_screen_change_is_not_identity_checked(fake_env):
+    """点了但画面没变：不核身份。"""
+    from tests.conftest import SeesApps
+    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 8)
+    obs = per.observe(dev.capture())
+    label = _icon_of(obs, "设置")
+    asker = SeesApps(frames, lambda texts: "主屏")
+    res, new = Executor(dev, per, asker=asker).run(
+        act("tap", id=label.id, x=label.center[0], y=label.center[1], target="icon_above"), obs)
+    assert res.ok and res.changed is False, res.to_json()
+    assert "identity" not in res.extra, res.to_json()
+    assert asker.asked == []
+
+
+def test_icon_above_tap_on_home_without_an_asker_is_verified_none(fake_env):
+    """没有看图的一方：verified None，照记即可（§3 失败必须能被看见）。"""
+    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 4 + [["通用", "关于本机"]] * 8)
+    obs = per.observe(dev.capture())
+    label = _icon_of(obs, "设置")
+    res, new = Executor(dev, per).run(
+        act("tap", id=label.id, x=label.center[0], y=label.center[1], target="icon_above"), obs)
+    assert res.ok and res.changed, res.to_json()
+    assert res.extra["identity"] == {"verified": None, "by": "judge"}, res.to_json()

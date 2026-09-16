@@ -290,8 +290,8 @@ def test_runs_is_empty_before_anything_has_run(chat, clean):
 
 def test_runs_lists_newest_first(chat, clean):
     root = chat.workspace.runs
-    _make_run(root, "20000101-005908-0518", "早的")
-    _make_run(root, "20000101-010530-6551", "晚的")
+    _make_run(root, "20260909-005908-0518", "早的")
+    _make_run(root, "20260909-010530-6551", "晚的")
     _, data = api.runs(chat)
     assert [r["task"] for r in data["runs"]] == ["晚的", "早的"]
 
@@ -299,8 +299,8 @@ def test_runs_lists_newest_first(chat, clean):
 def test_runs_distinguishes_failed_from_unfinished(chat, clean):
     """跑崩了没写完 end_reason 的运行，界面要能跟「跑完了但没做成」分开显示。"""
     root = chat.workspace.runs
-    _make_run(root, "20000101-010530-6551", "没做成", end="no_progress")
-    _make_run(root, "20000101-010531-6552", "没跑完", end=None)
+    _make_run(root, "20260909-010530-6551", "没做成", end="no_progress")
+    _make_run(root, "20260909-010531-6552", "没跑完", end=None)
     by = {r["task"]: r for r in api.runs(chat)[1]["runs"]}
     assert by["没做成"]["ok"] is False and by["没做成"]["finished"] is True
     assert by["没跑完"]["ok"] is False and by["没跑完"]["finished"] is False
@@ -309,8 +309,8 @@ def test_runs_distinguishes_failed_from_unfinished(chat, clean):
 def test_a_broken_run_json_is_skipped_not_fatal(chat, clean):
     """跑到一半崩掉留下半个 run.json 是常态。它不能让整个列表打不开。"""
     root = chat.workspace.runs
-    _make_run(root, "20000101-010530-6551", "好的")
-    bad = root / "20000101-010531-6552"
+    _make_run(root, "20260909-010530-6551", "好的")
+    bad = root / "20260909-010531-6552"
     bad.mkdir(parents=True)
     (bad / "run.json").write_text("{ 这不是 json", encoding="utf-8")
     _, data = api.runs(chat)
@@ -320,24 +320,24 @@ def test_a_broken_run_json_is_skipped_not_fatal(chat, clean):
 def test_run_detail_prefixes_frames_with_the_run_id(chat, clean):
     """⚠ steps.jsonl 里的帧名不带目录（frame_001.png），而 /api/frame/ 是相对 runs/ 解析的。
     不补前缀就是一路 404 —— 点某一步什么都不显示。这条测试就是为那个 bug 立的。"""
-    _make_run(chat.workspace.runs, "20000101-010530-6551", steps=2)
-    code, data = api.run_detail(chat, "20000101-010530-6551")
+    _make_run(chat.workspace.runs, "20260909-010530-6551", steps=2)
+    code, data = api.run_detail(chat, "20260909-010530-6551")
     assert code == 200
     assert [s["frame"] for s in data["steps"]] == [
-        "20000101-010530-6551/frame_001.png", "20000101-010530-6551/frame_002.png"]
+        "20260909-010530-6551/frame_001.png", "20260909-010530-6551/frame_002.png"]
 
 
 def test_run_detail_carries_the_timings_replay_needs(chat, clean):
     """回放的节奏靠这两个。没有它们就只能固定节拍，看不出「哪一步卡了很久」。"""
-    _make_run(chat.workspace.runs, "20000101-010530-6551", steps=1)
-    _, data = api.run_detail(chat, "20000101-010530-6551")
+    _make_run(chat.workspace.runs, "20260909-010530-6551", steps=1)
+    _, data = api.run_detail(chat, "20260909-010530-6551")
     s = data["steps"][0]
     assert s["exec_ms"] == 1500 and s["latency_ms"] == 3000
 
 
 @pytest.mark.parametrize("bad", [
     "../../../etc/passwd", "..", ".", "", "notarunid",
-    "20000101-010530-6551/../..", "20000101-010530-655",
+    "20260909-010530-6551/../..", "20260909-010530-655",
 ])
 def test_run_detail_refuses_anything_that_is_not_a_run_id(chat, clean, bad):
     """这个 id 会被拼进文件路径 —— 形状校验是安全边界，不是格式洁癖。"""
@@ -346,19 +346,54 @@ def test_run_detail_refuses_anything_that_is_not_a_run_id(chat, clean, bad):
 
 
 def test_run_detail_survives_a_missing_steps_file(chat, clean):
-    d = chat.workspace.runs / "20000101-010530-6551"
+    d = chat.workspace.runs / "20260909-010530-6551"
     d.mkdir(parents=True)
     (d / "run.json").write_text(json.dumps({"task": "x", "end_reason": "done_success"}), encoding="utf-8")
-    code, data = api.run_detail(chat, "20000101-010530-6551")
+    code, data = api.run_detail(chat, "20260909-010530-6551")
     assert code == 200 and data["steps"] == []
 
 
 def test_run_detail_skips_a_corrupt_line_instead_of_dying(chat, clean):
-    d = _make_run(chat.workspace.runs, "20000101-010530-6551", steps=1)
+    d = _make_run(chat.workspace.runs, "20260909-010530-6551", steps=1)
     with (d / "steps.jsonl").open("a", encoding="utf-8") as f:
         f.write("{ 半行坏数据\n")
-    code, data = api.run_detail(chat, "20000101-010530-6551")
+    code, data = api.run_detail(chat, "20260909-010530-6551")
     assert code == 200 and len(data["steps"]) == 1
+
+
+def test_run_detail_prepends_the_task_s_first_frame(chat, clean):
+    """⚠ 2026-09-14：steps 只存 after_frame_file（每步做完之后的画面），第一步的
+    「发任务时那一刻」画面只在 observation.frame_file 里——回放因此从已经进了 App
+    的画面开始。这里应该补一条 n=0 的 start 项，把它放回第一帧。"""
+    d = chat.workspace.runs / "20260909-010530-6551"
+    d.mkdir(parents=True)
+    (d / "run.json").write_text(json.dumps(
+        {"task": "做点什么", "end_reason": "done_success", "steps": 1}), encoding="utf-8")
+    rec = {"step": 1, "action": {"name": "tap", "args": {"id": 1}},
+           "result": {"changed": True}, "model": {"reason": "理由", "latency_ms": 3000},
+           "observation": {"frame_file": "frame_001.png"},
+           "after_frame_file": "frame_002.png", "exec_ms": 1500}
+    (d / "steps.jsonl").write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    code, data = api.run_detail(chat, "20260909-010530-6551")
+    assert code == 200
+    assert len(data["steps"]) == 2
+    start, first = data["steps"]
+    assert start == {
+        "n": 0, "name": "start", "args": {}, "reason": "",
+        "changed": None, "error": None, "hint": "",
+        "frame": "20260909-010530-6551/frame_001.png",
+        "exec_ms": None, "latency_ms": None,
+    }
+    assert first["frame"] == "20260909-010530-6551/frame_002.png"
+    assert first["n"] == 1
+
+
+def test_run_detail_has_no_start_item_without_an_observation_frame(chat, clean):
+    """老的运行（或没存观测帧的那种）不该凭空造出一个 start 项。"""
+    _make_run(chat.workspace.runs, "20260909-010530-6551", steps=2)   # _make_run 不写 observation
+    _, data = api.run_detail(chat, "20260909-010530-6551")
+    assert [s["name"] for s in data["steps"]] == ["tap", "tap"]
 
 
 # ── 学到的 ──────────────────────────────────────────────────────────────

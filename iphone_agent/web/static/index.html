@@ -5,7 +5,7 @@
 <title>iPhone Agent</title>
 <!--
   ⚠ 这是**网页**，不是原生窗口。浏览器已经有一套 chrome，将来打包成 .app
-  系统还会再给一套 —— 页面里不画红绿灯、不画标题栏（设计说明 D5）。
+  系统还会再给一套 —— 页面里不画红绿灯、不画标题栏（docs/22 D5）。
   也没有任何外部资源：这是个离线的本机工具，断网也得能用。
 -->
 <link rel="stylesheet" href="app.css">
@@ -58,6 +58,12 @@
     <section class="pane on" data-pane="chat">
       <div id="chatwrap">
         <div id="chatcol">
+          <div id="chathead">
+            <button class="cbtn" id="newchat" title="新对话" data-i18n-title="chat.newChat">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+              <span class="lb" data-i18n="chat.newChat">新对话</span>
+            </button>
+          </div>
           <div id="banners"></div>
           <div id="log"></div>
           <div id="bar">

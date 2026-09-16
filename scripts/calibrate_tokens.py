@@ -36,7 +36,7 @@
   4)  .venv/bin/python scripts/calibrate_tokens.py --probe cache
       24 次请求（12 个前缀长度 × 2 遍），输入合计 ~3 万 token —— 前缀越长越贵，
       因为它要把前缀从明显低于 1024 token 扫到明显高于。产出「cached_tokens 从哪个
-      前缀长度开始非零」，回答 设计说明 的立项问题。
+      前缀长度开始非零」，回答 docs/19 §3.6 的立项问题。
 
   5)  .venv/bin/python scripts/calibrate_tokens.py --probe text
       37 次请求（9 条纯语料 × 4 个长度 + 1 条基线 + 4 条真实语料），
@@ -91,7 +91,7 @@
 
   10) 替换测试：把 tests/test_tokens.py 的 `test_image_rules_is_empty_until_t0_3_passes`
       **替换**（不是删除）成断言具体规则内容的测试，commit 里写明依据的官方文档版本。
-      再按 spec §4.4 写 内部标定记录（未公开）：机型、模型 id、
+      再按 spec §4.4 写 docs/superpowers/acceptance/2026-09-09-token标定.md：机型、模型 id、
       返回的 model_version、日期、每个系数的值与残差、样本数、探针原始数据路径。
 
   11) .venv/bin/python -m pytest -q  → 全绿再提交。
@@ -206,7 +206,7 @@ def _real_elements_text(limit_lines: int = 120) -> str | None:
     ⚠ 为什么不从历史 runs 里直接读：`steps.jsonl` 里**没有** elements_text ——
       `_` 开头的进程内材料不落盘。screenmap 是唯一一条能拿到真机 OCR 文字的路。
 
-    ⚠ 文字是真的（来自使用者本地 OCR 数据），**坐标和置信度是合成的**：screenmap 只存
+    ⚠ 文字是真的（4382 条真机 OCR），**坐标和置信度是合成的**：screenmap 只存
       文字，不存框。合成值用确定性伪随机铺在 0-1000（norm1000 就是这个量程），
       位数分布和真实坐标一致 —— 对分词来说要紧的正是「三位数、逗号、两位小数」
       这个形状，不是具体数值。这一点必须写在验收文档里，别让人以为整行都是实测。
@@ -1683,7 +1683,7 @@ def probe_cache(runner: Runner) -> dict | None:
         first_pt = next(r["prompt_tokens_2"] for r in rows if r["prefix_chars"] == threshold)
         print(f"\n缓存阈值: cached_tokens 从前缀 {threshold} 字开始非零"
               f"（那一档 prompt_tokens={first_pt}）。")
-        print("  这个数才是 前缀占比问题 的答案。拿它和真实运行的冻结前缀长度比，"
+        print("  这个数才是 docs/19 §3.6 的答案。拿它和真实运行的冻结前缀长度比，"
               "判断前缀够不够 1024 token。")
         if threshold == CACHE_PREFIX_CHARS[0]:
             print("  ⚠ 最短的一档就命中了：阈值在梯子外面，把 CACHE_PREFIX_CHARS 往下再排几档重跑。")

@@ -12,7 +12,7 @@
 
 ⚠ 为什么不是「把字符桶做细一点」（2026-09-09 实测结论，见 TOKENS_PER_CHAR
   下方的失败记录）：真实语料上 tools 桶构成与 mixed 桶构成相近，误差方向却
-  相反。数字出处是 内部标定记录（未公开） 的 real_eval.rows[]
+  相反。数字出处是 probe-text-20260909-152108.json 的 real_eval.rows[]
   （signed 值 = (predicted_content_tokens − measured_content_tokens)
   / measured_content_tokens，即该行 rel_error 带上方向）：
 
@@ -33,7 +33,7 @@
     无出处的百分比。
 
 ⚠ 2026-09-09 用 scripts/calibrate_tokens.py 跑了一轮受控探针，结果写进
-  内部标定记录（未公开），并把
+  docs/superpowers/acceptance/2026-09-09-token标定.md，并把
   EXACT_SEGMENT_TOKENS / SEGMENT_TOKENS_PER_CHAR / CALIBRATION_ID 三处
   手动填回了这里 —— budget 的 calibration 字段现在报
   "2026-09-09-qwen3.7-plus"，不再是 "uninitialized"。
@@ -55,7 +55,7 @@ from __future__ import annotations
 import dataclasses
 import math
 
-# 标定产物的标识，与验收文档 内部标定记录（未公开）
+# 标定产物的标识，与验收文档 docs/superpowers/acceptance/2026-09-09-token标定.md
 # 同名。2026-09-09 用 scripts/calibrate_tokens.py --probe segments（外加
 # gate/preflight/probe-text/probe-tools/probe-cache/probe-image 六个探针）
 # 在 alibaba:qwen3.7-plus 上跑出了下面这套系数。
@@ -79,7 +79,7 @@ CALIBRATION_ID = "2026-09-09-qwen3.7-plus"
 
 # ============================ 字符分桶 ============================
 # 2026-09-09 用 scripts/calibrate_tokens.py --probe text 在 qwen3.7-plus 上跑的
-# **第一轮**（出处 内部标定记录（未公开），records[]）。单语料斜率
+# **第一轮**（出处 probe-text-20260909-143809.json，records[]）。单语料斜率
 # （每种语料 200/500/1000/2000 字各一点，扣掉 0 字基线；每种语料**单独看**
 # 都是完美线性，斜率跨 200→2000 字稳到 3~4 位有效数字）：
 #
@@ -144,8 +144,8 @@ TOKENS_PER_CHAR: dict[str, float] = {
     "astral": 2.555,
 
     # ── 第二批实测（P1 第二轮为这四个桶补的纯语料）──────────────
-    # 出处：runs 与 内部标定记录（未公开）
-    #       内部标定记录（未公开），字段 records[]（label 形如
+    # 出处：runs 与 docs/superpowers/acceptance/2026-09-09-token标定/
+    #       probe-text-20260909-152108.json，字段 records[]（label 形如
     #       "ascii_alpha×2000"，meta.group == "pure"）。
     # 算法：斜率 = 过原点最小二乘 Σ(x·y)/Σ(x²)，x = meta.chars（200/500/1000/2000），
     #       y = prompt_tokens − baseline_tokens（该文件 baseline_tokens = 59）。
@@ -282,7 +282,7 @@ LAYER_CHAR_CLASS = "char_class"         # 8 桶字符类兜底，真实语料上
 #:
 #: 这个「大头」到底占多少，随每次调用里可变段（元素列表长度、图片尺寸、有没有
 #: 记忆注入）变化，不是一个常数。2026-09-09 的端到端实测（出处
-#: 内部标定记录（未公开） 的 cases[].budget.est_by_layer，
+#: endtoend-20260909-160000.json 的 cases[].budget.est_by_layer，
 #: measured_share = (exact + image_rule) / est_total）：
 #:
 #:     场景                    est_total  exact  image_rule  measured_share  实测   误差
@@ -306,13 +306,13 @@ LAYER_CHAR_CLASS = "char_class"         # 8 桶字符类兜底，真实语料上
 #:                 = sha256(json.dumps(tools, sort_keys=True, ensure_ascii=False))
 #:
 #: 值的来源（2026-09-09 实测，qwen3.7-plus，
-#: 内部标定记录（未公开），见
+#: docs/superpowers/acceptance/2026-09-09-token标定/probe-segments-20260909-154117.json，见
 #: scripts/calibrate_tokens.py --probe segments）：
 #:   system 1920 —— system_prompt(allow_coord_tap=True, has_skills=True)，3486 字，
 #:          实测 0.551 token/字符（字符类模型兜底预测的误差 31.1%，见验收文档）。
 #:   tools_schema 5300 —— tool_defs(True) 共 17 个工具，**走 `tools=` 参数发**的实测值。
-#:          出处 内部标定记录（未公开）
-#:          内部标定记录（未公开）（tools=[] 的 13 与
+#:          出处 docs/superpowers/acceptance/2026-09-09-token标定/
+#:          probe-tools-reconstant-20260909-merge.json（tools=[] 的 13 与
 #:          tools=tool_defs(True) 的 5313 之差）。
 #:
 #:          ⚠ 这条常量重标过一次：main 合入后工具表从 15 个（4629 token）涨到 17 个
@@ -325,21 +325,43 @@ LAYER_CHAR_CLASS = "char_class"         # 8 桶字符类兜底，真实语料上
 #:          ⚠⚠ tools= 参数发的实测值**不等于**把同一份 schema 当文本 json.dumps 再估的量
 #:          （服务端把工具表渲染成自己的模板，和我们序列化出的 JSON 不是同一段字节）。
 #:          15 个工具时两条路差 220 token / 4.8%（4629 vs 4409，textual json 值见
-#:          内部标定记录（未公开））。**17 个工具下这个百分比没有重测**——
+#:          probe-segments-20260909-154117.json）。**17 个工具下这个百分比没有重测**——
 #:          别直接拿 4.8% 套到新工具表上，也别拿新的 5300 直接减一个没测过的文本估值。
 #:          **这里必须用 tools= 参数量出来的值（5300）**——budget 记的是这次请求真正
 #:          花掉的 token，我们的调用方式就是传 tools=。
 #:
-#: 发布提示词使用中性示例，旧 system 精确标定不再适用；回退到段比例估算。
-#: 工具表未改变，保留其与内容哈希绑定的历史标定。重新标定必须使用真实 API 用量。
+#: ⚠ 只有 (True, True) 这一组的 system 有实测值。别的开关组合（无坐标 / 无剧本）
+#:   hash 不同、查不到，会**自动**落到第 2 层，不会拿这个值顶替。这是设计，不是遗漏。
 EXACT_SEGMENT_TOKENS: dict[tuple[str, str], int] = {
+    # 2026-09-09 晚：提示词版本 21（七节：你是谁 / 世界怎么运作 / iOS 惯例 / 镜像差别 /
+    # 你的手 / 怎么做事 / 每轮看到什么），calibrate_tokens.py --probe segments 重标。4463 字 → 2485 token。
+    # 2026-09-09 深夜：加「起点不确定 / 回根路径」三处（ios、world、method），重标。4735 字 → 2645 token。
+    # 2026-09-10：method 节补「写前先读当前值」，重标。4804 字 → 2690 token。
+    # 2026-09-10 上午：版本 22，手那一节加「交给人」（handover + 安全闸的存在），重标。4898 字 → 2747 token。
+    #   同一次工具表 17→18（新增 handover，expect 描述改成「换页动作请填」），5296 → 6087。
+    # 2026-09-10 下午（main）：hands/ios 加光标键（key 的 enum 从 4 个到 12 个，工具表一起变），重标。4967 字 → 2763 token，工具表 5384。
+    # 2026-09-10 合并两路（handover + 光标键）后重标，并去掉字数上限、恢复为凑上限删过的句子：
+    #   5157 字 → 2873 token；工具表 18 个（含 handover，key 的 enum 12 个）6175（走 tools= 参数）。
+    #   出处 docs/superpowers/acceptance/2026-09-09-token标定/probe-segments-20260910-150711.json。
+    # 2026-09-11：tap 的 expect 改必填、描述改成「」写法（docs/superpowers/specs/2026-09-11-点击预期核对-design.md），
+    #   只重标工具表：6226（走 tools= 参数）。出处 docs/superpowers/acceptance/2026-09-11-token标定/probe-segments-20260911-172845.json。
+    # 2026-09-11 终审：tap 的 expect 描述换掉「飞行模式」示例、加「别把你要点的那几个字放进「」」，只重标工具表：
+    #   6226 → 6265（走 tools= 参数）。出处 docs/superpowers/acceptance/2026-09-11-token标定/probe-segments-20260911-182254.json。
+    # 2026-09-1x：按需看图 —— 提示词版本 23（感知一节改为「默认只有 OCR」）、observe 描述改为看全屏，重标。
+    #   system 4967→5446 字（2763→3051 token）；工具表仍 18 个（observe 描述改字），6265→6308（走 tools= 参数）。
+    #   出处 docs/superpowers/acceptance/2026-09-15-token标定/probe-segments-20260915-115841.json。
+    # ⚠ 2026-09-16 公开导出：method 节里的账户示例名改成了通用占位（公开仓库不带个人内容），
+    #   prompt_hash 因此从 e9b0ed49927c 变成 42680c245e3a。**3051 这个值没有重测**：改动只是把
+    #   一个 4 字的中文示例词换成另一个 4 字的中文示例词，system 段字数不变（仍是 5446 字），
+    #   所以沿用了上一次实测值。要拿它当精确值用之前，重跑 --probe segments 重标一次。
+    ("system", "42680c245e3a"): 3051,
     ("tools_schema",
-     "ad1cc418693b345530440f92fa390fc488b9754a507cbbcf113973560ff76051"): 6175,
+     "e13f9bd621eb74014f56a6421041af54766fd9d2ccfd6b15c209b03ed376bcc9"): 6308,
 }
 
 #: 第 2 层：每段的 token/字符比。只填**这一段自己量过**（样本 ≥200 字）的值。
 #:
-#: 2026-09-09 实测，内部标定记录（未公开）
+#: 2026-09-09 实测，docs/superpowers/acceptance/2026-09-09-token标定/probe-segments-20260909-154117.json
 #: （下表「兜底误差」是第 3 层字符类模型在**这一段**上的相对误差 —— 它是这一层
 #: 相对兜底的收益，不是这一层自己的误差）：
 #:

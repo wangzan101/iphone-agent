@@ -114,12 +114,134 @@ def perceiver_for(frames):
                 out.append(RawBox(t, 0.99, 0.1, 0.85 - i * 0.055, 0.4, 0.04))
         return out
     per = Perceiver(ocr=ocr)
-    orig = per.observe
-    def observe(frame):
-        ocr._current_fid = frame.frame_id
-        return orig(frame)
-    per.observe = observe
+    _track_frame_ids(per, ocr, "_current_fid")
     return per
+
+
+def _track_frame_ids(per, ocr, attr):
+    """假 OCR 按 frame_id 吐文字，所以每个观察入口都要先把「现在看的是哪一帧」告诉它。
+
+    ⚠ 2026-09-14：Perceiver 多了一个只跑 OCR 的 observe_text（翻主屏找 App 用）。原来这里只包
+      observe，observe_text 拿到的是上一帧的 frame_id —— 假 OCR 吐的是旧画面的字，按帧编排的测试
+      全在建模一个不存在的画面。两个入口一起包。
+    """
+    for meth in ("observe", "observe_text"):
+        orig = getattr(per, meth)
+
+        def wrapped(frame, *a, _orig=orig, **kw):
+            setattr(ocr, attr, frame.frame_id)
+            return _orig(frame, *a, **kw)
+        setattr(per, meth, wrapped)
+
+
+GRID_COLS = (105, 243, 381, 519)
+
+
+def grid_perceiver_for(frames, asker=None):
+    """像 perceiver_for，但把每帧的文字排成主屏那样的 4 列网格（infer_page 认得出）。
+    位置取自真机标注：列 x 105/243/381/519、行 y 从 290 起每 150 一行（624×1388），框 80×22。"""
+    texts = {f.frame_id: t for f, t in frames}
+
+    def ocr(img):
+        out = []
+        for i, t in enumerate(texts.get(ocr.fid, [])):
+            cx, cy = GRID_COLS[i % 4], 290 + (i // 4) * 150
+            out.append(RawBox(t, 0.99, (cx - 40) / 624, 1 - (cy + 11) / 1388, 80 / 624, 22 / 1388))
+        return out
+
+    ocr.fid = None
+    per = Perceiver(ocr=ocr, asker=asker)
+    _track_frame_ids(per, ocr, "fid")
+    return per
+
+
+def page_frame(texts, frame_id):
+    """一页主屏 / 一个 App 画面：624×1388，和真机截图同尺寸（grid_perceiver_for 的网格按它标定）。"""
+    return frame_with_text(texts, frame_id, w=624, h=1388, rect=Rect(0, 0, 312, 694))
+
+
+class PagedDevice(FakeDevice):
+    """主屏若干页，画面只随动作切换（不靠数帧数）：
+
+    · key home → 第 1 页；key spotlight → spotlight 那一帧（给了的话）
+    · 在主屏页上 scroll right → 下一页，最后一页再翻不动；scroll left → 上一页
+    · type → after_type 那一帧（给了的话）
+    · tap → on_tap(dev, x, y) 返回的那一帧（返回 None = 点了画面不变）
+    """
+
+    def __init__(self, pages, start=None, spotlight=None, after_type=None, on_tap=None):
+        self.pages = list(pages)
+        self.page = 0
+        self.cur = start if start is not None else self.pages[0]
+        self.spotlight, self.after_type, self.on_tap = spotlight, after_type, on_tap
+        super().__init__([self.cur])
+
+    def _next(self):
+        self._i += 1
+        return self.cur[0]
+
+    def _show(self, f):
+        if f is not None:
+            self.cur = f
+
+    def on_home_page(self, index):
+        return self.cur is self.pages[index]
+
+    def key(self, n):
+        super().key(n)
+        if n == "home":
+            self.page = 0
+            self._show(self.pages[0])
+        elif n == "spotlight":
+            self._show(self.spotlight)
+
+    def scroll(self, d, a):
+        super().scroll(d, a)
+        if self.cur is self.pages[self.page]:
+            if d == "right" and self.page + 1 < len(self.pages):
+                self.page += 1
+            elif d == "left" and self.page > 0:
+                self.page -= 1
+            self._show(self.pages[self.page])
+
+    def type(self, t):
+        super().type(t)
+        self._show(self.after_type)
+
+    def tap(self, x, y):
+        super().tap(x, y)
+        if self.on_tap is not None:
+            self._show(self.on_tap(self, x, y))
+
+
+class CountingAsker:
+    """会被整屏解析问到的假视觉：只记次数，一律「没问成」（None）。用来证明某段路上没做整屏解析。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def ask_json(self, prompt, images, max_tokens=None):
+        self.calls += 1
+        return None
+
+
+@pytest.fixture
+def long_sleeps(monkeypatch):
+    """记下所有 ≥1 秒的 time.sleep（不真睡）；短的照睡 —— settle 的轮询要靠真实时钟走。
+
+    用来证明「只看不点时不硬等 AFTER_PAGE_FLIP_S，要点之前才等」（2026-09-14）。
+    events 是共享的：测试可以把设备动作也记进来，看等待落在哪两个动作之间。
+    """
+    real = time.sleep
+    events: list = []
+
+    def fake(s):
+        if s >= 1:
+            events.append(("sleep", s))
+        else:
+            real(s)
+    monkeypatch.setattr(time, "sleep", fake)
+    return events
 
 
 @pytest.fixture
@@ -177,6 +299,13 @@ def fast_timing(monkeypatch):
     monkeypatch.setattr(executor_mod, "IOS_TIMING", table)
     # loop 里也用 IOS_TIMING（回主屏之后的初始 settle），不patch 的话整套测试会慢一个数量级
     monkeypatch.setattr(loop_mod, "IOS_TIMING", table)
+    # ⚠ 2026-09-14：twin/scan.walk_home_pages 翻页后自己 settle，也用 IOS_TIMING —— 漏了它，每翻一页按真机
+    #   时序等，整套测试从 59 秒涨到 116 秒。翻页后点之前的 AFTER_PAGE_FLIP_S 同理置 0；
+    #   要验这段等待的测试自己 monkeypatch 一个值（见 long_sleeps）。
+    import iphone_agent.twin.scan as scan_mod
+    from iphone_agent import config
+    monkeypatch.setattr(scan_mod, "IOS_TIMING", table)
+    monkeypatch.setattr(config, "AFTER_PAGE_FLIP_S", 0.0)
 
 
 @pytest.fixture(autouse=True)

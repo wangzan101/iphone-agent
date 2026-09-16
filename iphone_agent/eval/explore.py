@@ -38,7 +38,7 @@ from iphone_agent.perceive.hashing import ahash, hamming, state_key
 from iphone_agent.perceive.ocr import run_vision_ocr, vision_box_to_pixels
 
 # 含这些字的元素不点。宁可漏掉一些正样本，也不能在别人手机上发出一条消息。
-# 词表本体在 harness/safety.py —— 主循环的安全闸用的是同一份（一个规则一个入口，项目开发约定）。
+# 词表本体在 harness/safety.py —— 主循环的安全闸用的是同一份（一个规则一个入口，CLAUDE.md §7）。
 DANGER = _DANGER
 STATUS_BAR = 0.11
 

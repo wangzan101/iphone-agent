@@ -2,7 +2,7 @@
 
 为什么要有它：原来 `cmd_doctor` 是「边检查边 print」，判断和展示黏在一起。
 界面消费不了一串文本 —— 它要知道**哪一项没过、为什么重要、怎么修、能不能一键修**，
-才谈得上做一个能让人自己走完的向导（设计说明 P0）。
+才谈得上做一个能让人自己走完的向导（docs/22 P0）。
 
 所以这里只产出事实，一个字都不打印。CLI 和网页各自渲染。
 
@@ -32,7 +32,7 @@ class Check:
     id: str
     title: str
     status: str                  # pass | fail | info
-    detail: str = ""             # 一行现状，比如 "iPhone 16e · 已连接"
+    detail: str = ""             # 一行现状，比如 "iPhone · 已连接"
     why: str = ""                # 这一项为什么重要
     fix: str = ""                # 人话的修法
     fix_url: str = ""            # 有就给一个「去授权」按钮
@@ -119,7 +119,10 @@ def check_capture(session) -> Check:
 
 
 def check_ocr(session) -> Check:
-    obs = session.per.observe(session.dev.capture())
+    # ⚠ 2026-09-15（按需看图终审发现 2）：这一项只查 OCR，走 observe_text。原来走 observe，不在任何 task_scope 里
+    #   就按代码默认 always 打一次整屏解析：IPHONE_SCREEN_PARSE=off 的人跑 doctor 也会被收一次视觉调用；
+    #   serve 的 /api/doctor 在 HTTP 线程上跑，任务正挂着 scope 时还会记进那个任务的解析统计。
+    obs = session.per.observe_text(session.dev.capture())
     n = len(obs.elements)
     return Check(
         id="perceive.ocr", title="文字识别", status=PASS if n else FAIL,

@@ -189,7 +189,7 @@ def _key_events(inj):
 
 def test_typing_sends_only_key_downs(monkeypatch):
     """真机实测：down+up 成对会让大小写按位置交替（abcdef→aBcDeF），
-    只发 down 才正确。见 设计说明 与 runs/pinyin4-*。"""
+    只发 down 才正确。见 docs/14 与 runs/pinyin4-*。"""
     dev, inj = make_device(monkeypatch)
     dev.type("abcdef")
     ev = _key_events(inj)

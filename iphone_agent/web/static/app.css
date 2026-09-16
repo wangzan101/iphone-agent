@@ -2,7 +2,7 @@
  *
  * 贴 macOS 原生指的是**排版、材质、语义色、动效**这一套语言，
  * 不是仿造窗口部件：页面里不画红绿灯，也不画标题栏。浏览器已经有一套 chrome，
- * 将来打包成 .app 系统还会再给一套（设计说明 D5）。
+ * 将来打包成 .app 系统还会再给一套（docs/22 D5）。
  *
  * 没有构建步骤。改完刷新就看得见。
  */
@@ -186,6 +186,7 @@ input,textarea,select{font:inherit;color:inherit}
 /* ═══ 5. 对话 ═════════════════════════════════════════════════════════ */
 #chatwrap{flex:1;display:flex;min-height:0}
 #chatcol{flex:1;min-width:0;display:flex;flex-direction:column}
+#chathead{flex:none;display:flex;justify-content:flex-end;padding:10px 16px 0}
 
 .banner{margin:10px 16px 0;padding:10px 12px;border-radius:var(--r-md);
   display:flex;align-items:center;gap:10px;font-size:var(--f-body);line-height:1.45;

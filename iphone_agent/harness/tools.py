@@ -1,4 +1,4 @@
-"""OpenAI function 定义。所有工具都带 reason（必填）与 expect（可选）。"""
+"""OpenAI function 定义。所有工具都带 reason（必填）与 expect（可选；tap 例外，必填）。"""
 from iphone_agent import config
 from iphone_agent.harness.actions import KEY_NAMES
 from iphone_agent.skills.tools import procedure_tool_defs
@@ -36,6 +36,19 @@ _TAP_DESC_HEAD = (
     "④ 列表行最左边的小图标 → tap(id, target=\"row_left\")。")
 _TAP_DESC_COORDS = "实在没有对应文字时才用坐标 x,y（单个整数，不是范围）。"
 
+# ⚠ 2026-09-11：tap 的 expect 改成必填。留档里只有 9.7% 的点击带 expect（525 次里 51 次），
+#   写了的也全是「进入设置主界面」这种页面名 —— 「变了但变错了」的核对和熔断的 wrong_page 第三态
+#   都以它为前提，几乎从不触发。只改 tap；其他动作的 expect 仍然可选。
+#   执行层对缺 expect 宽容（validate_action 不查它），结果里记 expect_check.by=missing。
+#   改这段文字 = 换 tools_schema 的哈希，要重标 tokens.EXACT_SEGMENT_TOKENS（见 _tool 里的注释）。
+# ⚠ 2026-09-11 终审：原来的示例「「飞行模式」变成打开」换掉了。「飞行模式」点之前就在屏上，永远不是
+#   新出现 —— 教的是核对不了的写法；还拿项目明令不碰的设置（CLAUDE.md §8）当示范，而模型每一步都读它。
+_TAP_EXPECT_DESC = ("必填。点完应该看到什么，一句话。把**点完之后才会出现**的关键字放进「」里，"
+                    "例如：点通用那一行，写 进入通用页，出现「关于本机」；点输入框，写 弹出键盘；"
+                    "点保存，写 出现「已保存」。**别把你要点的那几个字放进「」** —— 它们点之前就在屏上，"
+                    "核对不了。不知道会出现什么字，就写你想到达的页面。系统先核对「」里的字有没有新出现，"
+                    "对不上再看图核对；没达到会在结果里告诉你。")
+
 
 def tool_defs(allow_coord_tap: bool = True, procedures=()) -> list[dict]:
     """工具列表按本次任务生成：坐标开关来自模型档案（多模型 spec），剧本来自路由结果（skill 层 spec）。
@@ -50,9 +63,17 @@ def tool_defs(allow_coord_tap: bool = True, procedures=()) -> list[dict]:
         tap_props = {"id": {"type": "integer"}, "x": {"type": "integer"}, "y": {"type": "integer"},
                      "target": tap_props["target"]}
         tap_desc = _TAP_DESC_HEAD + _TAP_DESC_COORDS
+    tap = _tool("tap", tap_desc, tap_props, ["expect"])
+    tap["function"]["parameters"]["properties"]["expect"] = {"type": "string",
+                                                             "description": _TAP_EXPECT_DESC}
     defs = [
-        _tool("observe", "重新观察当前画面（动作后已自动观察，通常不需要）", {}, []),
-        _tool("tap", tap_desc, tap_props, []),
+        # ⚠ 2026-09-14（spec 按需看图 §4.1）：observe 改义为「看全屏」。on_demand 下每个动作之后本来就自动做一次
+        #   纯 OCR 观察，想重新截图可以用 wait —— 旧含义「重新观察」已经没用了。名字不变：它已在 guard 的不计数集合
+        #   和历史的「不改画面」集合里。改描述 = 换 tools_schema 的哈希，要重标 tokens.EXACT_SEGMENT_TOKENS。
+        _tool("observe", "看全屏：让视觉模型把整屏读一遍，补上图标、无字按钮、开关状态并编号。慢（几十秒）。"
+                         "知道东西大概在哪就先 zoom 那一块，快得多；不知道在哪、或者要一次看清整屏的控件时才用它。",
+              {}, []),
+        tap,
         _tool("scroll",
               "滚动。**direction 说的是你想看到的内容在哪个方向，不是手指往哪滑。**"
               "down=看下面的内容（列表往下走）；up=看上面；"

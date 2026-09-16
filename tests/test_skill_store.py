@@ -23,7 +23,7 @@ def proc(app="settings", name="ios-version", status="verified", risk="read", run
 
 
 def scen(name="daily-expense", status="manual"):
-    return M.Scenario(name=name, description="记账", apps=("alipay", "yimujizhang"), risk="write",
+    return M.Scenario(name=name, description="记账", apps=("alipay", "jizhangben"), risk="write",
                       status=status, body="1. 读账单\n")
 
 
@@ -90,6 +90,27 @@ def test_broken_personal_app_does_not_fall_back_to_shared(roots):
     assert "settings" not in cat.apps and any("APP.md" in p for p, _ in cat.broken)
 
 
+def test_personal_app_dir_without_app_md_does_not_shadow_shared(roots):
+    """孪生在个人层挂 apps/<slug>/screens/，不带 APP.md：不是 App，不该遮蔽结构层，也不该报 broken。"""
+    shared_writer(roots).write_app(app(body="结构层"))
+    d = roots.app_dir("settings")
+    (d / "screens").mkdir(parents=True)
+    (d / "screens" / "s_x.json").write_text("{}", encoding="utf-8")
+    cat = roots.load()
+    assert cat.apps["settings"].body.startswith("结构层")
+    assert "settings" not in cat.shadowed
+    assert cat.broken == []
+
+
+def test_personal_app_dir_without_app_md_and_no_shared_counterpart_is_not_an_app(roots):
+    d = roots.app_dir("settings")
+    (d / "screens").mkdir(parents=True)
+    (d / "screens" / "s_x.json").write_text("{}", encoding="utf-8")
+    cat = roots.load()
+    assert "settings" not in cat.apps
+    assert cat.broken == []
+
+
 def test_broken_procedure_is_skipped_and_reported(roots):
     roots.write_app(app())
     roots.write_procedure(proc())
@@ -138,7 +159,7 @@ def test_index_lists_only_verified_apps_eligible_procedures_and_manual_scenarios
     assert "- ios-version   读 iOS 版本（settings）（可直接调）" in text
     assert "wechat" not in text and "draft-one" not in text and "proposed-one" not in text
     assert "- write-one   读 iOS 版本（settings）\n" in text, "写类剧本不能自动执行，但技能本身还是给模型看"
-    assert "- daily-expense   记账（alipay + yimujizhang）" in text
+    assert "- daily-expense   记账（alipay + jizhangben）" in text
     assert text.endswith("以当前屏幕为准。")
 
 
@@ -264,3 +285,17 @@ def test_append_note_accumulates_proposals(roots):
     roots.append_note("settings", "列表两屏高")
     text = p.read_text(encoding="utf-8")
     assert "开关只能点右端" in text and "列表两屏高" in text and p.name == "NOTES-proposed.md"
+
+
+def test_export_never_takes_twin_files(roots, tmp_path):
+    """孪生纯本地（docs/32 〇）：屏文件、缩略图、整理日志一个都不能跟着导出（codex 评审第 8 条）。"""
+    roots.write_app(app())
+    d = roots.app_dir("settings")
+    (d / "screens" / ".corrupt").mkdir(parents=True)
+    (d / "screens" / "s_abc.json").write_text("{}", encoding="utf-8")
+    (d / "thumbs").mkdir()
+    (d / "thumbs" / "s_abc.png").write_bytes(b"x")
+    (d / "twin.log.jsonl").write_text("{}\n", encoding="utf-8")
+    out = roots.export("settings", tmp_path / "out")
+    assert (out / "APP.md").exists()
+    assert not any(p.name in ("screens", "thumbs", "twin.log.jsonl") for p in out.rglob("*"))

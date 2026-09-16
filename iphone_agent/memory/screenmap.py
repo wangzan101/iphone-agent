@@ -235,7 +235,7 @@ class ScreenMap:
             if len(best.samples) < 5:
                 best.samples.append(where)
             # 增量交集：和「把历史上所有集合重新求交」结果完全相同，但不必留着它们
-            # （设计说明 C2/C4：留着就是单节点 O(v²) 的重复求交 + 无界内存）。
+            # （docs/20 C2/C4：留着就是单节点 O(v²) 的重复求交 + 无界内存）。
             best.fingerprint &= texts
             best.owners[owner] += 1
             return best.key
@@ -407,7 +407,7 @@ def build_from_runs(runs_root: Path, cache: Path | None = None) -> ScreenMap:
     """把 runs/ 下所有 steps.jsonl 喂进去。坏文件跳过，不让一个坏 run 顶掉整张图。
 
     给了 `cache` 就先从它加载，只喂 mtime 变过（或没喂过）的 run，喂完写回。
-    这条路挡在任务启动的关键路径上（设计说明 C1），runs/ 一多全量重建就是纯浪费。
+    这条路挡在任务启动的关键路径上（docs/20 C1），runs/ 一多全量重建就是纯浪费。
     `cache=None` 时不读也不写缓存，全量重建，不碰磁盘——但喂入顺序跟有缓存时一样：
     没结束的 run 仍然放在最后喂（见 `_run_finished`），不是「跟以前完全一样」。
     """

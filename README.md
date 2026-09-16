@@ -156,21 +156,34 @@ Our vision is a revisable model of the device: where apps are, what screens mean
 | Layer | Current state |
 |---|---|
 | Home-screen layout | Implemented: schema, grid inference, persistence and scanning. |
-| Layout-assisted app opening | Implemented: use known layout candidates, verify identity and fall back when needed. |
+| Layout-assisted app opening | Implemented: the home screen is tried first, identity is verified, and it falls back when the layout is wrong. |
+| Screen knowledge | Implemented: screens named by a vision label, rebuildable from stored runs, with wrong-merge and wrong-owner merge gates. |
+| Location and route hints | Implemented: "where you are" and "routes that worked from here", marked as reference rather than instruction. |
 | Cross-task memory and skills | Implemented separately; broader integration is evolving. |
-| Rich screen/transition knowledge | Further work toward the digital-twin vision. |
 | Broad compatibility and robust stale-state handling | Active validation and development work. |
 
-Try the current device-layout layer:
+Try the device-layout layer, then the screen layer:
 
 ```sh
 iphone twin scan
 iphone twin show
+iphone twin rebuild
+iphone twin report
 ```
 
-**The current scan returns to the first home-screen page and records that page. It is not a full-phone crawl.** Later observations can refresh layout information as tasks run.
+**The scan walks the home-screen pages and records them without tapping. It is not a full-phone crawl.** Later observations can refresh layout information as tasks run. The screen layer is built by replaying your own finished runs, so it starts empty.
 
 Read [the design and boundaries](docs/digital-twin.md). Good contributions include a reproducible layout failure, a stale-page case or a better way to verify app identity.
+
+## Reading the screen: pick your tradeoff
+
+Every observation runs OCR. A whole-screen parse by the vision model is what finds icon-only controls and rows OCR cannot read — and it is also the slowest step in a task.
+
+```sh
+IPHONE_SCREEN_PARSE=on_demand iphone run "your task"
+```
+
+`always` (the default), `on_demand` and `off` decide when that parse runs. In `on_demand` the parse happens when the model asks for it or as a one-shot fallback before a step gives up, and a short label call keeps the twin learning. A smoke comparison on one device moved the median per-step time from 34.0s to 18.8s — one run per cell, `always` first, so a direction rather than a measurement. **The default stays `always` until there is better evidence.** See [screen parsing](docs/screen-parsing.md).
 
 ## Teach it an app. Share what works.
 
@@ -219,7 +232,7 @@ Configure from the web Settings page or `.iphone/config.toml`. See [setup](docs/
 
 The harness is an explicit task loop. The driver handles capture and input; perception turns pixels into usable observations; memory and skills carry context across runs; the twin layer begins to model the device.
 
-The first public candidate passed **1,344 automated tests** in an independent macOS/Python 3.13 environment. These are regression tests, not a real-device task-success benchmark. See [evaluation](docs/evaluation.md) and [architecture](docs/architecture.md).
+This export passes **1,784 automated tests** in an independent macOS/Python 3.13 environment. These are regression tests, not a real-device task-success benchmark. See [evaluation](docs/evaluation.md) and [architecture](docs/architecture.md).
 
 ## Build with us
 

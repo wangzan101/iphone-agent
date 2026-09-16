@@ -1,4 +1,4 @@
-"""孪生的读写底座：随机 id、原子替换、revision 检查。spec 设计说明、§7 不变式 3。"""
+"""孪生的读写底座：随机 id、原子替换、revision 检查。spec docs/32 §2、§7 不变式 3。"""
 import json
 import re
 

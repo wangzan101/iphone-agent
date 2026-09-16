@@ -68,13 +68,13 @@ class MessageLog:
             return f"hash_error:{type(e).__name__}"
 
     def freeze(self):
-        """设计说明：前缀在一次任务里冻结，绝不回头改 —— 改了就砸掉缓存前缀。"""
+        """docs/19 §2：前缀在一次任务里冻结，绝不回头改 —— 改了就砸掉缓存前缀。"""
         self._frozen = True
         self.frozen_prefix_hash = self.prefix_hash()
 
     def _assert_open(self):
         if self._frozen:
-            raise RuntimeError("前缀已冻结：任务开始后不能再往 system/前缀里加东西（冻结前缀约束）")
+            raise RuntimeError("前缀已冻结：任务开始后不能再往 system/前缀里加东西（docs/19 §2）")
 
     def user_observation(self, obs_parts: list[tuple[str, str]], image_b64: str,
                         *, px: tuple[int, int] = (0, 0)):
@@ -106,7 +106,7 @@ class MessageLog:
     def state_view(self, state_text: str, image_b64: str,
                    *, parts: list[tuple[str, str]] | None = None,
                    px: tuple[int, int] = (0, 0)) -> list[dict]:
-        """冻结前缀 + 一条状态报告（设计说明）。
+        """冻结前缀 + 一条状态报告（docs/19 §2）。
 
         raw 里的 observation / assistant / tool 消息一条都不进 —— 它们仍然照常记着
         （日志、window 模式都靠它），只是不发给模型：状态报告已经把该说的重建了一遍。
@@ -212,7 +212,7 @@ def middle_truncate(s: str, cap: int) -> str:
 def build_state_parts(*, history: str, memory: str | None, last_result: str | None,
                       transition: str | None, elements_text: str, step: int,
                       max_steps: int, user_notes: list[str] | None = None) -> list[tuple[str, str]]:
-    """每步重建的状态报告，按段拆开（设计说明）。
+    """每步重建的状态报告，按段拆开（docs/19 §2）。
 
     段落顺序固定：历史 → 备忘 → 用户补充 → 上一步结果 → 上一步之后 → 当前屏幕 → 步数。
     history 自带【到目前为止】标题，transition 自带【上一步之后】标题。

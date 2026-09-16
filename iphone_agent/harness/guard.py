@@ -34,7 +34,7 @@ class ActionGuard:
         # 连续几次点击**完全没有反应**。2026-09-08 撞到过一个真实状态：
         # 镜像窗口滚轮还灵、`key` 还灵，**点击整个不生效** —— SkyLight 后台点、
         # CGEvent 前台点、HID 全局点全试了，指针位置对、按键没卡、权限齐、
-        # App 重启过，都没用（见 设计说明）。
+        # App 重启过，都没用（见 docs/15）。
         # 这时模型收到的是「没检测到变化，可能没点中」，于是它换目标、换方式、
         # 一路试到熔断 —— 20 步全废在一个它根本改变不了的事情上。
         # 2026-09-10 起攒到 DEAD_TAPS_ALERT 不再提示模型，loop 直接走恢复阶梯（recovery.py）。
@@ -112,6 +112,14 @@ class ActionGuard:
             return "warn"
         return None
 
+    def grant_fallback(self) -> None:
+        """程序补看了一次全屏（spec 2026-09-14 §3.5），给模型再留 NO_PROGRESS_STOP - NO_PROGRESS_WARN 步。
+
+        ⚠ 必须设回 WARN，不能清零也不能不管：record_outcome 只在计数**正好等于**阈值时报 stop，
+          计数越过去就再也不会等于 —— 熔断就被拆了（loop.py 剧本那段注释说的是同一个坑）。
+        """
+        self.no_progress = config.NO_PROGRESS_WARN
+
 
 NO_PROGRESS_SAYS = {
     "revisited": ("你回到了**之前已经到过的画面** —— 动作是生效的（画面确实变了），"
@@ -124,6 +132,12 @@ NO_PROGRESS_SAYS = {
 }
 
 
+# spec 2026-09-14 §3.4：元素表默认只有 OCR，「列表里找不到」不等于「屏上没有」。每一种无进展都补这一句。
+NOT_IN_LIST = "目标不在元素列表里，就 zoom 那一块或 observe 看全屏。"
+
+
 def no_progress_hint(reason: str | None) -> str:
     """给模型的说法。⚠ 两种无进展必须分开说，见 ActionGuard.last_reason 的注释。"""
-    return NO_PROGRESS_SAYS.get(reason or "", NO_PROGRESS_SAYS["unchanged"])
+    return NO_PROGRESS_SAYS.get(reason or "", NO_PROGRESS_SAYS["unchanged"]) + " " + NOT_IN_LIST
+
+

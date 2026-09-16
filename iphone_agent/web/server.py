@@ -28,7 +28,7 @@ class Chat:
 
     def __init__(self, workspace: Workspace | None = None,
                  model_spec: str | None = None, resolved=None) -> None:
-        # 工作区显式传进来：路径不再是模块级常量，一个进程能开两场对话（设计说明 D3）。
+        # 工作区显式传进来：路径不再是模块级常量，一个进程能开两场对话（docs/20 D3）。
         self.workspace = workspace or Workspace.default()
         # resolved：serve 启动时那次解析的结果。不接过来的话，第一次对话会再解析一遍，
         # 同一批 notices 在 stderr 上打两遍。
@@ -144,6 +144,17 @@ class Chat:
         self._note = note or None
         self._paused.clear()
         self.emit("resumed", text=note)
+        return True
+
+    def new_chat(self) -> bool:
+        """开一场新对话：清空 history、last_step。有任务在跑就什么都不做，返回 False——
+
+        history 是每轮任务的上下文，跑到一半清掉会让正在跑的那一轮和已经产生的事件对不上。
+        """
+        if self.busy.locked():
+            return False
+        self.history = []
+        self.last_step = None
         return True
 
     @property
@@ -340,6 +351,12 @@ def _handler(chat: Chat):
                 return self._json((200, {"ok": True, "running": chat.stop()}))
             if self.path == "/api/pause":
                 return self._json((200, {"ok": True, "paused": chat.pause()}))
+            if self.path == "/api/new-chat":
+                if chat.new_chat():
+                    return self._json((200, {"ok": True}))
+                return self._json((409, {
+                    "ok": False, "error": "有任务正在跑，先停下来再开新对话。",
+                    "error_message": {"code": "api.newChatBusy"}}))
             if self.path == "/api/confirm":
                 body = self._body()
                 if body is None:
@@ -428,7 +445,7 @@ def _handler(chat: Chat):
 
             为什么要有它：进来第一眼那栏不该是一块黑的。用户对这个产品的全部信心
             都来自「我看见它在动我的手机」，而这份信心得在他还没发出第一条指令之前
-            就建立起来（设计说明 第三节）。
+            就建立起来（docs/22 第三节）。
 
             ⚠ 任务跑起来之后不要再问这里 —— 那时候画面由 SSE 的 step 事件驱动，
             两边同时抓帧会互相抢镜像窗口。
@@ -488,7 +505,7 @@ def serve(port: int = config.WEB_PORT, model_spec: str | None = None) -> int:
     except ConfigError as e:
         # ⚠ 以前这里 return 2 —— 服务根本起不来。
         #   但**填密钥的地方就在这个界面里**：起不来就永远进不去，新用户被锁在门外，
-        #   只能回去 vim config.toml。这正是产品化要消灭的那一步（设计说明 P2）。
+        #   只能回去 vim config.toml。这正是产品化要消灭的那一步（docs/22 P2）。
         #   所以照常起，把问题交给界面去说，并引导到设置页。
         print(f"还没配好：{e}", file=__import__("sys").stderr)
         print("界面照常打开，去「设置」里填上密钥就能用。", file=__import__("sys").stderr)

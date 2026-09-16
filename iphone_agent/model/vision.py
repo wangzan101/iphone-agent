@@ -24,6 +24,9 @@ from iphone_agent.model.reply import ModelError
 # 模型很爱把 JSON 裹进 ```json ... ``` 里，即使你让它别这么干。
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
 
+# 一次调用失败的种类（spec 2026-09-14 §8.1）：和 ask_json 的几个分支一一对应。
+OUTCOME_KINDS = ("transport", "exception", "truncated", "unparsable", "partial")
+
 
 def png_b64(img) -> str:
     buf = io.BytesIO()
@@ -80,6 +83,9 @@ class VisionAsker:
         self.truncations = 0
         self.cache_hits = 0
         self.last_error: str | None = None
+        # ⚠ 2026-09-14：last_error 是共享的，会被下一次调用覆盖、成功时也不清空 —— 拿它当「这一帧为什么失败」
+        #   就会把上一帧的原因安到这一帧头上。last_outcome 在每次调用开始时清空，Perceiver 调用一返回就抄进本帧。
+        self.last_outcome: dict | None = None
         # ⚠ 缓存放在**这一层**，缓存的是模型的原始回复，不是解析/融合之后的结果。
         #   评测集靠它做到「改融合、改坐标映射、改 OCR 后处理都不花钱」：
         #   那些都在这层之上，重跑是本地几百毫秒；只有改 prompt 或换模型才真调。
@@ -100,7 +106,9 @@ class VisionAsker:
 
     def ask_json(self, prompt: str, images: list, max_tokens: int | None = None):
         """images 是 PIL 图，按顺序附在问题后面。返回解析好的 JSON，失败返回 None。"""
+        self.last_outcome = None
         if not self.enabled or self._t is None:
+            self.last_outcome = {"kind": "transport", "detail": "视觉未启用或没有 transport"}
             return None
         cache_path = None
         if self.cache_dir is not None:
@@ -108,7 +116,10 @@ class VisionAsker:
             cache_path = Path(self.cache_dir) / f"{self._cache_key(prompt, images, max_tokens)}.json"
             if cache_path.exists():
                 self.cache_hits += 1
-                return extract_json(cache_path.read_text(encoding="utf-8"))
+                data = extract_json(cache_path.read_text(encoding="utf-8"))
+                if data is None:
+                    self.last_outcome = {"kind": "unparsable", "detail": f"缓存 {cache_path.name} 解析不出 JSON"}
+                return data
         parts: list[dict] = [{"type": "text", "text": prompt}]
         for img in images:
             parts.append({"type": "image_url",
@@ -119,10 +130,12 @@ class VisionAsker:
         except ModelError as e:
             self.failures += 1
             self.last_error = str(e)[:400]
+            self.last_outcome = {"kind": "transport", "detail": self.last_error}
             return None
         except Exception as e:      # 连接层的意外：一样只记不抛
             self.failures += 1
             self.last_error = f"{type(e).__name__}: {e}"[:400]
+            self.last_outcome = {"kind": "exception", "detail": self.last_error}
             return None
         truncated = getattr(self._t, "last_finish_reason", None) == "length"
         if truncated:
@@ -139,10 +152,12 @@ class VisionAsker:
                 f"回复被 max_tokens={getattr(self._t, 'last_max_tokens', '?')} 截断，"
                 f"连一条完整记录都没抢救出来（已生成 {len(text)} 字符）"
                 if truncated else f"回复里没有可解析的 JSON：{text[:200]!r}")
+            self.last_outcome = {"kind": "truncated" if truncated else "unparsable", "detail": self.last_error}
         elif truncated:
             # 抢救成功，但这次结果是**不完整**的 —— 该说一声，别让人以为这屏就这么点东西。
             self.last_error = (f"回复被 max_tokens={getattr(self._t, 'last_max_tokens', '?')} "
                                f"截断，只用上了能解析出来的那部分")
+            self.last_outcome = {"kind": "partial", "detail": self.last_error}
         return data
 
     def stats(self) -> dict:

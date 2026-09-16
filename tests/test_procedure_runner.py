@@ -66,9 +66,9 @@ def sim_perceiver(sim):
     per = Perceiver(ocr=ocr)
     orig = per.observe
 
-    def observe(frame):
+    def observe(frame, **kw):
         ocr._fid = frame.frame_id
-        return orig(frame)
+        return orig(frame, **kw)
     per.observe = observe
     return per
 
@@ -107,6 +107,9 @@ def test_happy_path_returns_read_value_and_logs_substeps(harness):
     subs = [s for s in RunLog.read_steps(log.dir) if s.get("kind") == "procedure_step"]
     assert [s["step"] for s in subs] == [1, 2] and all(s["parent_call_id"] == "c1" for s in subs)
     assert subs[0]["expect_ok"] is True and subs[0]["action"]["name"] == "tap"
+    # ⚠ 2026-09-11 final review：子记录没写 ts，twin/events.py 兜底成 0.0，
+    #   剧本碰过的屏在孪生里全带 1970 年戳。子记录必须自带真实时间戳。
+    assert all(isinstance(s.get("ts"), (int, float)) and s["ts"] > 0 for s in subs)
 
 
 def test_expect_mismatch_hands_back_current_screen(harness):

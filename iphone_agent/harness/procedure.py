@@ -210,7 +210,9 @@ class ProcedureRunner:
             self._verdict = verdict          # stop 盖过 warn：stop 这一步本来就要中止
         elif self.guard.no_progress == 0:
             self._verdict = None             # 计数被清零 = 真有进展，之前那次 warn 不作数了
-        rec = {"parent_call_id": call_id, "procedure": tool_name, "step": k,
+        rec = {"parent_call_id": call_id, "procedure": tool_name, "step": k, "ts": time.time(),
+               # ⚠ 2026-09-11 final review：漏了 ts，twin/events.py 兜底成 0.0，
+               #   剧本碰过的屏全带 1970 年戳（runs 里子记录一直没有 ts 这个键）。
                "observation": observation_snapshot(cur, self.log.save_frame(frame_stub(cur))),
                "action": {"name": action.name, "args": dict(action.args)},
                "result": json.loads(res.to_json())}

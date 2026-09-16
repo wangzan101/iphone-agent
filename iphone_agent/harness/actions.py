@@ -17,7 +17,7 @@ ICON_ABOVE_LABEL_RATIO = 3   # 图标中心 ≈ 标签中心上移 3 倍文字�
 def icon_y_above_label(center_y, box):
     """标签上方图标的 y 坐标：从标签中心上移 ICON_ABOVE_LABEL_RATIO 倍文字高，下限 0。
 
-    一个规则一个入口（项目开发约定）：主屏幕 / Spotlight「点了标签还在原处」那一步 /
+    一个规则一个入口（CLAUDE.md §7）：主屏幕 / Spotlight「点了标签还在原处」那一步 /
     布局表查表直达，凡是要从标签框推图标位置，都调这里，别再各自重复这条公式。
     `box` 是元素包围盒 `(x1, y1, x2, y2)`。
     """
@@ -80,7 +80,7 @@ class Action:
     reason: str
     expect: str | None
     call_id: str
-    # 模型对上一步的评价与自己维护的备忘（设计说明）。默认 None：
+    # 模型对上一步的评价与自己维护的备忘（docs/19 §2.3）。默认 None：
     # 老模型、老 prompt、测试脚本都不给这两个字段，构造必须照旧能用。
     eval: str | None = None
     memory: str | None = None
@@ -112,13 +112,19 @@ def _num(v, field):
 def _clamp_axis(v: float, size: int, field: str, coord_mode: str) -> int:
     tol = size * config.CLAMP_TOLERANCE
     if v < -tol or v > size + tol:
-        # 越界最常见的原因是坐标约定搞错了（给了像素，而这里要 0-1000），
-        # 光说「越界」模型只会换个像素值再试一遍 —— 真机上连试五次被熔断。
-        hint = ("坐标要用 0-1000 的归一化值，不是像素 —— 看元素列表头部那行。"
-                if coord_mode == "norm1000" else "")
-        raise ValidationError(
-            "out_of_image",
-            f"{field}={v} 超出图像 {size} 且超过 {config.CLAMP_TOLERANCE:.0%} 容差。{hint}")
+        # ⚠ 2026-09-16：这句提示以前一律说「坐标要用 0-1000 的归一化值，不是像素」。
+        #   那时 zoom 的框没被换算，模型给对了也被拒，还被这句话劝去改成像素 ——
+        #   提示在教它犯错，真机上连试五次熔断（见 model/coords.py）。
+        #   换算补齐之后，走到这里的就是**真的**出界，提示只该说「出界了」，不该说约定。
+        #   norm1000 下把数值换回模型自己那一套报出去：它写的是 1200，我们不能拿
+        #   换算后的 749 去问它 —— 那是它没写过的数，对不上就等于没有提示。
+        if coord_mode == "norm1000":
+            shown = round(v / size * 1000) if size else v
+            msg = (f"{field}={shown} 在屏幕外（0 是左/上边缘，1000 是右/下边缘，"
+                   f"超出 {config.CLAMP_TOLERANCE:.0%} 容差）。换一个屏幕之内的位置。")
+        else:
+            msg = f"{field}={v} 超出图像 {size} 且超过 {config.CLAMP_TOLERANCE:.0%} 容差。"
+        raise ValidationError("out_of_image", msg)
     return int(round(min(max(v, 0), size)))
 
 
@@ -173,7 +179,7 @@ def validate_action(action: Action, obs, procedures: dict | None = None, *,
                 # 列表行的版式很规整：文字在左、chevron/开关/数值在右、图标在最左，
                 # 三者在同一个 y 上。所以从行文字能推出同一行上另外两个位置，
                 # 而且推出来的是**精确坐标**，不是模型估的（模型估图标 p90 差 117px，
-                # 一个图标才 120px 宽 —— 2026-09-08 标定，见 设计说明）。
+                # 一个图标才 120px 宽 —— 2026-09-08 标定，见 docs/14）。
                 #
                 # ⚠ row_right 是**开关唯一能点中的地方**：点行文字不会切换开关，
                 #   而开关在 OCR 里根本没有元素。实测见 config 里的常量注释。

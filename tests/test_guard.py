@@ -29,6 +29,13 @@ def test_repeat_detected_only_after_executed():
     assert not g.check_repeat(a, 2, 800, 1700)  # 画面变了，同动作允许
 
 
+def test_no_progress_hint_points_at_zoom_and_observe():
+    """spec 2026-09-14 §3.4：无进展警告里点名「目标不在列表里就 zoom 或 observe」。"""
+    from iphone_agent.harness.guard import NOT_IN_LIST, no_progress_hint
+    for reason in ("unchanged", "revisited", "wrong_page", None):
+        assert no_progress_hint(reason).endswith(NOT_IN_LIST)
+
+
 def test_no_progress_warn_then_stop_and_reset():
     g = ActionGuard()
     a = act("tap", x=1, y=1)
@@ -121,7 +128,7 @@ def test_other_actions_still_count():
 
 # --- 两种「无进展」必须分开说 ---
 #
-# 2026-09-08 真机踩到（runs/example-run）：模型在底部 tab 之间来回点，
+# 2026-09-08 真机踩到（runs/20260908-022024-e257）：模型在底部 tab 之间来回点，
 # 每一步 changed=True，画面真的变了，熔断判「无进展」判**对**了 —— 回到见过的
 # 画面就是原地打转。但给它的说法是「连续 6 步没有检测到画面变化」。
 # 于是模型以为自己**没点中**，换了三个不同的图标继续试，在错误的假设上白烧六步。
@@ -219,3 +226,17 @@ def test_record_result_still_counts_plain_revisits_and_no_change():
     assert g.no_progress == 2 and g.last_reason == "unchanged"
     assert g.record_result(act("tap", x=3, y=3), SimpleNamespace(ok=False, changed=None, extra={}), None) is None
     assert g.no_progress == 2, "失败的动作不记账"
+
+
+def test_grant_fallback_rewinds_to_warn_so_the_breaker_fires_again():
+    """⚠ 不设回的话计数越过 NO_PROGRESS_STOP 就再也不会「等于」它，熔断就被拆了（spec 2026-09-14 §3.5）。"""
+    from iphone_agent import config
+    from iphone_agent.harness.actions import Action
+    from iphone_agent.harness.guard import ActionGuard
+    g = ActionGuard()
+    g.no_progress = config.NO_PROGRESS_STOP
+    g.grant_fallback()
+    assert g.no_progress == config.NO_PROGRESS_WARN
+    verdicts = [g.record_outcome(Action("tap", {"x": i, "y": 1}, "r", None, "c"), changed=False)
+                for i in range(config.NO_PROGRESS_STOP - config.NO_PROGRESS_WARN)]
+    assert verdicts[-1] == "stop" and verdicts[:-1] == [None] * (len(verdicts) - 1)

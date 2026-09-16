@@ -222,6 +222,11 @@ class SkillStore:
             if not d.is_dir():
                 continue
             name = d.name
+            # ⚠ 孪生共享 apps/<app>/ 这个目录名（screens/ 落认屏数据），个人层可能只有孪生数据、
+            #   没有 APP.md —— 这种目录不是 App：不能进遮蔽逻辑，也不该报 broken
+            #   （2026-09-11 final review：孪生把共享 App 目录挤没了）。
+            if not (d / "APP.md").exists():
+                continue
             if origin == "personal" and name in cat.apps:
                 cat.shadowed.add(name)
             if origin == "personal":
@@ -350,7 +355,7 @@ class SkillStore:
     write_scenario = write_skill        # 旧名
 
     def append_note(self, app: str, text: str) -> Path:
-        """模型提议的 App 脾气。不直接进 APP.md：一条没被审阅的记忆等于一段隐形 system prompt（设计说明）。"""
+        """模型提议的 App 脾气。不直接进 APP.md：一条没被审阅的记忆等于一段隐形 system prompt（docs/17 §2.2）。"""
         path = self.app_dir(app) / "NOTES-proposed.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -444,7 +449,9 @@ class SkillStore:
         out = Path(dest) / "knowledge" / "apps" / app
         if out.exists():
             raise M.SkillError("exists", f"{out} 已存在，不覆盖")
-        shutil.copytree(src, out, ignore=shutil.ignore_patterns("*.tmp", "NOTES-proposed.md"))
+        # ⚠ 孪生（screens/ thumbs/ twin.log.jsonl）是设备私有资产，纯本地，永不导出（spec 2026-09-11 §7）。
+        shutil.copytree(src, out, ignore=shutil.ignore_patterns(
+            "*.tmp", "NOTES-proposed.md", "screens", "thumbs", "twin.log.jsonl"))
         mp = out / "map.json"
         if mp.exists():
             m = json.loads(mp.read_text(encoding="utf-8"))

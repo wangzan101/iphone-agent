@@ -55,7 +55,7 @@ class MemoryEntry:
 class MemoryStore:
     def __init__(self, root: Path | None = None):
         # root 为 None 时落到默认工作区（env IPHONE_WORKSPACE，否则 cwd）——
-        # 位置和原来的 config.MEMORY_DIR 一样，只是现在能整块换掉（设计说明 D3）。
+        # 位置和原来的 config.MEMORY_DIR 一样，只是现在能整块换掉（docs/20 D3）。
         if root is None:
             from iphone_agent.workspace import Workspace
             root = Workspace.default().memory_dir

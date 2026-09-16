@@ -69,7 +69,7 @@ def test_frame_paths_must_stay_inside_runs():
 
 
 def test_the_page_is_self_contained():
-    """界面从「一个字符串常量」搬到了 web/static/（设计说明 P1）——
+    """界面从「一个字符串常量」搬到了 web/static/（docs/22 P1）——
     175 行的字符串撑不起向导、设置和技能页。
 
     但**没有构建步骤**这一条不变：这些文件原样发出去，改完刷新就看得见。
@@ -98,7 +98,7 @@ def test_serve_announces_a_missing_key_up_front_but_still_starts(tmp_path, monke
 
     但「起不来」这个做法在产品化之后是错的：**填密钥的地方就在这个界面里**，
     起不来就永远进不去，新用户只能回去 vim config.toml —— 那正是要消灭的一步
-    （设计说明 P2）。所以改成照常起，但立刻在终端说清楚，界面也能从
+    （docs/22 P2）。所以改成照常起，但立刻在终端说清楚，界面也能从
     /api/state 问出来同一件事。
     """
     from iphone_agent.web import server
@@ -288,6 +288,63 @@ def test_undo_rejects_names_outside_memory_name_re_with_400(tmp_path):
             resp.read()
             conn.close()
             assert resp.status == 400, f"{bad!r} 应该 400"
+    finally:
+        srv.shutdown()
+        srv.server_close()   # 不关会留一个没关的 socket，pytest 把这当成资源泄露警告报错
+
+
+# ── 新对话 ─────────────────────────────────────────────────────────────
+
+def test_new_chat_clears_history_and_last_step():
+    c = Chat()
+    c.history.append(("你好", "你好呀"))
+    c.last_step = {"n": 1, "name": "tap"}
+    assert c.new_chat() is True
+    assert c.history == []
+    assert c.last_step is None
+
+
+def test_new_chat_refuses_while_busy_and_changes_nothing():
+    """一台手机同一时刻只能做一件事——跑到一半清 history 会让正在跑的这一轮
+    和已经发生的事件对不上。"""
+    c = Chat()
+    c.history.append(("你好", "你好呀"))
+    c.busy.acquire()
+    assert c.new_chat() is False
+    assert c.history == [("你好", "你好呀")]
+
+
+def test_new_chat_endpoint_returns_200_and_clears_history(tmp_path):
+    srv, chat = _live_server(tmp_path)
+    try:
+        chat.history.append(("你好", "你好呀"))
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1])
+        conn.request("POST", "/api/new-chat")
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+        assert resp.status == 200
+        assert body == {"ok": True}
+        assert chat.history == []
+    finally:
+        srv.shutdown()
+        srv.server_close()   # 不关会留一个没关的 socket，pytest 把这当成资源泄露警告报错
+
+
+def test_new_chat_endpoint_returns_409_while_a_task_is_running(tmp_path):
+    srv, chat = _live_server(tmp_path)
+    try:
+        chat.busy.acquire()
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1])
+        conn.request("POST", "/api/new-chat")
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+        assert resp.status == 409
+        assert body["ok"] is False
+        assert body["error_message"]["code"] == "api.newChatBusy"
     finally:
         srv.shutdown()
         srv.server_close()   # 不关会留一个没关的 socket，pytest 把这当成资源泄露警告报错

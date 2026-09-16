@@ -41,14 +41,14 @@ def test_only_bracketed_words_count_as_named_targets():
 
 
 def test_the_known_false_success_would_not_be_caught_by_value_check():
-    """诚实记录这个检查抓不到什么：那次报了 iOS 26.6.1（设备的实际版本），
+    """诚实记录这个检查抓不到什么：那次报了 iOS 26.6.1（真值 18.3.1），
     而「更新到 iOS 26.6.1」确实在屏幕上 —— **假成功不是幻觉，是读错了地方**。"""
     assert fabricated_values(facts("iOS 26.6.1", "更新到iOS 26.6.1", "设置")) == []
 
 
 # --- 「有没有到过该到的屏」 ---
 #
-# 用两条真实轨迹验证过（runs/example-run 假成功、024924-eca3 真成功）：
+# 用两条真实轨迹验证过（runs/20260908-022551-5204 假成功、024924-eca3 真成功）：
 # 前者标为可疑、后者放行。下面是同样形状的合成用例。
 
 def _map(*runs):
@@ -94,7 +94,7 @@ def test_a_run_that_did_reach_it_is_not_flagged():
 def test_an_unidentifiable_destination_is_not_audited():
     """⚠ 目的地本身认不出来的不能拿来审计 —— 那时「没到过」其实是「认不出来」。
     漏了这一条，第一版把 5 次正确的运行标成了假成功。"""
-    once = [_s(1, ["主屏", "天气图标"], _tap(2)), _s(2, ["天气", "宝安区", "28°"])]
+    once = [_s(1, ["主屏", "天气图标"], _tap(2)), _s(2, ["天气", "示例城区", "28°"])]
     m = _map(once)                # 只跑一遍：目的地只到过 1 次，不可识别
     f = RunFacts("x", "打开「天气」App 读温度", "28°", set())
     assert never_reached(m, f, []) == []

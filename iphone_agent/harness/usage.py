@@ -2,7 +2,7 @@
 
 ⚠ 原来的累加器只收顶层 int（loop.py:278 的 isinstance(v, int)），
 把 prompt_tokens_details 这个嵌套 dict 整个丢了 —— 而 cached_tokens 就在里面。
-结果是 run.json 里从来没有过缓存命中数（设计说明）。
+结果是 run.json 里从来没有过缓存命中数（docs/19 §1）。
 
 只展一层，不递归：cached_tokens 是 prompt_tokens 的子集，键名必须保留
 "prompt_tokens_details.cached_tokens" 这个语义，不能和 prompt_tokens 混在一起加。

@@ -5,16 +5,18 @@ The CLI and local web UI share the session and task harness. The harness observe
 | Module | Responsibility |
 |---|---|
 | driver | Mirror window discovery, capture, coordinates and input injection |
-| perceive | OCR, model-assisted vision, element extraction and image-change checks |
+| perceive | OCR, model-assisted vision, element extraction, image-change checks and the screen-parsing policy |
 | model | Provider/model configuration, reply parsing and compatible transport |
 | harness | Task loop, history, action validation, execution, recovery and logging |
 | memory | File-based memory and reconstructed screen maps |
 | skills | Skill storage, extraction, routing and execution support |
-| twin | Device-layout schema, inference, scanning and updates |
+| twin | Device-layout schema, inference, scanning and updates; screen files, screen recognition, replay/rebuild, location and route hints, and merge gates |
 | cli / web | User interfaces sharing the underlying execution components |
 | eval | Replay and task-verification utilities |
 
 Input operates through macOS iPhone Mirroring. No app is installed on the phone. The driver uses macOS-specific mechanisms, including private system interfaces; OS changes may require adaptation.
+
+How much of a frame is read by the model, and when, is decided in one place — see [screen parsing](screen-parsing.md). Run records carry per-step phase timings (`capture`, `settle`, `ocr`, `parse`, `label`, `zoom`, `judge`) so a slow step can be attributed rather than guessed at.
 
 A Workspace places configuration and knowledge under `.iphone/` and run artifacts under `runs/`. `IPHONE_WORKSPACE` can select a different workspace root. These directories are user data, not distributable examples.
 

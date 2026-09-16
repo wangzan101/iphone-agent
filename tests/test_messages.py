@@ -62,7 +62,7 @@ def test_assistant_message_has_tool_calls_shape():
     assert a["tool_calls"][0]["function"]["name"] == "tap"
 
 
-# ---- 状态报告视图（设计说明）----
+# ---- 状态报告视图（docs/19 §2）----
 
 def test_freeze_rejects_prefix_edits():
     log = MessageLog()
@@ -77,7 +77,7 @@ def test_freeze_rejects_prefix_edits():
 
 def test_prefix_hash_is_stable_across_appends_after_freeze():
     """freeze() 之后追加的 observation/assistant/tool 消息不进 prefix_hash 的
-    计算范围——它们本来就不是「前缀」（设计说明），hash 只该盯着前缀本身。"""
+    计算范围——它们本来就不是「前缀」（docs/19 §2），hash 只该盯着前缀本身。"""
     log = MessageLog()
     log.system("sys")
     log.user_text("任务：t", seg="task")

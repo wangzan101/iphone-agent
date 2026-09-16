@@ -197,7 +197,7 @@ def test_unknown_target_rejected():
 #
 # 列表行：文字在左、chevron/开关/数值在右、图标在最左，三者同一个 y。
 # 这么做而不是让模型估坐标，是因为标定出来模型指图标 p90 差 117px，
-# 而一个图标才 120px 宽（设计说明）。
+# 而一个图标才 120px 宽（docs/14）。
 
 def test_row_right_keeps_the_row_and_moves_to_the_right_edge():
     o = obs_with_box(1, (100, 500), (80, 490, 160, 510))
@@ -252,18 +252,18 @@ def test_procedure_action_validates_declared_params():
 
     from iphone_agent.harness.actions import Action, ValidationError, validate_action
     from iphone_agent.skills import model as M
-    p = M.Procedure(name="add", app="yimujizhang", description="记一笔",
+    p = M.Procedure(name="add", app="jizhangben", description="记一笔",
                     params={"金额": {"type": "string", "description": ""}}, returns=[], risk="read",
                     status="verified", expect_source="single_run", provenance=M.Provenance(),
                     steps=[M.Step(do="type", text="{金额}", expect=())])
     procs = {p.tool_name: p}
-    ok = validate_action(Action("yimujizhang__add", {"金额": "12"}, "r", None, "c"), None, procs)
+    ok = validate_action(Action("jizhangben__add", {"金额": "12"}, "r", None, "c"), None, procs)
     assert ok.args == {"金额": "12"}
     with pytest.raises(ValidationError) as e:
-        validate_action(Action("yimujizhang__add", {}, "r", None, "c"), None, procs)
+        validate_action(Action("jizhangben__add", {}, "r", None, "c"), None, procs)
     assert e.value.code == "invalid_args"
     with pytest.raises(ValidationError):
-        validate_action(Action("yimujizhang__add", {"金额": "12", "多余": "x"}, "r", None, "c"), None, procs)
+        validate_action(Action("jizhangben__add", {"金额": "12", "多余": "x"}, "r", None, "c"), None, procs)
     with pytest.raises(ValidationError) as e:
         validate_action(Action("nobody__x", {}, "r", None, "c"), None, procs)
     assert e.value.code == "unknown_tool"

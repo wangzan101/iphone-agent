@@ -74,7 +74,7 @@ def models(chat) -> tuple[int, dict]:
                 "current": current, "default": registry.DEFAULT_MODEL_SPEC}
 
 
-# 运行目录名的形状：20000101-000000-abcd（合成示例）。
+# 运行目录名的形状：20260909-010530-6551。
 # ⚠ 这是**安全边界**，不是格式洁癖 —— 这个 id 会被拼进文件路径。
 #   只认这个形状，再加一道 resolve 后的包含关系检查（见 _run_dir）。
 RUN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-z]{4}$")
@@ -147,6 +147,7 @@ def run_detail(chat, run_id: str) -> tuple[int, dict]:
         return 404, {"error": "没有这次运行", "error_message": {"code": "api.runMissing"}}
     brief = _run_brief(d) or {"id": run_id}
     steps = []
+    start_frame = None
     try:
         with (d / "steps.jsonl").open(encoding="utf-8") as f:
             for line in f:
@@ -157,10 +158,13 @@ def run_detail(chat, run_id: str) -> tuple[int, dict]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue                         # 坏行跳过，不能因为一行毁掉整次回放
+                obs = rec.get("observation") or {}
+                if start_frame is None and obs.get("frame_file"):
+                    start_frame = obs["frame_file"]
                 a = rec.get("action") or {}
                 res = rec.get("result") or {}
                 m = rec.get("model") or {}
-                frame = rec.get("after_frame_file") or (rec.get("observation") or {}).get("frame_file")
+                frame = rec.get("after_frame_file") or obs.get("frame_file")
                 steps.append({
                     "n": rec.get("step"),
                     "name": a.get("name"),
@@ -176,6 +180,17 @@ def run_detail(chat, run_id: str) -> tuple[int, dict]:
                 })
     except OSError:
         pass                                         # 没有 steps.jsonl 也返回摘要，别 500
+    if start_frame:
+        # ⚠ 2026-09-14：每一步存的是它的 after_frame_file（动作之后的画面），第一步的
+        # before 画面（发任务那一刻、还没做任何操作的 home 屏）只落在 observation 里，
+        # 从没被放进 steps —— 回放因此从「已经进了 App」开始，用户以为一开始就在 App 里。
+        # 这里补一条 n=0 的 start 项，把「发任务时的画面」放回回放的第一帧。
+        steps.insert(0, {
+            "n": 0, "name": "start", "args": {}, "reason": "",
+            "changed": None, "error": None, "hint": "",
+            "frame": f"{run_id}/{start_frame}",
+            "exec_ms": None, "latency_ms": None,
+        })
     return OK, {**brief, "steps": steps}
 
 
@@ -183,7 +198,7 @@ def learned(chat) -> tuple[int, dict]:
     """它从跑过的任务里长出来的东西：App、剧本、场景、跨任务记忆。
 
     这是这个项目最独特的一层，一直只在 `iphone skill list` 里看得见 —— 藏在命令行里
-    是浪费（设计说明 P4）。界面要能看见，尤其要能看见**待批准**的那些：
+    是浪费（docs/22 P4）。界面要能看见，尤其要能看见**待批准**的那些：
     写类剧本（会改 UI 的操作）必须人点头模型才敢调用，那个「点头」本身就是这一页的功能。
     """
     from iphone_agent.memory.store import MemoryStore

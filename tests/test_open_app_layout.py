@@ -1,9 +1,10 @@
-"""open_app 查表直达：布局表只给候选页和格子，当前帧负责确认（设计说明）。零打字。"""
+"""open_app 查表直达：布局表只给候选页和格子，当前帧负责确认（docs/32 §5.1）。零打字。"""
 from iphone_agent.driver.geometry import Rect, image_to_screen
 from iphone_agent.harness.actions import Action, icon_y_above_label
 from iphone_agent.harness.executor import Executor
 from iphone_agent.perceive.elements import Element
 from iphone_agent.twin import layout as L
+from tests.conftest import CountingAsker, PagedDevice, SeesApps, grid_perceiver_for, page_frame
 
 HOME = ["设置", "照片", "日历", "备忘录", "时钟", "计算器", "天气", "相机"]     # ≥3 个主屏特征词
 APP = ["通用", "关于本机", "软件更新"]
@@ -93,9 +94,8 @@ def test_app_on_page_two_flips_once_before_tapping(fake_env, monkeypatch):
     """起点 → 主屏第 1 页 → 翻页后第 2 页 → 点图标后进了微信。
 
     同上一条的 Ruling 3 说明：改成「按了哪个键/滚了哪个方向就换哪一叠帧」，不靠数帧数。
-    翻页之后 executor 会 `time.sleep(config.AFTER_PAGE_FLIP_S)`（真机 2 秒，见那个常量的注释）——
-    测试不能真睡这 2 秒，monkeypatch 成 0（precedent test_open_app_falls_back_to_the_home_screen_icon
-    没有翻页所以没撞上这个问题；这条测试恰恰会翻页，必须处理）。
+    翻页之后、点之前 executor 会把 `config.AFTER_PAGE_FLIP_S` 等满（真机 2 秒，见那个常量的注释）——
+    测试不能真睡这 2 秒，monkeypatch 成 0。
     """
     from iphone_agent import config
     from tests.conftest import FakeDevice, frame_with_text, perceiver_for
@@ -221,30 +221,9 @@ def _switching_dev(start, on_home, on_tap=None):
 
 
 def _grid_perceiver(frames):
-    """像 conftest.perceiver_for，但把每帧的文字排成主屏那样的 4 列网格（infer_page 认得出）。
-    位置取自真机标注：列 x 105/243/381/519、行 y 从 290 起每 150 一行（624×1388），框 80×22。"""
-    from iphone_agent.perceive.observe import Perceiver
-    from iphone_agent.perceive.ocr import RawBox
-    texts = {f.frame_id: t for f, t in frames}
-    cols = (105, 243, 381, 519)
-
-    def ocr(img):
-        out = []
-        for i, t in enumerate(texts.get(ocr.fid, [])):
-            cx, cy = cols[i % 4], 290 + (i // 4) * 150
-            out.append(RawBox(t, 0.99, (cx - 40) / 624, 1 - (cy + 11) / 1388, 80 / 624, 22 / 1388))
-        return out
-
-    ocr.fid = None
-    per = Perceiver(ocr=ocr)
-    orig = per.observe
-
-    def observe(frame):
-        ocr.fid = frame.frame_id
-        return orig(frame)
-
-    per.observe = observe
-    return per
+    """像 conftest.perceiver_for，但把每帧的文字排成主屏那样的 4 列网格（infer_page 认得出）。"""
+    from tests.conftest import grid_perceiver_for
+    return grid_perceiver_for(frames)
 
 
 def _run_open(dev, per, layout, name):
@@ -341,9 +320,13 @@ def test_page_order_out_of_range_is_not_flipped_to(fake_env, monkeypatch):
     from iphone_agent import config
     # 闸坏了会翻 49 页、每页硬等 AFTER_PAGE_FLIP_S —— 测试要红得快，不要卡 100 秒
     monkeypatch.setattr(config, "AFTER_PAGE_FLIP_S", 0.0)
+    from iphone_agent.harness.executor import HOME_PRESSES
     for order in (50, 0, config.HOME_PAGES_MAX + 1):
         res, new, dev = _open(fake_env, [APP] + [["设置", "通用"]] * 12, _layout_with(HOME, order=order))
-        assert dev.calls[0] == ("key", "spotlight"), (order, dev.calls[:3])
+        # 2026-09-14 起直达没成先翻主屏（从第 1 页找），所以 home 会被按 —— 但只按翻主屏那一轮的
+        # HOME_PRESSES 次：直达那条路既没回主屏也没翻页。这页认不出主屏，最后才是 Spotlight。
+        assert dev.calls.count(("key", "home")) == HOME_PRESSES, (order, dev.calls[:6])
+        assert ("key", "spotlight") in dev.calls, order
         assert not any(c[0] == "scroll" for c in dev.calls), order
         assert res.extra["layout_miss"] == "page_out_of_range", order
 
@@ -391,3 +374,216 @@ def test_direct_open_that_lands_in_another_app_falls_back_and_says_so(fake_env):
     assert res.extra["wrong_app"][0]["via"] == "layout" and res.extra["wrong_app"][0]["seen"] == "备忘录"
     assert any(c == ("key", "spotlight") for c in dev.calls), "直达开错了要退回 Spotlight"
     assert not (res.ok and res.extra.get("via") == "layout")
+
+
+# ---------- 2026-09-14：主屏优先、只用 OCR 翻页找 App，Spotlight 打字放最后 ----------
+#
+# 布局表只有第 1 页 → 直达 23/23 次 no_hit；退路翻主屏每页做一次整屏解析，中位 112 秒（n=23），
+# 比 Spotlight 44–53 秒还慢；而打字是全项目最脆的通道（docs/15；2026-09-08 39/40 次打字失败）。
+# 现在的顺序：查表直达 → 从第 1 页往右翻着找（只跑 OCR）→ 都没有才打字。
+
+P1 = ["照片", "日历", "时钟", "计算器", "天气", "相机", "地图", "App Store"]     # 第 1 页：没有「设置」
+P2 = ["设置", "备忘录", "提醒事项", "微博", "支付宝", "淘宝", "抖音", "美团"]
+P3 = ["记账本", "滴滴出行", "高德地图", "携程旅行", "饿了么", "闲鱼", "得物", "Keep"]
+SETTINGS_IN = ["通用", "关于本机", "辅助功能", "隐私与安全性"]
+SPOT = ["Q 搜索", "Siri建议"]
+
+
+def _paged(pages_labels, opens=None, spotlight=None, after_type=None, asker=None):
+    """主屏 pages_labels 若干页；opens = {页下标: 点开后的标签}（在那一页上点了就进那个画面）。
+    spotlight / after_type：按 Spotlight、打完字之后的画面标签；点了 after_type 那一帧进 opens['spot']。"""
+    fid = iter(range(1, 1000))
+    pages = [page_frame(t, next(fid)) for t in pages_labels]
+    opened = {k: page_frame(v, next(fid)) for k, v in (opens or {}).items()}
+    spot = page_frame(spotlight, next(fid)) if spotlight else None
+    typed = page_frame(after_type, next(fid)) if after_type else None
+
+    def on_tap(dev, x, y):
+        for k, f in opened.items():
+            if k == "spot" and typed is not None and dev.cur is typed:
+                return f
+            if k != "spot" and dev.on_home_page(k):
+                return f
+        return None
+
+    frames = pages + list(opened.values()) + [f for f in (spot, typed) if f is not None]
+    dev = PagedDevice(pages, start=page_frame(["聊天", "通讯录"], 999), spotlight=spot,
+                      after_type=typed, on_tap=on_tap)
+    return dev, grid_perceiver_for(frames + [dev.cur], asker=asker)
+
+
+def _layout_of(*label_lists):
+    lay = L.Layout()
+    for i, labels in enumerate(label_lists, start=1):
+        lay.upsert_page(L.infer_page(_elements(labels), 624, 1388, order=i))
+    return lay
+
+
+def _open_with(dev, per, name, layout=None, layout_path=None, asker=None):
+    obs = per.observe(dev.capture())
+    ex = Executor(dev, per, layout=layout, layout_path=layout_path, asker=asker)
+    res, new = ex.run(Action("open_app", {"name": name}, "r", None, "c1"), obs)
+    return res, new, ex
+
+
+def test_layout_hit_on_page_two_opens_without_typing_and_waits_before_the_tap(monkeypatch, long_sleeps):
+    """表里设置在第 2 页 → 回第一页、翻一页、当前帧（只跑 OCR）上找到标签 → 等满 AFTER_PAGE_FLIP_S → 点。"""
+    from iphone_agent import config
+    monkeypatch.setattr(config, "AFTER_PAGE_FLIP_S", 3.0)
+    dev, per = _paged([P1, P2], opens={1: SETTINGS_IN})
+    dev.calls = long_sleeps                    # 设备动作和长等待记进同一张表，看等待落在哪
+    res, new, _ = _open_with(dev, per, "设置", layout=_layout_of(P1, P2))
+    assert res.ok and res.extra["via"] == "layout" and res.extra["page"] == 2, res.to_json()
+    assert not any(c[0] == "type" for c in dev.calls) and ("key", "spotlight") not in dev.calls
+    kinds = [c[0] for c in long_sleeps]
+    assert kinds.count("sleep") == 1, long_sleeps
+    i_sleep = kinds.index("sleep")
+    assert kinds.index("scroll") < i_sleep < kinds.index("tap"), long_sleeps
+    assert 2.0 < long_sleeps[i_sleep][1] <= 3.0, "等的是翻页后剩下的那段，不是每翻一页硬等一次"
+    assert "关于本机" in new.text_set
+
+
+def test_stale_layout_falls_to_the_home_walk_and_finds_it_without_typing(tmp_path):
+    """表说设置在第 1 页（过时了）：直达 label_missing → 从第 1 页往右翻着找 → 第 2 页找到、点开。
+    翻过的页按真实页序写回布局表，下次直达就能用。"""
+    path = tmp_path / "layout.json"
+    stale = _layout_of(HOME)
+    assert stale.save(path)
+    dev, per = _paged([P1, P2], opens={1: SETTINGS_IN})
+    res, new, ex = _open_with(dev, per, "设置", layout=stale, layout_path=path)
+    assert res.ok and res.extra["via"] == "home_icon" and res.extra["page"] == 2, res.to_json()
+    assert res.extra["layout_miss"] == "label_missing"
+    assert res.extra["tapped"] == "设置"
+    assert not any(c[0] == "type" for c in dev.calls) and ("key", "spotlight") not in dev.calls
+    got = L.Layout.load(path)
+    assert got.find_app("设置").page_order == 2, [(p.order, p.labels) for p in got.pages]
+    assert got.find_app("照片").page_order == 1
+    assert ex.layout.find_app("设置").page_order == 2, "同一个任务里下一次 open_app 直接用新表"
+
+
+def test_no_layout_home_walk_builds_the_table_on_the_way(tmp_path):
+    """第一天没扫过：翻主屏找 App 顺手把翻过的页记下来（它知道页序）。"""
+    path = tmp_path / "layout.json"
+    dev, per = _paged([P1, P2, P3], opens={2: ["记一笔", "账单"]})
+    res, _, ex = _open_with(dev, per, "记账本", layout=None, layout_path=path)
+    assert res.ok and res.extra["via"] == "home_icon" and res.extra["page"] == 3, res.to_json()
+    assert "layout_miss" not in res.extra, "没表 = 没尝试直达"
+    assert sorted(p.order for p in L.Layout.load(path).pages) == [1, 2, 3]
+    assert ex.layout is not None and ex.layout.find_app("记账本").page_order == 3
+
+
+def test_app_on_no_home_page_falls_back_to_spotlight_once(tmp_path):
+    """主屏哪一页都没有 → 才打字。Spotlight 那条路自己不再回主屏翻一遍（刚翻过）。"""
+    from iphone_agent.harness.executor import HOME_PRESSES
+    spot_hit = ["最佳搜索结果", "滴答清单", "didaqingdan", "在App中搜索"]
+    dev, per = _paged([P1, P2], opens={"spot": ["今天", "收集箱"]}, spotlight=SPOT, after_type=spot_hit)
+    res, _, _ = _open_with(dev, per, "滴答清单", layout=_layout_of(P1))
+    assert res.ok and res.extra["via"] == "row", res.to_json()
+    assert res.extra["layout_miss"] == "no_hit"
+    assert res.extra["home_miss"] == "not_found"
+    assert dev.calls.count(("key", "home")) == HOME_PRESSES, "只翻一轮主屏"
+    # I1，2026-09-14：翻到第 2 页（最后一页）复现，先复核一次（再翻一次还是第 2 页）才停 = 3 次。
+    assert dev.calls.count(("scroll", "right", "page")) == 3
+    assert [c for c in dev.calls if c[0] == "type"] == [("type", "didaqingdan")]
+
+
+def test_home_walk_import_failure_falls_through_to_spotlight(monkeypatch):
+    """M3，2026-09-14 终审：`twin.scan` 这个晚 import 本身坏了（模块坏掉 / 循环 import）——
+    等于没有孪生（docs/32 不变式 5），要接住、退回 Spotlight，不能冒成 device_error 把
+    整个 open_app 打断、Spotlight 一次都没走到。
+
+    ⚠ 光把 `sys.modules["iphone_agent.twin.scan"]` 设成 None 挡不住——这个模块在测试进程里
+    早被别的用例导入过，`iphone_agent.twin` 包对象上已经挂了 `scan` 这个属性，`from 包 import scan`
+    会先 `getattr` 命中它，根本不会再去碰 `sys.modules`。改成拦截 `builtins.__import__`
+    本身，只对这一条 `from iphone_agent.twin import scan` 语句装死。
+    """
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "iphone_agent.twin" and fromlist and "scan" in fromlist:
+            raise ImportError("模块坏了（模拟）")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    spot_hit = ["最佳搜索结果", "滴答清单", "didaqingdan", "在App中搜索"]
+    dev, per = _paged([P1, P2], opens={"spot": ["今天", "收集箱"]}, spotlight=SPOT, after_type=spot_hit)
+    res, _, _ = _open_with(dev, per, "滴答清单", layout=None)
+    assert res.error != "device_error", res.to_json()
+    assert res.ok and res.extra["via"] == "row", res.to_json()
+    assert res.extra["home_miss"] == "error"
+    assert not any(c[0] == "scroll" for c in dev.calls), "import 都没成，根本没翻主屏"
+    assert [c for c in dev.calls if c[0] == "type"] == [("type", "didaqingdan")]
+
+
+def test_everything_failing_keeps_the_typed_flag_and_says_both(tmp_path):
+    """主屏没有、字也没打进去 → app_not_found，typed=False 照带（恢复阶梯靠它认出键盘通道死了），
+    hint 说清两条路各自怎么没成；不再回主屏翻第二遍。"""
+    from iphone_agent.harness.executor import HOME_PRESSES
+    dev, per = _paged([P1, P2], spotlight=SPOT, after_type=SPOT)
+    res, _, _ = _open_with(dev, per, "滴答清单")
+    assert res.error == "app_not_found" and res.extra["typed"] is False, res.to_json()
+    assert res.extra["home_miss"] == "not_found"
+    assert Executor._channel_failure(Action("open_app", {"name": "滴答清单"}, "r", None, "c1"), res) == "keyboard"
+    assert "翻了 2 页" in res.hint and "打字" in res.hint, res.hint
+    assert dev.calls.count(("key", "home")) == HOME_PRESSES
+    assert dev.calls.count(("scroll", "right", "page")) == 3, "I1：翻到最后一页复现，复核一次才停"
+
+
+def test_home_walk_is_ocr_only_until_the_opened_frame():
+    """翻页找的时候每页只跑 OCR；点开之后那一帧才做整屏解析（它是下一步的观察，_identity 要它的标注）。"""
+    asker = CountingAsker()
+    dev, per = _paged([P1, P2, P3], opens={2: ["记一笔", "账单"]}, asker=asker)
+    obs = per.observe(dev.capture())
+    assert asker.calls == 1
+    res, new = Executor(dev, per).run(Action("open_app", {"name": "记账本"}, "r", None, "c1"), obs)
+    assert res.ok and res.extra["via"] == "home_icon", res.to_json()
+    assert asker.calls == 2, "只有点开后的那一帧做了整屏解析"
+    assert new.perception["vision"] != "off"
+
+
+def test_on_demand_open_app_parses_nothing_and_labels_the_opened_frame_once():
+    """spec 2026-09-14 §7：open_app 中间观察只跑 OCR；点开之后那一帧由 _identity 短标注一次。"""
+    asker = CountingAsker()
+    dev, per = _paged([P1, P2, P3], opens={2: ["记一笔", "账单"]}, asker=asker)
+    with per.task_scope(None, "on_demand"):
+        obs = per.observe(dev.capture())
+        res, new = Executor(dev, per, asker=asker).run(Action("open_app", {"name": "记账本"}, "r", None, "c1"), obs)
+    st = per.stats()
+    assert res.ok and res.extra["via"] == "home_icon", res.to_json()
+    assert st["parse_by"] == {"always": 0, "model": 0, "fallback": 0}
+    assert sum(st["label"]["identity"].values()) == 1 and new.perception["label_by"] == "label"
+
+
+def test_home_walk_waits_before_tapping_on_a_flipped_page_only(monkeypatch, long_sleeps):
+    from iphone_agent import config
+    monkeypatch.setattr(config, "AFTER_PAGE_FLIP_S", 3.0)
+    dev, per = _paged([P1, P2, P3], opens={2: ["记一笔", "账单"]})
+    dev.calls = long_sleeps
+    res, _, _ = _open_with(dev, per, "记账本")
+    assert res.ok, res.to_json()
+    kinds = [c[0] for c in long_sleeps]
+    assert kinds.count("sleep") == 1, long_sleeps
+    last_scroll = max(i for i, k in enumerate(kinds) if k == "scroll")
+    assert last_scroll < kinds.index("sleep") < kinds.index("tap"), long_sleeps
+
+    long_sleeps.clear()
+    dev, per = _paged([HOME, P3], opens={0: SETTINGS_IN})     # 第 1 页要认得出是主屏（≥3 个特征词）
+    dev.calls = long_sleeps
+    res, _, _ = _open_with(dev, per, "设置")
+    assert res.ok and res.extra["page"] == 1, res.to_json()
+    assert not any(c[0] == "sleep" for c in long_sleeps), "第 1 页没翻过，不用等"
+
+
+def test_home_walk_tap_that_opens_the_wrong_app_falls_to_spotlight(tmp_path):
+    """翻主屏找到了、点开的却不是它：记 wrong_app（via=home_icon），换最后一条路 Spotlight。"""
+    notes = ["返回", "Wiamzusr1lp"]
+    dev, per = _paged([P1, P2], opens={1: notes, "spot": SETTINGS_IN}, spotlight=SPOT,
+                      after_type=["最佳搜索结果", "设置", "shezhi", "在App中搜索"])
+    # SeesApps 按图片字节认帧；page_frame 的图案只由文字决定，所以 frame_id 随便给
+    frames = [dev.cur] + dev.pages + [page_frame(notes, 0), page_frame(SETTINGS_IN, 0)]
+    asker = SeesApps(frames, lambda t: "备忘录" if "Wiamzusr1lp" in t else ("设置" if "关于本机" in t else "主屏"))
+    res, _, _ = _open_with(dev, per, "设置", asker=asker)
+    assert res.ok and res.extra["via"] == "row", res.to_json()
+    assert res.extra["home_miss"] == "wrong_app"
+    assert res.extra["wrong_app"][0]["via"] == "home_icon" and res.extra["wrong_app"][0]["seen"] == "备忘录"

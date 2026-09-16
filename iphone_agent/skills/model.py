@@ -322,7 +322,7 @@ def skill_from_markdown(text: str, stem: str, procedure: Procedure | None = None
     validate_name(stem, "技能名")
     apps = meta.get("apps")
     if not isinstance(apps, list) or not apps or not all(isinstance(a, str) for a in apps):
-        raise SkillError("invalid_field", 'apps 必须是非空 JSON 数组，如 apps: ["alipay", "yimujizhang"]')
+        raise SkillError("invalid_field", 'apps 必须是非空 JSON 数组，如 apps: ["alipay", "jizhangben"]')
     for a in apps:
         validate_name(a, "apps 里的 App id")
     return Skill(

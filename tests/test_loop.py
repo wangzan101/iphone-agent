@@ -7,6 +7,7 @@ from iphone_agent.harness.actions import Action
 from iphone_agent.harness.loop import run_task
 from iphone_agent.harness.runlog import RunLog
 from iphone_agent.model.reply import ModelError, ModelReply
+from iphone_agent.workspace import RunConfig
 from tests._resolved import fake_resolved
 
 
@@ -65,7 +66,7 @@ def run(fake_env, specs, script, tmp_path, task_text="t", **kw):
 
 def test_prefix_order_memory_then_history_then_runs_then_task(fake_env, tmp_path):
     """装配顺序必须是 system → 记忆索引 → 对话前几轮 → 最近运行 → 任务
-    （设计说明 的第 1、3、2 层）：记忆索引几乎不变，排最前吃前缀缓存；
+    （docs/19 §2 的第 1、3、2 层）：记忆索引几乎不变，排最前吃前缀缓存；
     最近运行每次任务都变，排在容易变的位置，不拖累前面的缓存命中。"""
     store = isolated_store(tmp_path)
     store.write("k", "d", "c", "runs/x", "done_success")
@@ -291,7 +292,7 @@ def test_successful_run_has_no_error(fake_env, tmp_path):
 
 
 def test_initial_observation_waits_for_the_home_press_to_settle(fake_env, tmp_path):
-    """真机 bug（2026-09-07，runs/example-run）：按完 Cmd+1 立刻抓帧，
+    """真机 bug（2026-09-07，runs/20260907-142838-fbc1）：按完 Cmd+1 立刻抓帧，
     抓到的是翻页动画中途的那一页；模型基于它选了「设置」，等它想完三五秒动作发出去时，
     iOS 早已落到第一页，同一个网格位置上是 Gemini —— 打开了错误的 App。
     坐标和几何都没错，错在观察到了一个已经不存在的画面。
@@ -445,7 +446,8 @@ def _obs_text(messages):
 def test_the_model_is_told_where_it_is(fake_env, tmp_path):
     _seed_map(tmp_path, ["通用", "关于本机", "软件更新"], ["关于本机", "iOS版本"])
     r, dev, m = run(fake_env, [["通用", "关于本机", "软件更新"]] * 5,
-                    [[("done", {"status": "success", "result": "x"})]], tmp_path)
+                    [[("done", {"status": "success", "result": "x"})]], tmp_path,
+                    run_config=RunConfig(twin_hints=False))
     blob = _obs_text(m.seen[0])
     assert "【位置】" in blob, "位置说明没进模型消息 —— 钩子没接上"
     assert "关于本机" in blob
@@ -472,7 +474,8 @@ def test_the_model_is_given_a_route_when_the_task_names_a_screen(fake_env, tmp_p
     _seed_map(tmp_path, ["通用", "关于本机", "软件更新"], ["关于本机", "iOS版本"])
     r, dev, m = run(fake_env, [["通用", "关于本机", "软件更新"]] * 5,
                     [[("done", {"status": "success", "result": "x"})]], tmp_path,
-                    task_text="进入「关于本机」读版本号")
+                    task_text="进入「关于本机」读版本号",
+                    run_config=RunConfig(twin_hints=False))
     blob = _obs_text(m.seen[0])
     assert "【路线】" in blob, "任务点名了「关于本机」，图上有路，却没说"
 
@@ -533,7 +536,8 @@ def test_有屏幕图且认得出当前位置时多出_obs_location(fake_env, tm
     calls = _spy_on_user_observation(monkeypatch)
     _seed_map(tmp_path, ["通用", "关于本机", "软件更新"], ["关于本机", "iOS版本"])
     r, dev, m = run(fake_env, [["通用", "关于本机", "软件更新"]] * 5,
-                    [[("done", {"status": "success", "result": "x"})]], tmp_path)
+                    [[("done", {"status": "success", "result": "x"})]], tmp_path,
+                    run_config=RunConfig(twin_hints=False))
     assert r.end_reason == "done_success"
     segs = [seg for seg, _ in calls[0]]
     assert segs[:2] == ["obs_elements", "obs_location"]
@@ -547,7 +551,8 @@ def test_obs_parts_逐字符拼接结果与拆分前相同(fake_env, tmp_path, m
     _seed_map(tmp_path, ["通用", "关于本机", "软件更新"], ["关于本机", "iOS版本"])
     r, dev, m = run(fake_env, [["通用", "关于本机", "软件更新"]] * 5,
                     [[("done", {"status": "success", "result": "x"})]], tmp_path,
-                    task_text="进入「关于本机」读版本号")
+                    task_text="进入「关于本机」读版本号",
+                    run_config=RunConfig(twin_hints=False))
     assert r.end_reason == "done_success"
     obs_parts = calls[0]
     segs = [seg for seg, _ in obs_parts]
@@ -659,7 +664,7 @@ def test_coords_disabled_model_gets_coord_disabled_and_prompt_without_xy(fake_en
     run_json = json.loads((r.run_dir / "run.json").read_text())
     assert run_json["prompt_hash"] == prompt_hash(False) != prompt_hash(True)
     assert run_json["config"]["model_allow_coord_tap"] is False
-# --- 上下文视图：滑窗 vs 状态报告（设计说明）---
+# --- 上下文视图：滑窗 vs 状态报告（docs/19 §2）---
 
 def test_state_mode_sends_prefix_plus_one_user_message(fake_env, tmp_path, monkeypatch):
     """state 模式：模型每次只收到冻结前缀 + 一条状态报告，没有旧图、没有 tool 消息。"""
@@ -705,7 +710,7 @@ def test_state_mode_memory_field_is_echoed_and_capped(fake_env, tmp_path, monkey
 
 
 def test_run_config_selects_state_mode_without_touching_globals(fake_env, tmp_path):
-    """同一个进程里两种视图并存 —— 对照实验（设计说明）不能靠改进程级常量。"""
+    """同一个进程里两种视图并存 —— 对照实验（docs/19 §5）不能靠改进程级常量。"""
     from iphone_agent.workspace import RunConfig
     dev, per, frames = fake_env([["a"]] * (INITIAL_SETTLE_FRAMES + 3))
     model = ScriptedModel([[("done", {"status": "success", "result": "x"})]])
@@ -715,7 +720,7 @@ def test_run_config_selects_state_mode_without_touching_globals(fake_env, tmp_pa
 
 
 def test_max_steps_default_is_read_at_call_time(fake_env, tmp_path, monkeypatch):
-    """默认值在**调用时**取（设计说明 D8）：绑在函数签名上就锁死在 import 那一刻。"""
+    """默认值在**调用时**取（docs/20 D8）：绑在函数签名上就锁死在 import 那一刻。"""
     from iphone_agent import config
     monkeypatch.setattr(config, "MAX_STEPS", 1)
     r, dev, m = run(fake_env, [["a"]] * 4,

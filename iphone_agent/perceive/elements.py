@@ -43,6 +43,22 @@ class Observation:
     # 这次观察是用哪种坐标约定告诉模型的。头部那行按它写，actions.py 拒绝时的提示语也读它 ——
     # 一个规则一个入口。2026-09-08 真机踩过两个入口只改一个的坑（见下面 build_observation）。
     coord_mode: str = "norm1000"
+    # 各路感知这一帧怎么样：{"ocr": 元素数, "vision": off/failed/empty/ok}。zoom 观察不填。
+    perception: dict = field(default_factory=dict)
+    # 这一屏是什么（perceive.screen.ScreenLabel，spec 2026-09-12 §3）。整屏解析没给 / 没做就是 None。
+    # 类型写 object：elements 不 import screen，避免两个模块互相依赖。
+    screen: object | None = None
+    # 这一帧提示词里给过的候选（perceive.screen.Candidate）。重放靠它把 same_as 编号还原成屏 id。
+    screen_candidates: list = field(default_factory=list)
+    # 只有 zoom 观察填：它放大的那一帧的整屏解析结果（那一帧的 perception.vision）。非 zoom 观察是 None。
+    # ⚠ 2026-09-15（终审发现 1）：zoom 自己不解析、perception 是空的，policy.fallback_due 原来把它当成
+    #   「没拿到整屏解析」，always 下 zoom 之后 done(failed) 也兜底，白打一次整屏解析（spec §3.1 不许）。
+    #   兜底要按被放大的那一帧判。单独一个字段而不是塞进 perception：wants_label 靠 perception 为空认 zoom 帧，
+    #   zoom 帧永远不标。只由 Perceiver.zoom 写（grep 测试守着）。
+    zoom_base_vision: str | None = None
+    # 推给模型之后置 True（Perceiver.finalize，spec 2026-09-14 §6.3）。之后再补写感知字段 = 程序 bug。
+    # 这是约定不是语言层面的不可变：Perceiver 之外不许写 screen / screen_candidates / perception（grep 测试守着）。
+    finalized: bool = False
 
     @property
     def state_key(self) -> int:
@@ -69,6 +85,11 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
 
 
 FUSE_IOU = 0.3      # 两个框互相盖住这么多就算同一个东西（用的是「小框被盖住的比例」）
+
+# 元素表头部那一句与视觉项分隔行（spec 2026-09-14 §4.2）。只由 build_observation 生成 —— 一个入口。
+HEAD_FULL = "（整屏看过：含图标、按钮、开关）"
+HEAD_OCR_ONLY = "（只有 OCR 文字；图标、无字按钮、开关状态可能不在列表里）"
+VISION_SEPARATOR = "（下面是看全屏补上的：图标、无字按钮、开关）"
 
 
 def _covered(small: tuple[int, int, int, int], big: tuple[int, int, int, int]) -> float:
@@ -125,8 +146,40 @@ def fuse(ocr_els: list[Element], items) -> list[Element]:
     return out
 
 
+def number_elements(elements: list[Element], height: int, start: int = 1) -> list[Element]:
+    """编号的唯一入口（spec 2026-09-14 §6.1）：build_observation 与 build_zoom_observation 共用。
+
+    OCR 来源（ocr / both）先编，只按它们自己的框排序（上到下按 y1 分带，带高 = 图高 2%，带内按 x1）；
+    纯视觉项（vision）按同样的排序接在后面。视觉项只给认领到的元素贴 kind/state，从不改它们的编号。
+    ⚠ 2026-09-14：原来 OCR 与视觉项混排后统一编号 —— 同一帧解析跑没跑，「通用」的编号就不同。
+      on_demand 下同一屏看全屏前后编号会变，模型拿旧编号去点就点到别处；OCR 优先后，
+      同一屏再看一次，OCR 读到的框一样，编号就一样（§6.3 旧编号的第一道防线）。
+    """
+    band = max(1, int(height * 0.02))
+
+    def key(e: Element) -> tuple[int, int]:
+        return e.box[1] // band, e.box[0]
+
+    ocr = sorted((e for e in elements if e.source != "vision"), key=key)
+    vis = sorted((e for e in elements if e.source == "vision"), key=key)
+    return [replace(e, id=i) for i, e in enumerate([*ocr, *vis], start=start)]
+
+
+def display_xy(x: int, y: int, width: int, height: int, coord_mode: str) -> tuple[int, int]:
+    """图像像素 → 告诉模型的那套坐标。唯一入口：元素表、zoom 视图、tapped 回显共用（CLAUDE.md §7）。"""
+    if coord_mode == "norm1000":
+        return round(x / width * 1000), round(y / height * 1000)
+    return x, y
+
+
+def elements_at(obs, x: int, y: int) -> list[Element]:
+    """框包含 (x, y) 的所有元素（边界算在内），不论来源。坐标点击的安全分类只经这一个几何入口（spec §6.2）。"""
+    return [e for e in obs.elements if e.box[0] <= x <= e.box[2] and e.box[1] <= y <= e.box[3]]
+
+
 def build_observation(frame: Frame, boxes: list[RawBox], observation_id: int,
-                       coord_mode: str = "norm1000", screen_items=None) -> Observation:
+                       coord_mode: str = "norm1000", screen_items=None,
+                       full_screen: bool = False) -> Observation:
     W, H = frame.width_px, frame.height_px
     pix = [(b, vision_box_to_pixels(b, W, H)) for b in boxes]
     ocr_els = [Element(id=0, text=b.text, confidence=round(b.confidence, 2),
@@ -137,10 +190,7 @@ def build_observation(frame: Frame, boxes: list[RawBox], observation_id: int,
     #   而假变化会直接喂给熔断器（NO_PROGRESS_STOP）。这条线不能越。
     ocr_texts = {e.text for e in ocr_els if e.center[1] > H * config.STATUS_BAR_CROP_RATIO}
     merged = fuse(ocr_els, screen_items or [])
-    # 上到下、左到右：按 y1 分带（带高 = 图高 2%），带内按 x1。编号在排序之后统一给。
-    band = max(1, int(H * 0.02))
-    merged.sort(key=lambda e: (e.box[1] // band, e.box[0]))
-    elements: list[Element] = [replace(e, id=i) for i, e in enumerate(merged, start=1)]
+    elements: list[Element] = number_elements(merged, H)
     # 头部必须带图像尺寸：模型要用坐标点「OCR 看不见的图标」时，得知道坐标空间多大。
     # 2026-09-07 实测：不给尺寸，模型按 850 宽估坐标（实际 644），越界被拒。
     #
@@ -156,17 +206,20 @@ def build_observation(frame: Frame, boxes: list[RawBox], observation_id: int,
                 f"（x 按宽、y 按高各自折算）。")
     else:
         head = f"observation #{observation_id}  图像 {W}x{H} 像素（坐标就用这个空间）"
-    lines = [head]
+    # ⚠ 2026-09-14（spec 按需看图 §4.2）：on_demand 下元素表默认只有 OCR，头部必须如实说，模型才知道
+    #   截图上看得见、列表里没有的东西要去 zoom / observe。解析跑了但失败也写「只有 OCR」（计划 R12）。
+    lines = [head + (HEAD_FULL if full_screen else HEAD_OCR_ONLY)]
     # ⚠ 元素坐标必须和 tap 参数用**同一套约定**。
     #   2026-09-08 真机踩到：头部写着「给坐标时用 0-1000 的归一化值」，
     #   而元素行印的是**像素**中心 `(187,673)` —— 同一段文字里两套约定。
     #   模型从列表读到那种数、在那个尺度上做空间推理，然后自然按同一尺度给坐标，
     #   连续 5 次 out_of_image 被熔断。它不是没看提示，是**列表本身在教它用像素**。
+    # 元素表先列 OCR 项，再加一行分隔，然后列看全屏补上的视觉项（spec §6.1 第 2 条）
+    first_vision = next((e.id for e in elements if e.source == "vision"), None)
     for e in elements:
-        cx, cy = e.center
-        if coord_mode == "norm1000":
-            cx = round(cx / W * 1000)
-            cy = round(cy / H * 1000)
+        if e.id == first_vision:
+            lines.append(VISION_SEPARATOR)
+        cx, cy = display_xy(*e.center, W, H, coord_mode)
         # kind 跟在文字后面，用 · 引出；开关这类再带上状态。
         # 视觉那一路没有 OCR 置信度，印 `-` 而不是 0.00 —— 后者会被读成「很不确定」，
         # 而它其实只是「这个数不适用」。
@@ -261,10 +314,10 @@ def build_zoom_observation(base: Observation, box: tuple[int, int, int, int],
         cx, cy = e.center
         return not (x1 <= cx <= x2 and y1 <= cy <= y2)
 
-    merged = [e for e in base.elements if _outside(e)] + inside
-    band = max(1, int(H * 0.02))
-    merged.sort(key=lambda e: (e.box[1] // band, e.box[0]))
-    elements = [replace(e, id=i) for i, e in enumerate(merged, start=1)]
+    # ⚠ 2026-09-14（spec §6.1 第 3 条）：原来这里把区域外 + 区域内整体重新编号，区域外的编号也跟着变。
+    #   现在区域外原样保留，区域内从 base 最大编号之后接着编；被替换的旧编号不再使用，拿它点得到 stale_element_id。
+    start = max((e.id for e in base.elements), default=0) + 1
+    elements = [e for e in base.elements if _outside(e)] + number_elements(inside, H, start=start)
 
     head = (f"observation #{observation_id}  **这是放大视图**：把原图 {W}x{H} 的 "
             f"({x1},{y1})-({x2},{y2}) 这一块放大了看。图上是放大后的样子，"
@@ -273,9 +326,7 @@ def build_zoom_observation(base: Observation, box: tuple[int, int, int, int],
         head += "坐标统一用 0-1000 的归一化值（x 按宽、y 按高各自折算）。"
     lines = [head]
     for e in elements:
-        cx, cy = e.center
-        if base.coord_mode == "norm1000":
-            cx, cy = round(cx / W * 1000), round(cy / H * 1000)
+        cx, cy = display_xy(*e.center, W, H, base.coord_mode)
         tag = f" ·{e.kind}{':' + e.state if e.state else ''}" if e.kind else ""
         conf = f"{e.confidence:.2f}" if e.source != "vision" else "-"
         mark = "" if _outside(e) else " ←放大区内"

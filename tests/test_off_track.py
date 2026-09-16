@@ -2,7 +2,7 @@
 
 以前只有「变 / 没变」。误点进一个**新的**错页面满足「变了且是新画面」，
 于是被熔断器当成进展、把 no_progress 清零 —— 误点这类失败在它眼里是看不见的
-（设计说明，Mobile-Agent-E 的 A/B/C；设计说明，mirroir 的 PostActionVerifier）。
+（docs/26 §1，Mobile-Agent-E 的 A/B/C；docs/23 §1.1，mirroir 的 PostActionVerifier）。
 
 信号从哪来：模型 103 次运行、1113 步里**一次都没填过**自评字段（2026-09-09 统计 runs/），
 所以只能在「变了」这一侧也问一次判官 —— 但只在模型给了 expect 时问，
@@ -51,13 +51,18 @@ def test_off_track_tap_did_land_so_dead_taps_reset():
 # ---------- executor ----------
 
 class _Judge:
+    """回复按被问的那一问作答：提示词要 "met" 键（tap 画面变了之后问 judge.met_expectation，终审 2026-09-11）
+    就把结论放在 met 下，否则放在 worked 下（did_action_work）。只改分发，结论本身不变。"""
     def __init__(self, *replies):
         self.replies = list(replies)
         self.calls = 0
 
     def ask_json(self, prompt, images, max_tokens=None):
         self.calls += 1
-        return self.replies.pop(0) if self.replies else None
+        r = self.replies.pop(0) if self.replies else None
+        if isinstance(r, dict) and "worked" in r and '"met"' in prompt:
+            r = {("met" if k == "worked" else k): v for k, v in r.items()}
+        return r
 
 
 def _tap_with_expect(fake_env, judge, expect):

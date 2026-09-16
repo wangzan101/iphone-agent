@@ -98,7 +98,7 @@ class ChatCompletionsTransport:
         #   这里一度默认拿 profile 的 m.max_tokens 来顶，那个数（1024）是给
         #   decide()「回一个工具调用」定的，屏幕解析要列几十个元素，一列就超。
         #   2026-09-09 真机：记账页 51 个元素输出 1000+ token 被硬截断，JSON 断在
-        #   半句话，那一屏视觉贡献归零 —— 而**「示例银行」这个元素只有视觉读得到**，
+        #   半句话，那一屏视觉贡献归零 —— 而**「工资账户」这个元素只有视觉读得到**，
         #   OCR 根本没有它。三次任务失败就卡在这儿。
         #   把 1024 改成 4000 是打补丁：51 个元素要 1000 token，80 个元素的界面呢？
         #   只是把断点往后挪一格。要限制的时候调用方自己传。
@@ -159,8 +159,10 @@ class ChatCompletionsTransport:
             # 否则会混进 args 被 validate_action 当成非法参数拒掉。
             ev = args.pop("eval", None) if "_parse_error" not in args else None
             mem = args.pop("memory", None) if "_parse_error" not in args else None
-            if fn["name"] == "tap":
-                args = to_pixels(args, self.resolved.model.coord_mode, image_size)
+            # ⚠ 这里**不按动作名分支**。2026-09-16 之前写的是 `if fn["name"] == "tap"`，
+            #   于是 zoom 的框从来没被换算过（事故与证据见 model/coords.py 的注释）。
+            #   哪些键是坐标由 coords.py 一处说了算，桥只管把 args 交给它。
+            args = to_pixels(args, self.resolved.model.coord_mode, image_size)
             actions.append(Action(name=fn["name"], args=args, reason=reason,
                                   expect=str(expect) if expect else None, call_id=tc["id"],
                                   eval=str(ev) if ev else None, memory=str(mem) if mem else None))

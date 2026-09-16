@@ -70,7 +70,7 @@ def test_tools_are_accounted_separately_with_a_hash():
 
 def test_calibration_status_is_reported():
     """2026-09-09 标定后 tokens.CALIBRATION_ID 不再是 "uninitialized"（见验收文档
-    内部标定记录（未公开））——budget 的 calibration
+    docs/superpowers/acceptance/2026-09-09-token标定.md）——budget 的 calibration
     字段就是原样透传它，这条测试钉住「透传」这条行为，不钉具体字符串（字符串
     随下一轮标定会变，钉字面值只会制造无意义的红）。"""
     b = budget.account(a_view(), None, None, context_mode="state", call_index=0, model_id="m")
@@ -695,8 +695,8 @@ def test_dry_run_confirm_never_sends():
 
 # =========================== 分层与自陈可信度 ==============================
 
-def test_sanitized_prompt_uses_estimate_and_unchanged_tools_keep_calibration():
-    """脱敏改了提示词字节，必须退回估算，不能把旧测量值换个 hash 沿用。"""
+def test_real_system_prompt_hits_the_exact_constant_layer():
+    """真实前缀里最大的一块必须走第 1 层：它是确定性的，不该被估。"""
     from iphone_agent.harness.prompt import system_prompt
     from iphone_agent.harness.tools import tool_defs
 
@@ -707,14 +707,18 @@ def test_sanitized_prompt_uses_estimate_and_unchanged_tools_keep_calibration():
     b = budget.account(log.raw(), tool_defs(True), None,
                        context_mode="state", call_index=0, model_id="m")
     sysdeg = b["segments"]["system"]
-    assert sysdeg["layer"] == tokens.LAYER_SEGMENT_RATIO
-    assert sysdeg["est"] == round(len(text) * tokens.SEGMENT_TOKENS_PER_CHAR["system"])
+    assert sysdeg["layer"] == tokens.LAYER_EXACT
+    assert sysdeg["est"] == 3051          # 2026-09-1x 按需看图：提示词版本 23（感知一节改为「默认只有 OCR」）
+                                           # 后重标：5446 字。出处 docs/superpowers/acceptance/2026-09-15-token标定/
+                                           # probe-segments-20260915-115841.json（上一版 2873）
     tsc = b["segments"]["tools_schema"]
     assert tsc["layer"] == tokens.LAYER_EXACT
-    assert tsc["est"] == 6175             # 同一次重标：18 个工具（含 handover，key 的 enum 12 个），
-                                           # 走 tools= 参数；出处同上
+    assert tsc["est"] == 6308             # 2026-09-1x 按需看图：observe 描述改为看全屏后重标：
+                                           # 18 个工具，走 tools= 参数；出处
+                                           # docs/superpowers/acceptance/2026-09-15-token标定/
+                                           # probe-segments-20260915-115841.json（上一版 6265）
     # ⚠ 这两段合起来是冻结前缀的大头。分层的全部收益就在这一行里。
-    assert b["est_by_layer"][tokens.LAYER_EXACT] == 6175
+    assert b["est_by_layer"][tokens.LAYER_EXACT] == 3051 + 6308
 
 
 def test_changed_prompt_falls_back_to_the_ratio_layer_not_the_stale_constant():

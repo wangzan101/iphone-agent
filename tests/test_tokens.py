@@ -4,7 +4,7 @@ from iphone_agent.harness import tokens
 
 
 def test_calibration_id_is_set_after_the_2026_09_09_run():
-    """2026-09-09 真机标定完成，见 内部标定记录（未公开）
+    """2026-09-09 真机标定完成，见 docs/superpowers/acceptance/
     2026-09-09-token标定.md。CALIBRATION_ID 不再是「未标定」的占位值 ——
     这条测试替换了原来的 test_calibration_id_starts_uninitialized（该测试
     钉的是「标定之前不许冒充」，现在已经真标定过，钉字面值 "uninitialized"
@@ -89,9 +89,9 @@ def test_every_bucket_has_a_non_negative_coefficient():
 def test_every_bucket_coefficient_is_the_measured_pure_corpus_slope():
     """八个桶的系数必须是 2026-09-09 P1 纯语料实测出来的斜率，不是待标定初值。
 
-    出处：内部标定记录（未公开）
-          内部标定记录（未公开）（第二轮，八条纯语料齐全）
-          + 内部标定记录（未公开）（第一轮，前四个桶）。
+    出处：docs/superpowers/acceptance/2026-09-09-token标定/
+          probe-text-20260909-152108.json（第二轮，八条纯语料齐全）
+          + probe-text-20260909-143809.json（第一轮，前四个桶）。
     算法：过原点最小二乘 Σ(x·y)/Σ(x²)，x = meta.chars（200/500/1000/2000），
           y = prompt_tokens − baseline_tokens（= 59）。
 
@@ -265,7 +265,7 @@ def test_every_production_segment_name_is_accounted_for():
 
 
 def test_real_device_screenshot_624x1388_is_862_tokens():
-    """真机截图尺寸（iPhone 16e，624x1388）按官方 smart_resize 手算：
+    """真机截图尺寸（624x1388）按官方 smart_resize 手算：
 
         round(624/32) = round(19.5) = 20 -> w_bar = 640
         round(1388/32) = round(43.375) = 43 -> h_bar = 1376
@@ -416,9 +416,9 @@ def test_exact_constants_are_keyed_by_hashes_the_code_actually_produces():
     from iphone_agent.harness.tools import tool_defs
 
     sys_key = prompt_hash(allow_coord_tap=True, has_skills=True)
-    assert ("system", sys_key) not in tokens.EXACT_SEGMENT_TOKENS
-    assert not any(segment == "system" for segment, _ in tokens.EXACT_SEGMENT_TOKENS), (
-        "发布提示词尚未重新标定，不能移植旧提示词的精确用量。")
+    assert ("system", sys_key) in tokens.EXACT_SEGMENT_TOKENS, (
+        "system 的实测常量对不上当前提示词的 hash。要么提示词改了（重跑 "
+        "--probe segments 重标），要么这个键是手编的。")
 
     blob = json.dumps(tool_defs(True), sort_keys=True, ensure_ascii=False)
     tools_key = hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -444,7 +444,7 @@ def test_segment_ratio_layer_for_elements():
     est, layer = tokens.estimate_segment("state_elements", text)
     assert layer == tokens.LAYER_SEGMENT_RATIO
     # 2026-09-09 真机标定：state_elements 独立测出 0.884（之前是和 obs_elements
-    # 共用的占位值 0.868），见 内部标定记录（未公开）。
+    # 共用的占位值 0.868），见 docs/superpowers/acceptance/2026-09-09-token标定.md。
     assert est == round(len(text) * 0.884)
     # 元素列表是字符类模型低估最狠的一段（实测 0.884 / 兜底误差 52.6%）：
     # 分层的收益就体现在这里，比兜底大。

@@ -5,7 +5,7 @@ import time
 
 from AppKit import NSPasteboard, NSPasteboardTypeString
 
-from iphone_agent import config
+from iphone_agent import config, timing
 from iphone_agent.driver.capture import capture_window
 from iphone_agent.driver.geometry import Frame, OutOfWindow, Rect, content_bounds
 from iphone_agent.driver.injector import (
@@ -99,8 +99,9 @@ class Device:
 
     # ---- 观察 ----
     def capture(self) -> Frame:
-        self._frame_seq += 1
-        return capture_window(self._resolve(), self._frame_seq)
+        with timing.phase("capture"):
+            self._frame_seq += 1
+            return capture_window(self._resolve(), self._frame_seq)
 
     def window_rect(self) -> Rect:
         return current_rect(self._resolve().window_id)
@@ -244,7 +245,7 @@ class Device:
         排除过的原因都不是：事件标志位、down→up 停留 0.02–0.35s、字符间隔、
         私有事件源、显式敲 Shift、双 up、每字符补 Shift、输入法解析。
         「有 up 就交替、没 up 就正确」这条规律本身足够指导实现，机制不再深挖。
-        取证：`runs/pinyin4-*`、`runs/pinyin6-*`，详见 `设计说明`。
+        取证：`runs/pinyin4-*`、`runs/pinyin6-*`，详见 `docs/14`。
 
         ⚠ 键按下后不松，**再按同一个键就不出字符**。所以不是「相邻重复」要处理，
         是**整串里任何重复字母**：`shezhi` 会丢第二个 `h` 变成 `shezi`（实测）。
@@ -256,7 +257,7 @@ class Device:
 
         ⚠ 粘贴四种情形实测全败（Spotlight 三种等待时长、先点输入框聚焦、
         备忘录正文里光标就位）。⚠ **但通用剪贴板需要「接力」开着且两台设备同一
-        iCloud，我们从没查过这些前提** —— 判它坏可能判早了，见 `设计说明`。
+        iCloud，我们从没查过这些前提** —— 判它坏可能判早了，见 `docs/15`。
         """
         strokes = [char_keystroke(ch) for ch in text]
         if any(k is None for k in strokes):

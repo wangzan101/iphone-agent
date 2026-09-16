@@ -8,7 +8,7 @@ PROVIDER = ProviderProfile(
 )
 
 MODELS = (
-    # 2026-09-08 标定（scripts/calibrate_coords.py，iPhone 16e，图像 624x1388，逐条数据
+    # 2026-09-08 标定（scripts/calibrate_coords.py，一台 iPhone，图像 624x1388，逐条数据
     # 在 runs/calibrate-coords.json）：让模型直接报坐标，两种约定的误差差了 20 倍 ——
     #
     #   目标   约定        中位数    p90

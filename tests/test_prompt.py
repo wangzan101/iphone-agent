@@ -8,9 +8,10 @@ def test_hash_with_coords_equals_pinned_value():
         .venv/bin/python -c "from iphone_agent.harness.prompt import prompt_hash; print(prompt_hash(True))"
     别顺手把断言改成实际值了事 —— 这个钉子的意义就是逼你意识到「提示词变了，旧 run.json 对不上了」。
     """
-    assert PROMPT_VERSION == "22"
-    # 中性银行示例改变了提示词字节；旧精确 token 标定已移除。
-    assert prompt_hash(True) == "f1103f24d5a1"
+    assert PROMPT_VERSION == "23"
+    # ⚠ 2026-09-16 公开导出：method 节的账户示例名换成通用占位，提示词文本变了，hash 跟着变
+    #   （8507afe1a292 → cf3a5d97392b）。这不是「顺手改成实际值」，是一次有意的文本改动。
+    assert prompt_hash(True) == "cf3a5d97392b"
 
 
 def test_hash_differs_when_coords_disabled():

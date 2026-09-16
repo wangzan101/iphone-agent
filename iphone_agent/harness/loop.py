@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import io
 import json
@@ -10,14 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-from iphone_agent import config
+from iphone_agent import config, timing
 from iphone_agent.driver.injector import ActivateFailed
 from iphone_agent.driver.timing import IOS_TIMING, SCROLL_LINES, SCROLL_LINES_H
 from iphone_agent.harness import budget as budget_mod
 from iphone_agent.harness import recap, safety
 from iphone_agent.harness.actions import ValidationError, validate_action
 from iphone_agent.harness.audit import RunFacts, never_reached
-from iphone_agent.harness.executor import Executor, ToolResult
+from iphone_agent.harness.executor import Executor, ToolResult, full_screen_note
 from iphone_agent.harness.guard import ActionGuard, no_progress_hint
 from iphone_agent.harness.history import render_history, row_from_record
 from iphone_agent.harness.messages import (
@@ -30,7 +31,7 @@ from iphone_agent.harness.messages import (
 from iphone_agent.harness.procedure import COUNTED_FAILURES, ProcedureRunner
 from iphone_agent.harness.prompt import prompt_hash, system_prompt
 from iphone_agent.harness.reconnect import ensure_connected
-from iphone_agent.harness.runlog import RunLog
+from iphone_agent.harness.runlog import RunLog, frame_name
 from iphone_agent.harness.runlog import frame_stub as _frame_stub
 from iphone_agent.harness.runlog import observation_snapshot as _observation_snapshot
 from iphone_agent.harness.settle import settle
@@ -40,6 +41,7 @@ from iphone_agent.harness.whereami import route_hint, where_am_i
 from iphone_agent.memory import MemoryRejected, MemoryStore
 from iphone_agent.memory.screenmap import build_from_runs
 from iphone_agent.model.reply import ModelError
+from iphone_agent.perceive import policy
 from iphone_agent.perceive import transition as tr
 from iphone_agent.perceive.elements import Observation
 from iphone_agent.perceive.hashing import ahash
@@ -76,6 +78,25 @@ def _platform_info() -> dict:
     import platform
     return {"macos": platform.mac_ver()[0], "machine": platform.machine(),
             "python": platform.python_version()}
+
+
+# ⚠ 2026-09-15（终审发现 5）：第一次 done(failed) 被换成兜底时，那次 done 带的 remember / used_memories
+#   没有落盘（任务没结束）。不告诉模型，它下一次 done 多半不再带，记忆就悄悄丢了。
+FALLBACK_MEMORY_NOTE = "这次 done 里的 remember / used_memories 没有保存，再调 done 时请重新带上。"
+FALLBACK_DONE_HINT = ("你报了失败。程序先补看了一次全屏，元素表已更新（含图标、无字按钮、开关）。"
+                      "据此再判断；确实做不到就再 done(failed)。" + FALLBACK_MEMORY_NOTE)
+FALLBACK_NO_PROGRESS_NOTE = "已连续多步无进展，程序补看了一次全屏；目标还不在就换路或 done(failed)。"
+
+
+def _fallback_text(o, *, done: bool) -> str:
+    """兜底那一帧交回模型时怎么说。看全屏失败要照实说（spec §9），然后照常把决定交回模型。"""
+    note = full_screen_note(o)
+    if done:
+        return FALLBACK_DONE_HINT if note is None else (
+            f"你报了失败。程序补看了一次全屏，但{note}。据此再判断；确实做不到就再 done(failed)。"
+            + FALLBACK_MEMORY_NOTE)
+    return FALLBACK_NO_PROGRESS_NOTE if note is None else (
+        f"已连续多步无进展，程序补看了一次全屏，但{note}；目标还不在就换路或 done(failed)。")
 
 
 def _config_snapshot(model) -> dict:
@@ -161,7 +182,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     人在想事情，保险丝不该替他计时。插话进上下文的方式见 MessageLog.user_note。
 
     `confirm(text) -> bool`：写类动作执行前问人（harness/safety.py）。**None 就是无人在场**，
-    写类动作一律拒绝 —— 设计说明「无人只读、有人可写」就落在这个参数上。等人回答的时间同样不计时限。
+    写类动作一律拒绝 —— docs/04「无人只读、有人可写」就落在这个参数上。等人回答的时间同样不计时限。
 
     `on_handover(need, reason) -> str | None`：模型调 handover 时把事交给人，**阻塞**到人做完；
     返回人补的话（没补就 ""），返回 None = 人不接（按了停止 / 关了对话框）。回来后重新观察再交回模型。
@@ -176,7 +197,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
 
     `max_steps` / `timeout_s` 仍然接受（CLI 在传），非 None 时覆盖 run_config。
     ⚠ 它们的默认值必须在**调用时**从 config 取，不能绑在函数签名上 ——
-    绑在签名上就锁死在 import 那一刻，改 config 再也影响不了它（设计说明 D8）。
+    绑在签名上就锁死在 import 那一刻，改 config 再也影响不了它（docs/20 D8）。
     """
     rc = run_config or RunConfig.from_env()
     if max_steps is not None or timeout_s is not None:
@@ -206,6 +227,9 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                  config_snapshot=(_config_snapshot(model)
                                   | {"max_steps": max_steps, "timeout_s": timeout_s,
                                      "context_mode": rc.context_mode,
+                                     "twin_hints": rc.twin_hints,
+                                     "location_hints": rc.location_hints, "memory": rc.memory,
+                                     "screen_parse": rc.screen_parse,
                                      "platform": _platform_info()}),
                  prompt_hash=prompt_hash(allow_coords, has_skills))
     if on_start:
@@ -217,7 +241,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     # 屏幕图从既往运行日志现拼。⚠ 拼图失败绝不能顶掉任务 —— 它只是参考。
     try:
         # 落盘缓存：只喂新 run。这一步挡在任务启动的关键路径上，
-        # runs/ 一多，每次开跑都全量重建就是纯等待（设计说明 C1）。
+        # runs/ 一多，每次开跑都全量重建就是纯等待（docs/20 C1）。
         screen_map = build_from_runs(runs_root, cache=ws.screenmap_cache)
         if not screen_map.stable_nodes():
             screen_map = None
@@ -280,7 +304,9 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     # 唯一区分信号，必须一路进 run.json，不能停在 recap 里（Task 4 的结论）。
     runs_skipped = 0
     try:
-        mem_msg, recent_msg, runs_skipped = recap.build_memory_message(store, runs_root, task=task)
+        # memory=False（评测对照，spec 2026-09-12 §8.2）：记忆索引与最近运行一段都不注入。
+        if rc.memory:
+            mem_msg, recent_msg, runs_skipped = recap.build_memory_message(store, runs_root, task=task)
     except Exception as e:      # noqa: BLE001 —— 读记忆失败不能连累任务
         # 拼不出注入内容就当没有记忆继续跑。这一步在 try/finally 之外，让它抛出去
         # 就是 run_task 抛一个未捕获异常：log.finish() 永远不会被调用，run.json 的
@@ -328,7 +354,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     if recent_msg:
         # ⚠ 最近运行排在任务描述前、记忆索引和对话历史后：它每次任务都变
         # （这次任务本身跑完就会多一条），排在容易变的位置，不拖累前面
-        # 稳定前缀的缓存命中（设计说明）。
+        # 稳定前缀的缓存命中（docs/19 §2）。
         # 也排在上面那几段知识之后 —— 知识来自文件，几次任务之间基本不动，
         # 属于稳定前缀那一头。
         msgs.user_text(recent_msg, seg="recent_runs")
@@ -337,7 +363,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     # 只是内容来源从一条消息变成两条消息的拼接（中间空行分隔）。
     injected = "\n\n".join(x for x in (mem_msg, recent_msg) if x) or None
     if rc.context_mode == "state":
-        # 前缀到此为止（设计说明）。冻结只在 state 模式下做：window 模式还要靠
+        # 前缀到此为止（docs/19 §2）。冻结只在 state 模式下做：window 模式还要靠
         # user_text 往后追加催促消息，那正是「回头改前缀」——两种视图不能共用一套规矩。
         msgs.freeze()
     guard = ActionGuard()
@@ -345,12 +371,76 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     # 而这两个东西本来就该是同一个（一个 Session 一份），分开传迟早会分叉。
     from iphone_agent.harness.recovery import Recovery
     recovery = Recovery(device, perceiver)
-    # 设备层孪生：布局表空或读不出就当没有，任务照旧（设计说明 不变式 5）。
+    # 设备层孪生：布局表空或读不出就当没有，任务照旧（docs/32 不变式 5）。
     # 「空或坏就 None」只有一个入口 Layout.load_or_none（它永不抛），CLI 也调它。
     from iphone_agent.twin.layout import Layout
     layout = Layout.load_or_none(ws.twin_device / "layout.json")
+    # App 层孪生（spec 2026-09-11 §6.1）：只读加载；第一次用而已有跑完的 run，先从留档长一次。
+    # ⚠ 孪生任何一处坏了都不影响任务（docs/32 不变式 5）：错误只进 run.json["twin"]["errors"]。
+    twin_errors: list[str] = []
+    twin_live = None
+    current_twin: dict | None = None
+    # 这一步模型看到的观察里有没有【位置】/【路线】（学习曲线评测按它分组，spec 2026-09-12 §8.2）。
+    current_hints: dict = {"location": False, "route": False}
+    try:
+        from iphone_agent.twin import record as twin_record
+        if twin_record.needs_initial_rebuild(ws):
+            twin_record.rebuild(ws)
+    except Exception as e:          # noqa: BLE001
+        twin_errors.append(f"rebuild: {type(e).__name__}: {e}")
+    ident_ctx = None
+    try:
+        # 重新 import：上面 rebuild 那个 try 若连 import 都失败了，这里不能因 NameError 丢掉实时孪生。
+        from iphone_agent.twin import live as twin_live_mod
+        from iphone_agent.twin import record as twin_record
+        twin_live = twin_live_mod.LiveTwin(ws.twin_apps, log.dir.name, known_apps=twin_record.known_apps(ws))
+        from iphone_agent.twin.context import ScreenIdentityContext
+        ident_ctx = ScreenIdentityContext(twin_live)
+    except Exception as e:          # noqa: BLE001
+        twin_errors.append(f"init: {type(e).__name__}: {e}")
+
+    def adopt(o) -> None:
+        """这一帧成为「这一步的观察」：需要时补一次短标注（spec 2026-09-14 §5.2）。
+        在 _twin_after（after 帧）和 push_obs 开头各调一次，靠 ensure_label 的幂等保证只标一次。"""
+        perceiver.ensure_label(o, "adopt")
+
+    def _twin_snapshot(o):
+        from iphone_agent.twin.events import Snapshot
+        # 帧文件名走唯一入口 frame_name：实时建屏的 id 与任务后重放的 id 必须相同（spec §4.1）。
+        return Snapshot.from_observation(_observation_snapshot(o, frame_name(o.frame_id)))
+
+    def _twin_after(record: dict, after_obs) -> None:
+        """动作做完、拿到动作后那一帧时调；必须排在 push_obs 之前（先推归属，再认下一帧）。
+
+        ⚠ 没有新画面的动作（recall/recall_runs/search_memory/use_skill、失败动作）之后，
+          LiveTwin.after_action 会原地对同一帧重新认屏、把 _cur 重新武装（与重放一致：
+          下一个事件的 before 帧就是这一帧）并把认屏结果返回。这里接住那个返回值、
+          更新 current_twin，让下一个动作的 record["twin"] 描述的是它真正落在的那一帧
+          （而不是继续挂着上一次的 owner="system"）——2026-09-11 评审：不然下一个动作
+          在同一帧上被跳过认屏，归属和后续位置感全部跟着错。
+        """
+        nonlocal current_twin
+        if after_obs is not None:
+            # ⚠ 2026-09-14（spec §5.2）：先标注，再让孪生认 —— LiveTwin 在这里认动作后那一帧，
+            #   排在 push_obs 之前；不先标，on_demand 下这一帧永远是 unlabeled，孪生不长。
+            adopt(after_obs)
+        if twin_live is None:
+            return
+        try:
+            act = record.get("action") or {}
+            rearmed = twin_live.after_action(
+                {"name": act.get("name"), "args": act.get("args") or act.get("args_raw") or {}},
+                record.get("result") or {},
+                _twin_snapshot(after_obs) if after_obs is not None else None,
+                record.get("ts") or time.time())
+            if rearmed is not None:
+                current_twin = rearmed
+        except Exception as e:      # noqa: BLE001
+            twin_errors.append(f"after: {type(e).__name__}: {e}")
+
     ex = Executor(device, perceiver, store=store, runs_root=runs_root, catalog=catalog,
-                  asker=getattr(perceiver, "asker", None), recovery=recovery, layout=layout)
+                  asker=getattr(perceiver, "asker", None), recovery=recovery, layout=layout,
+                  layout_path=ws.twin_device / "layout.json", identity=ident_ctx)
     started = time.time()
     steps = 0
     error_detail: str | None = None
@@ -375,7 +465,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                      "use_skill": config.SKILL_USE_PER_RUN}
     obs: Observation | None = None
     obs_frame_file: str = ""
-    # state 模式的材料（设计说明）。window 模式下这些也照样维护 ——
+    # state 模式的材料（docs/19 §2）。window 模式下这些也照样维护 ——
     # transition / eval 记进 steps.jsonl 对复盘有用，两种模式的日志因此是同一份。
     step_records: list[dict] = []        # 已进入历史的动作记录（含被拒的），顺序即历史
     current_memory: str | None = None    # 模型自写备忘，整段替换
@@ -385,6 +475,24 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     current_obs_text: str = ""           # push_obs 拼好的那段（含【位置】【路线】）
     pending_record: dict | None = None   # 延迟一拍待写盘的动作记录，见 _flush
     pending_after: list[dict] = []       # 排在它后面、等它一起落盘的非动作记录
+    # 按需看图（spec 2026-09-14）：本任务的感知记账。
+    sent_observation_id: int | None = None   # push_obs 最后推给模型的那一帧（§6.3 内部 invariant）
+    observation_mismatch = 0
+    taps = {"by_id": 0, "by_coord": 0, "coord_unclassified": 0}
+    fallback_used = False                                   # 每个任务至多一次，两种触发共用（spec §3.5）
+    fallback_by = {"done_failed": 0, "no_progress": 0}
+    step_timer: timing.StepTimer | None = None      # 本轮的计时器（spec 2026-09-14 §8.2）；异常出口也要拿到它
+    startup_timer: timing.StepTimer | None = None
+    startup_timing: dict | None = None
+
+    def _stamp(record: dict) -> None:
+        """这一轮的计时挂到这一轮的那条记录上：只挂调过模型的轮，只挂一次（spec §8.2）。
+        有新帧的路径都是先 push_obs 再 _flush，所以挂上时已经包含下一帧的标注。"""
+        t = step_timer
+        if t is None or not t.model_called or t.stamped:
+            return
+        record["timing"] = t.result()
+        t.stamped = True
 
     def _flush(record: dict) -> None:
         """动作记录晚一拍落盘。
@@ -394,6 +502,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
           已经填好了。循环结束时（finally 里）把最后挂着的那条补写掉。
         """
         nonlocal pending_record
+        _stamp(record)
         step_records.append(record)
         _flush_pending()
         pending_record = record
@@ -407,13 +516,16 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             log.step(r_)
         pending_after.clear()
 
-    def _log_other(record: dict) -> None:
+    def _log_other(record: dict, ends_step: bool = False) -> None:
         """非动作记录（error_phase / phase / 被拒的整轮回复）。
 
         它们不带 eval，本可以直接写；但如果直接写，就会排到那条还挂着的动作记录
         **前面**去 —— steps.jsonl 的先后顺序跟延迟一拍之前不一样了。所以按到达顺序
         排在它后面，等它落盘时一起写。
+        ends_step=True 表示这条记录就是这一轮的结果，挂上这一轮的计时。
         """
+        if ends_step:
+            _stamp(record)
         if pending_record is None:
             log.step(record)
         else:
@@ -424,7 +536,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         log.step({k: v for k, v in record.items() if not k.startswith("_")})
 
     def _bound_result(res: ToolResult) -> str:
-        """【上一步结果】的额度（设计说明）。
+        """【上一步结果】的额度（docs/19 §3.3）。
 
         成功尾截：collect/recall 这类的关键内容在前面。失败中间挖：报错的关键行常在
         尾部，一律尾截正好把它砍掉。
@@ -434,10 +546,10 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             return raw[:cap] + "…" if len(raw) > cap else raw
         return middle_truncate(raw, cap)
 
-    def observe_now() -> Observation:
+    def observe_now(fallback: bool = False) -> Observation:
         nonlocal obs_frame_file
         frame = device.capture()
-        o = perceiver.observe(frame)
+        o = perceiver.observe(frame, fallback=fallback)
         obs_frame_file = log.save_frame(frame)
         # ⚠ 每次观察就报一次画面，别等到 step 才报。
         #   第一次观察发生在「按 home → 等稳定」之后、**模型开始思考之前**，
@@ -451,15 +563,20 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         return o
 
     def push_obs(o: Observation):
-        nonlocal current_obs_text
+        nonlocal current_obs_text, current_twin, current_hints, sent_observation_id
+        # 先标注（spec 2026-09-14 §5.2）：下面孪生认屏、刷新主屏页都要用这一帧的标注。已标过就是空操作。
+        adopt(o)
         # 设备层孪生：任务中顺手经过表里已有的主屏页，就用这一帧把那一页整页覆盖
         # （四道闸的判定和「只覆盖不追加」的道理见 twin/scan.refresh_from_observation）。
         # 这里再包一层 try/except：函数内部虽已自兜底返回 False，但 log.dir.name 之类
-        # 的取值发生在这一层，孪生任何一处坏了都不能影响任务（设计说明 不变式 5）。
-        if layout is not None:
+        # 的取值发生在这一层，孪生任何一处坏了都不能影响任务（docs/32 不变式 5）。
+        # ⚠ 2026-09-14：读 ex.layout 而不是任务开始时读的 layout —— open_app 翻主屏会把翻过的页按页序
+        #   写回表；任务开始时表是空的（None）时它新建一份，只在 ex.layout 上。两边用同一个对象，
+        #   revision 才对得上（各拿一份的话，先写的那边一写，另一边之后的每次写都是 RevisionConflict）。
+        if ex.layout is not None:
             try:
                 from iphone_agent.twin import scan as twin_scan
-                twin_scan.refresh_from_observation(layout, o, ws.twin_device / "layout.json",
+                twin_scan.refresh_from_observation(ex.layout, o, ws.twin_device / "layout.json",
                                                     run_name=log.dir.name)
             except Exception:      # noqa: BLE001 —— 孪生任何一处坏了都不影响任务
                 pass
@@ -467,28 +584,102 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         #   一旦被【位置】【路线】污染，B9「元素列表要不要有上限」的结论就是错的。
         #   那两段有自己的上限（MAX_EDGES / MAX_HOPS），治理方式完全不同。
         obs_parts: list[tuple[str, str]] = [("obs_elements", o.elements_text)]
-        if screen_map is not None:
+        if twin_live is not None:
+            try:
+                current_twin = twin_live.observe(_twin_snapshot(o))
+            except Exception as e:  # noqa: BLE001 —— 孪生坏了 = 没有孪生
+                current_twin = None
+                twin_errors.append(f"observe: {type(e).__name__}: {e}")
+        where = plan = None
+        if not rc.location_hints:
+            pass                    # 评测对照组：孪生和 screenmap 一段都不给（spec 2026-09-12 §8.2）
+        elif rc.twin_hints:
+            # 【位置】【路线】由孪生出（spec 2026-09-11 §6）。认不出 / 孪生坏了就什么都不说。
+            if twin_live is not None and current_twin is not None:
+                try:
+                    where, plan = twin_live.position(), twin_live.route(task)
+                except Exception as e:      # noqa: BLE001
+                    twin_errors.append(f"render: {type(e).__name__}: {e}")
+        elif screen_map is not None:
             # 位置感：认出当前是图上哪个节点，把从这儿走过的路一并告诉模型。
             # 认不出来就什么都不说 —— 宁可没帮上忙，也不要指错地方。
             ts = o.text_set or {e.text for e in o.elements}
             try:
                 # 先问命中 App 的子图，再退回全图（spec §4.6）：同名的屏在别的 App 里也有，
                 # 收窄之后认出来的位置更可能是对的。
-                where = plan = None
                 for m_ in [*app_maps, screen_map]:
                     where = where or where_am_i(m_, ts)
                     plan = plan or route_hint(m_, task, ts)
             except Exception:      # noqa: BLE001 —— 位置感是锦上添花，绝不能顶掉任务
                 where = plan = None
-            if where:
-                obs_parts.append(("obs_location", where))
-            if plan:
-                obs_parts.append(("obs_route", plan))
+        current_hints = {"location": bool(where), "route": bool(plan)}
+        if where:
+            obs_parts.append(("obs_location", where))
+        if plan:
+            obs_parts.append(("obs_route", plan))
         # ⚠ raw 里照常记：日志和 window 模式都靠它，state 模式只是不把它发出去。
         msgs.user_observation(obs_parts, _png_b64(o.marked_image),
                               px=(o.width_px, o.height_px))
         # 拼接结果与拆分前逐字符相同：原来就是 text + "\n\n" + block 逐个拼的。
         current_obs_text = "\n\n".join(t for _, t in obs_parts)
+        # 推给模型之后这一帧不再改（spec §6.3）：记下发出去的是哪个 observation，再冻结。
+        sent_observation_id = o.observation_id
+        perceiver.finalize(o)
+
+    def _adopt_new(record: dict, o: Observation) -> None:
+        """新截的一帧交回模型：记 after → _twin_after（先标注）→ push_obs → 动作记录存 after_observation。
+        handover 恢复后与兜底（spec 2026-09-14 §3.5）共用这一个 helper，不另写一份。
+        o 必须刚由 observe_now 截好（obs_frame_file 就是它的帧文件）。"""
+        nonlocal obs
+        obs = o
+        record["after_frame_id"] = o.frame_id
+        record["after_frame_file"] = obs_frame_file
+        guard.record_screen(o.state_key)
+        _twin_after(record, o)
+        push_obs(o)
+        record["after_observation"] = _observation_snapshot(o, obs_frame_file)
+
+    def _fallback_due() -> bool:
+        """policy.fallback_due 在 loop 里的唯一调用点：done(failed) 和 stop 两个触发都经这里。
+
+        ⚠ 2026-09-15（Fix round 1，评审发现）：兜底之后两条路都是 `continue` 回循环顶部，
+          那里对步数上限和总时限的判断先于任何别的结束原因。若这一步已经是最后一步
+          或时间已经用完，兜底换来的不是「模型据此再判断」，而是下一圈立刻把 done_failed / no_progress
+          这个干净的结束原因连同模型的 result 一起吞成 max_steps / timeout，还白打一次整屏解析。
+          所以这里也要问「兜底完还走得下去吗」：步数没到上限、时间也还够
+          （和循环顶部同一对预算，只是不写成完全相同的那两行字，以免撞上
+          test_stop.py::test_stop_is_checked_before_step_limits 用字面文本核对代码顺序的探针）。"""
+        if max_steps <= steps or timeout_s < time.time() - started:
+            return False
+        return policy.fallback_due(perceiver.mode, obs, fallback_used, getattr(perceiver, "asker", None) is not None)
+
+    def _take_fallback(reason: str) -> Observation:
+        """两种触发共用的记账 + 补看（CLAUDE.md §7）：配额记在这次兜底头上，再补看一次全屏。"""
+        nonlocal fallback_used
+        fallback_used = True
+        fallback_by[reason] += 1
+        return observe_now(fallback=True)
+
+    def _no_progress_fallback() -> dict:
+        """guard 判了 stop、任务即将以 no_progress 结束：程序补看一次全屏再交回模型（spec §3.5 (b)）。
+        返回一条程序发出的 observe 记录（不计步），调用方走 _log_other 落盘（计划 R6）。"""
+        nonlocal last_result_text, last_transition
+        guard.grant_fallback()
+        prog = {"step": steps, "ts": time.time(), "by": "program", "observation_id": obs.observation_id,
+                "before_frame_id": obs.frame_id, "observation": _observation_snapshot(obs, obs_frame_file),
+                "action": {"name": "observe", "args": {}}, "result": {"ok": True, "changed": None},
+                "fallback": {"reason": "no_progress"}}
+        o = _take_fallback("no_progress")
+        note = _fallback_text(o, done=False)
+        # 新帧是程序补看的，【上一步之后】那段说的还是模型上一步的变化 —— 和 done 兜底那条路一样清掉（终审发现 6）。
+        last_transition = None
+        if rc.context_mode == "state":
+            # 前缀冻结了，催促放进【上一步结果】（和空回复催促同一个做法，loop.py 空回复那段）
+            last_result_text = f"{last_result_text or ''}\n{note}".strip()
+        else:
+            msgs.user_text(note, seg="repair_prompt")
+        _adopt_new(prog, o)
+        return prog
 
     # 剧本子记录也走 _log_other：`log.procedure_step` 直接写盘的话，会插到那条
     # 还挂着的上一步动作记录**前面**去（动作记录延迟一拍落盘，见 _flush）。
@@ -496,6 +687,13 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         save_frame=log.save_frame,
         procedure_step=lambda rec: _log_other({"kind": "procedure_step", **rec}))
     runner = ProcedureRunner(ex, guard, runner_log, deadline=started + timeout_s, on_step=on_step)
+
+    # 认屏上下文与本任务的整屏解析模式挂到会话级 Perceiver 上（spec 2026-09-14 §3.3）；
+    # 紧贴主循环 try 之前挂，下面 finally 里释放设备之后第一件事就是解除。
+    # ⚠ 2026-09-14：每个任务都**无条件**进 scope。原来只有 ident_ctx 不为 None 才挂，孪生初始化一失败，
+    #   模式覆盖和 stats 清零就一起不生效了。模式只有一条来路：env → RunConfig.from_env → 这里。
+    _task_scope = contextlib.ExitStack()
+    _task_scope.enter_context(perceiver.task_scope(ident_ctx, rc.screen_parse))
 
     try:
         activate_ok = True
@@ -517,13 +715,20 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             # 模型基于那一页选了「设置」，等它想完（三五秒）动作发出去时，iOS 早就落到
             # 第一页了，同一个网格位置上是 Gemini —— 于是打开了错误的 App。
             # 坐标没错、几何没错，错在**观察到了一个已经不存在的画面**。
+            startup_timer = timing.open_step()
             settle(device, device.capture(), IOS_TIMING["key"], ahash)
             obs = observe_now()
             # ⚠ 镜像不是一直在的。「连接暂停」插页挡在前面时 key("home") 照样不报错，
             #   于是模型对着一张写着「连接暂停」的白图猜半天 —— 步数和钱全白花。
             #   复用刚才那次观察来判，正常情况下零额外开销；能点回来就点。
             try:
+                seen = obs
                 conn_ok, conn_why, obs = ensure_connected(device, perceiver, obs=obs)
+                if obs is not None and obs is not seen:
+                    # ⚠ 2026-09-15：点回「继续」后 ensure_connected 自己又看了一帧，那一帧没落盘；obs_frame_file
+                    #   还指着暂停页那一帧 —— 第一条记录的 observation.frame_file 与推给模型、进孪生的
+                    #   （frame_name(obs.frame_id)）不是同一帧。换了帧就把新帧落盘、改指它。
+                    obs_frame_file = log.save_frame(_frame_stub(obs))
                 if not conn_ok:
                     log.step({"step": 0, "ts": time.time(), "phase": "connect",
                               "ok": False, "detail": conn_why})
@@ -536,408 +741,472 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         if activate_ok:
             guard.record_screen(obs.state_key)
             push_obs(obs)
+            startup_timing = startup_timer.result()     # 每个任务都有的一次感知成本，A/B 单独比（spec §8.2）
+            timing.close_step()
             empty_replies = 0
             user_notes: list[str] = []
             while True:
-                # 暂停排在最前：它会阻塞。回来之后再看停止 —— 用户可能在暂停中按了停止。
-                if wait_if_paused is not None:
-                    t_pause = time.time()
-                    note = wait_if_paused()
-                    paused_s = time.time() - t_pause
-                    if paused_s > 0:
-                        started += paused_s                     # 暂停的时间不算任务时限
-                        runner.deadline += paused_s
-                    if note:
-                        user_notes.append(note)
-                        if rc.context_mode != "state":
-                            msgs.user_note(note)                 # state 视图由状态报告承载
-                        _log_other({"step": steps + 1, "ts": time.time(), "phase": "user_note",
-                                    "text": note, "paused_s": round(paused_s, 1)})
-                # 停止排在步数和时限前面：人按了停止，就不该再多跑一步，
-                # 也不该被报成「达到步数上限」这种看起来像故障的原因。
-                if should_stop is not None and should_stop():
-                    end_reason = "stopped"
-                    error_detail = "你按了停止"
-                    break
-                if steps >= max_steps:
-                    end_reason = "max_steps"
-                    error_detail = f"达到步数上限 {max_steps}"
-                    break
-                if time.time() - started > timeout_s:
-                    end_reason = "timeout"
-                    error_detail = f"超过总时限 {timeout_s}s"
-                    break
-
-                # 2. 调模型
-                model_calls += 1
-                if rc.context_mode == "state":
-                    history_text = render_history(
-                        [row_from_record(r_, r_.get("_elements_by_id")) for r_ in step_records],
-                        config.HISTORY_KEEP)
-                    mem_text = current_memory
-                    if mem_text and memory_truncated:
-                        mem_text += f"\n（备忘已截断：超过 {config.MEMORY_FIELD_MAX} 字的部分没保留）"
-                    # 逐段拆开传给 state_view：段名要进 budget（计量层），拼接结果和
-                    # build_state_text 的旧返回值逐字符相同，state_text 参数只是
-                    # 兼容旧签名，parts 给了就以 parts 为准。
-                    state_parts = build_state_parts(
-                        history=history_text, memory=mem_text,
-                        last_result=last_result_text, transition=last_transition,
-                        elements_text=current_obs_text,
-                        step=steps + 1, max_steps=max_steps, user_notes=user_notes)
-                    view = msgs.state_view(
-                        build_state_text(history=history_text, memory=mem_text,
-                                         last_result=last_result_text, transition=last_transition,
-                                         elements_text=current_obs_text,
-                                         step=steps + 1, max_steps=max_steps, user_notes=user_notes),
-                        _png_b64(obs.marked_image), parts=state_parts,
-                        px=(obs.width_px, obs.height_px))
-                else:
-                    view = msgs.windowed()
+                step_timer = timing.open_step()
                 try:
-                    # view 是带 _seg 标记的原件（后面的计量层按它记账）；
-                    # to_wire(view) 才是发出去的那份 —— 内部标记一个不带。
-                    reply = model.decide(to_wire(view), (obs.width_px, obs.height_px), tools=tools)
-                except ModelError as e:
-                    end_reason = "model_error"
-                    error_detail = str(e)
-                    _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "model", "error": str(e)})
-                    break
-                model_version = reply.model_version or model_version
-                accumulate(usage_total, reply.usage)
-                # 观测设施：account() 炸了记一条结构化错误继续跑，绝不顶掉任务
-                # （和上面记忆注入失败的处置是同一套）。account 吃 view（带 _seg
-                # 标记的原件），不是发出去的 to_wire(view)。
-                try:
-                    call_budget = budget_mod.account(
-                        view, tools, reply.usage, context_mode=rc.context_mode,
-                        call_index=len(budgets_by_call),
-                        # 优先用响应里返回的版本：qwen3.7-plus 是滚动别名，
-                        # 标定要能绑到具体版本上。
-                        model_id=reply.model_version or model.resolved.model.id)
-                except Exception as e:      # noqa: BLE001
-                    call_budget = {"budget_error": f"{type(e).__name__}: {e}",
-                                   "call_index": len(budgets_by_call)}
-                # 前缀漂移只记账不中断：观测设施。作用是让离线的差分校验知道
-                # 哪些调用的 token 差分数据作废（前缀变了，差分就没意义了）。
-                # 两种 call_budget（正常记账 / account() 炸了的错误占位符）都要
-                # 能挂上这个字段 —— 漂移和记账是否成功是两回事。
-                if rc.context_mode == "state" and msgs.frozen_prefix_hash is not None:
-                    call_budget["prefix_drift"] = (
-                        msgs.prefix_hash() != msgs.frozen_prefix_hash)
-                budgets_by_call.append(call_budget)
-
-                if not reply.actions:
-                    empty_replies += 1
-                    _log_other({"step": steps + 1, "ts": time.time(), "observation_id": obs.observation_id,
-                                "rejected": "empty_reply",
-                                "model": {"latency_ms": reply.latency_ms, "usage": reply.usage},
-                                "budget": call_budget})
-                    if empty_replies >= 2:
-                        end_reason = "model_error"
-                        error_detail = "模型连续两次没有调用任何工具，只回了文字"
+                    # 暂停排在最前：它会阻塞。回来之后再看停止 —— 用户可能在暂停中按了停止。
+                    if wait_if_paused is not None:
+                        t_pause = time.time()
+                        note = wait_if_paused()
+                        paused_s = time.time() - t_pause
+                        step_timer.wait("pause", paused_s)
+                        if paused_s > 0:
+                            started += paused_s                     # 暂停的时间不算任务时限
+                            runner.deadline += paused_s
+                        if note:
+                            user_notes.append(note)
+                            if rc.context_mode != "state":
+                                msgs.user_note(note)                 # state 视图由状态报告承载
+                            _log_other({"step": steps + 1, "ts": time.time(), "phase": "user_note",
+                                        "text": note, "paused_s": round(paused_s, 1)})
+                    # 停止排在步数和时限前面：人按了停止，就不该再多跑一步，
+                    # 也不该被报成「达到步数上限」这种看起来像故障的原因。
+                    if should_stop is not None and should_stop():
+                        end_reason = "stopped"
+                        error_detail = "你按了停止"
                         break
+                    if steps >= max_steps:
+                        end_reason = "max_steps"
+                        error_detail = f"达到步数上限 {max_steps}"
+                        break
+                    if time.time() - started > timeout_s:
+                        end_reason = "timeout"
+                        error_detail = f"超过总时限 {timeout_s}s"
+                        break
+
+                    # 2. 调模型
+                    model_calls += 1
+                    step_timer.model_called = True
                     if rc.context_mode == "state":
-                        # 前缀冻结了，催促不能再往里加。放进【上一步结果】——
-                        # 状态报告每步重建，模型下一步照样看得到，且不砸缓存前缀。
-                        last_result_text = "你上一次只回了文字，没有调用工具。请调用一个工具。"
-                        last_transition = None
+                        history_text = render_history(
+                            [row_from_record(r_, r_.get("_elements_by_id")) for r_ in step_records],
+                            config.HISTORY_KEEP)
+                        mem_text = current_memory
+                        if mem_text and memory_truncated:
+                            mem_text += f"\n（备忘已截断：超过 {config.MEMORY_FIELD_MAX} 字的部分没保留）"
+                        # 逐段拆开传给 state_view：段名要进 budget（计量层），拼接结果和
+                        # build_state_text 的旧返回值逐字符相同，state_text 参数只是
+                        # 兼容旧签名，parts 给了就以 parts 为准。
+                        state_parts = build_state_parts(
+                            history=history_text, memory=mem_text,
+                            last_result=last_result_text, transition=last_transition,
+                            elements_text=current_obs_text,
+                            step=steps + 1, max_steps=max_steps, user_notes=user_notes)
+                        view = msgs.state_view(
+                            build_state_text(history=history_text, memory=mem_text,
+                                             last_result=last_result_text, transition=last_transition,
+                                             elements_text=current_obs_text,
+                                             step=steps + 1, max_steps=max_steps, user_notes=user_notes),
+                            _png_b64(obs.marked_image), parts=state_parts,
+                            px=(obs.width_px, obs.height_px))
                     else:
-                        msgs.user_text("请调用一个工具，不要只回复文字。", seg="repair_prompt")
-                    continue
-                empty_replies = 0
-
-                # 一次多个工具调用：全部拒绝
-                if len(reply.actions) > 1:
-                    res = ToolResult(ok=False, error="rejected_multiple_calls",
-                                     hint="一次只发一个工具调用")
-                    for a in reply.actions:
-                        msgs.assistant_tool_call(a.call_id, a.name, json.dumps(a.args, ensure_ascii=False), reply.text)
-                        msgs.tool_result(a.call_id, res.to_json())
-                    _log_other({"step": steps + 1, "ts": time.time(), "observation_id": obs.observation_id,
-                                "rejected": "multiple_calls", "count": len(reply.actions),
-                                "model": {"latency_ms": reply.latency_ms, "usage": reply.usage},
-                                "budget": call_budget})
-                    consecutive_rejections += 1
-                    if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
+                        view = msgs.windowed()
+                    t_model = time.perf_counter()
+                    try:
+                        # view 是带 _seg 标记的原件（后面的计量层按它记账）；
+                        # to_wire(view) 才是发出去的那份 —— 内部标记一个不带。
+                        reply = model.decide(to_wire(view), (obs.width_px, obs.height_px), tools=tools)
+                    except ModelError as e:
+                        step_timer.model_ms = int((time.perf_counter() - t_model) * 1000)
                         end_reason = "model_error"
-                        error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                    "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                        error_detail = str(e)
+                        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "model", "error": str(e)},
+                                   ends_step=True)
                         break
-                    last_result_text, last_transition = _bound_result(res), None
-                    continue
+                    step_timer.model_ms = int((time.perf_counter() - t_model) * 1000)
+                    model_version = reply.model_version or model_version
+                    accumulate(usage_total, reply.usage)
+                    # 观测设施：account() 炸了记一条结构化错误继续跑，绝不顶掉任务
+                    # （和上面记忆注入失败的处置是同一套）。account 吃 view（带 _seg
+                    # 标记的原件），不是发出去的 to_wire(view)。
+                    try:
+                        call_budget = budget_mod.account(
+                            view, tools, reply.usage, context_mode=rc.context_mode,
+                            call_index=len(budgets_by_call),
+                            # 优先用响应里返回的版本：qwen3.7-plus 是滚动别名，
+                            # 标定要能绑到具体版本上。
+                            model_id=reply.model_version or model.resolved.model.id)
+                    except Exception as e:      # noqa: BLE001
+                        call_budget = {"budget_error": f"{type(e).__name__}: {e}",
+                                       "call_index": len(budgets_by_call)}
+                    # 前缀漂移只记账不中断：观测设施。作用是让离线的差分校验知道
+                    # 哪些调用的 token 差分数据作废（前缀变了，差分就没意义了）。
+                    # 两种 call_budget（正常记账 / account() 炸了的错误占位符）都要
+                    # 能挂上这个字段 —— 漂移和记账是否成功是两回事。
+                    if rc.context_mode == "state" and msgs.frozen_prefix_hash is not None:
+                        call_budget["prefix_drift"] = (
+                            msgs.prefix_hash() != msgs.frozen_prefix_hash)
+                    budgets_by_call.append(call_budget)
 
-                action = reply.actions[0]
-                # 模型对**上一步**的评价：回填到上一条记录上（那条还没落盘，见 _flush）。
-                # 约定 "yes:/no:/unknown: 说明"，写错就归到 unknown，不因此拒绝动作。
-                if action.eval and step_records:
-                    head, _, note = action.eval.partition(":")
-                    head = head.strip().lower()
-                    step_records[-1]["eval"] = {
-                        "expected": head if head in ("yes", "no", "unknown") else "unknown",
-                        "note": note.strip() or action.eval.strip()}
-                if action.memory is not None:
-                    # 整段替换而不是追加：追加会让备忘无界地长，也没法让模型自己删。
-                    memory_truncated = len(action.memory) > config.MEMORY_FIELD_MAX
-                    current_memory = action.memory[:config.MEMORY_FIELD_MAX]
-                msgs.assistant_tool_call(action.call_id, action.name,
-                                         json.dumps(action.args | {"reason": action.reason}, ensure_ascii=False), reply.text)
-                record = {"step": steps + 1, "ts": time.time(), "observation_id": obs.observation_id,
-                          "before_frame_id": obs.frame_id,
-                          "observation": _observation_snapshot(obs, obs_frame_file),
-                          "model": {"reason": action.reason, "expect": action.expect,
-                          "eval": action.eval, "memory": action.memory,
-                          "latency_ms": reply.latency_ms, "usage": reply.usage},
-                          "budget": call_budget,
-                          "action": {"name": action.name, "args_raw": dict(action.args)},
-                          # 历史行靠它把 `tap 3` 显示成 `tap "通用"`。`_` 开头 = 不落盘。
-                          "_elements_by_id": {e.id: e.text for e in obs.elements}}
+                    if not reply.actions:
+                        empty_replies += 1
+                        _log_other({"step": steps + 1, "ts": time.time(), "observation_id": obs.observation_id,
+                                    "rejected": "empty_reply",
+                                    "model": {"latency_ms": reply.latency_ms, "usage": reply.usage},
+                                    "budget": call_budget}, ends_step=True)
+                        if empty_replies >= 2:
+                            end_reason = "model_error"
+                            error_detail = "模型连续两次没有调用任何工具，只回了文字"
+                            break
+                        if rc.context_mode == "state":
+                            # 前缀冻结了，催促不能再往里加。放进【上一步结果】——
+                            # 状态报告每步重建，模型下一步照样看得到，且不砸缓存前缀。
+                            last_result_text = "你上一次只回了文字，没有调用工具。请调用一个工具。"
+                            last_transition = None
+                        else:
+                            msgs.user_text("请调用一个工具，不要只回复文字。", seg="repair_prompt")
+                        continue
+                    empty_replies = 0
 
-                # 校验
-                try:
-                    if "_parse_error" in action.args:
-                        raise ValidationError("invalid_args", "arguments 不是合法 JSON")
-                    action = validate_action(action, obs, proc_by_tool,
-                                             allow_coord_tap=allow_coords)
-                except ValidationError as e:
-                    res = ToolResult(ok=False, error=e.code, hint=e.message)
-                    msgs.tool_result(action.call_id, res.to_json())
-                    record.update({"validation": e.code, "result": json.loads(res.to_json())})
-                    last_result_text, last_transition = _bound_result(res), None
-                    _flush(record)
-                    if on_step: on_step(record)
-                    consecutive_rejections += 1
-                    if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                        end_reason = "model_error"
-                        error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                    "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
-                        break
-                    continue
+                    # 一次多个工具调用：全部拒绝
+                    if len(reply.actions) > 1:
+                        res = ToolResult(ok=False, error="rejected_multiple_calls",
+                                         hint="一次只发一个工具调用")
+                        for a in reply.actions:
+                            msgs.assistant_tool_call(a.call_id, a.name, json.dumps(a.args, ensure_ascii=False), reply.text)
+                            msgs.tool_result(a.call_id, res.to_json())
+                        _log_other({"step": steps + 1, "ts": time.time(), "observation_id": obs.observation_id,
+                                    "rejected": "multiple_calls", "count": len(reply.actions),
+                                    "model": {"latency_ms": reply.latency_ms, "usage": reply.usage},
+                                    "budget": call_budget}, ends_step=True)
+                        consecutive_rejections += 1
+                        if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
+                            end_reason = "model_error"
+                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
+                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
+                                        "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                            break
+                        last_result_text, last_transition = _bound_result(res), None
+                        continue
 
-                record["action"]["args"] = dict(action.args)
+                    action = reply.actions[0]
+                    # 模型对**上一步**的评价：回填到上一条记录上（那条还没落盘，见 _flush）。
+                    # 约定 "yes:/no:/unknown: 说明"，写错就归到 unknown，不因此拒绝动作。
+                    if action.eval and step_records:
+                        head, _, note = action.eval.partition(":")
+                        head = head.strip().lower()
+                        step_records[-1]["eval"] = {
+                            "expected": head if head in ("yes", "no", "unknown") else "unknown",
+                            "note": note.strip() or action.eval.strip()}
+                    if action.memory is not None:
+                        # 整段替换而不是追加：追加会让备忘无界地长，也没法让模型自己删。
+                        memory_truncated = len(action.memory) > config.MEMORY_FIELD_MAX
+                        current_memory = action.memory[:config.MEMORY_FIELD_MAX]
+                    msgs.assistant_tool_call(action.call_id, action.name,
+                                             json.dumps(action.args | {"reason": action.reason}, ensure_ascii=False), reply.text)
+                    record = {"step": steps + 1, "ts": time.time(), "observation_id": obs.observation_id,
+                              "before_frame_id": obs.frame_id,
+                              "observation": _observation_snapshot(obs, obs_frame_file),
+                              "model": {"reason": action.reason, "expect": action.expect,
+                              "eval": action.eval, "memory": action.memory,
+                              "latency_ms": reply.latency_ms, "usage": reply.usage},
+                              "budget": call_budget,
+                              "action": {"name": action.name, "args_raw": dict(action.args)},
+                              # 历史行靠它把 `tap 3` 显示成 `tap "通用"`。`_` 开头 = 不落盘。
+                              "_elements_by_id": {e.id: e.text for e in obs.elements}}
+                    if current_twin is not None:
+                        record["twin"] = current_twin          # 这一帧当时认成了什么：事后分析不用重跑
+                    record["hints"] = dict(current_hints)      # 这一步模型看到【位置】/【路线】没有
+                    if obs.observation_id != sent_observation_id:
+                        # 内部 invariant（spec §6.3）：构造视图和校验用的应是同一个 obs，这里只能抓 loop 自己换错对象的 bug。
+                        # 抓不到模型凭记忆用旧编号 —— 那一类的防线是 OCR 编号稳定、zoom 不复用编号、tapped 回显。
+                        record["observation_mismatch"] = {"sent": sent_observation_id, "validated": obs.observation_id}
+                        observation_mismatch += 1
 
-                # 3. 同屏同动作拒绝
-                if guard.check_repeat(action, obs.state_key, obs.width_px, obs.height_px):
-                    res = ToolResult(ok=False, error="repeated_action", hint="这个动作在当前画面上已经做过且没有变化，换一个。")
-                    msgs.tool_result(action.call_id, res.to_json())
-                    record.update({"validation": "repeated_action", "result": json.loads(res.to_json())})
-                    last_result_text, last_transition = _bound_result(res), None
-                    _flush(record)
-                    if on_step: on_step(record)
-                    consecutive_rejections += 1
-                    if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                        end_reason = "model_error"
-                        error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                    "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
-                        break
-                    continue
-
-                # 3.2 安全闸：写类动作有人确认才做，没人就拒；不可逆的谁说都不做。
-                # 放在校验和去重之后、执行之前 —— 模型说什么都绕不过这一道（harness/safety.py 说明为什么）。
-                decision = safety.classify(action, obs)
-                if decision.level != "read":
-                    what = decision.describe()
-                    if decision.level == "never":
-                        outcome = "blocked_never"
-                    elif confirm is None:
-                        outcome = "blocked_unattended"
-                    else:
-                        t_ask = time.time()
-                        try:
-                            allowed = bool(confirm(safety.ConfirmationRequest(decision.target, action.reason)))
-                        except Exception as e:      # noqa: BLE001 —— 问人的通道坏了按拒绝算，绝不放行
-                            allowed = False
-                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "confirm",
-                                        "error": f"{type(e).__name__}: {e}"})
-                        waited = time.time() - t_ask                  # 等人回答的时间不计时限
-                        started += waited
-                        runner.deadline += waited
-                        outcome = "confirmed" if allowed else "denied"
-                    record["safety"] = {"level": decision.level, "decision": outcome,
-                                        "target": decision.target}
-                    if outcome != "confirmed":
-                        res = ToolResult(ok=False, error=outcome, hint=safety.hint(outcome, what))
+                    # 校验
+                    try:
+                        if "_parse_error" in action.args:
+                            raise ValidationError("invalid_args", "arguments 不是合法 JSON")
+                        action = validate_action(action, obs, proc_by_tool,
+                                                 allow_coord_tap=allow_coords)
+                    except ValidationError as e:
+                        res = ToolResult(ok=False, error=e.code, hint=e.message)
                         msgs.tool_result(action.call_id, res.to_json())
-                        record.update({"validation": outcome, "result": json.loads(res.to_json())})
+                        record.update({"validation": e.code, "result": json.loads(res.to_json())})
                         last_result_text, last_transition = _bound_result(res), None
                         _flush(record)
                         if on_step: on_step(record)
                         consecutive_rejections += 1
                         if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
                             end_reason = "model_error"
-                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用/安全闸）"
+                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
                             _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
                                         "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
                             break
                         continue
 
-                # 3.5 查询记忆的次数上限：每种各 config.RECALL_PER_RUN 次。
-                # 没有上限时，模型可以把一整轮步数都耗在翻记忆上（每次 recall 都算一步，
-                # 而且屏幕不变，无进展熔断只会在 6 步之后才拦）。超出按拒绝处理，
-                # 走既有的连续拒绝熔断，不另发明一套停机机制。
-                if action.name in recall_used and recall_used[action.name] >= recall_budget[action.name]:
-                    res = ToolResult(ok=False, error="recall_budget_exhausted",
-                                     hint=f"{action.name} 每次运行最多 {recall_budget[action.name]} 次，"
-                                          f"已用完；用当前屏幕上的信息继续。")
-                    msgs.tool_result(action.call_id, res.to_json())
-                    record.update({"validation": "recall_budget_exhausted",
-                                   "result": json.loads(res.to_json())})
-                    last_result_text, last_transition = _bound_result(res), None
-                    _flush(record)
-                    if on_step: on_step(record)
-                    consecutive_rejections += 1
-                    if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                        end_reason = "model_error"
-                        error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                    "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
-                        break
-                    continue
+                    record["action"]["args"] = dict(action.args)
 
-                # 4. 执行
-                steps += 1
-                record["step"] = steps
-                consecutive_rejections = 0
-                if action.name == "done":
-                    done_status, done_result = action.args["status"], action.args["result"]
-                    end_reason = "done_success" if done_status == "success" else "done_failed"
-                    # 只记下来，等设备释放之后再落盘（见 finally）。
-                    # used_memories 同理：使用计数要等审计出结论才知道算成功还是失败。
-                    pending_memories = action.args.get("remember", [])
-                    action_used_memories = action.args.get("used_memories", [])
-                    msgs.tool_result(action.call_id, ToolResult(ok=True).to_json())
-                    record["result"] = {"ok": True}
-                    _flush(record)
-                    if on_step: on_step(record)
-                    break
+                    tap_tt = safety.tap_target(action, obs)
+                    if tap_tt is not None:
+                        # 被拦下的点击也记：verify 反查、复盘都读它（spec 2026-09-14 §6.2）
+                        record["tap_target"] = tap_tt.to_json()
 
-                if action.name == "handover":
-                    # 交给人。没人可交（评测、无人值守）就到此为止，need 原样带出去让人看见。
-                    need = action.args["need"]
-                    note = None
-                    if on_handover is not None:
-                        t_wait = time.time()
-                        try:
-                            note = on_handover(need, action.reason)
-                        except Exception as e:      # noqa: BLE001 —— 交接通道坏了按「没人接」算
-                            note = None
-                            _log_other({"step": steps, "ts": time.time(), "error_phase": "handover",
-                                        "error": f"{type(e).__name__}: {e}"})
-                        waited = time.time() - t_wait                     # 等人的时间不计时限
-                        started += waited
-                        runner.deadline += waited
-                    if note is None:
-                        end_reason = "handover"
-                        error_detail = need
-                        msgs.tool_result(action.call_id, ToolResult(ok=True, extra={"resumed": False}).to_json())
-                        record["result"] = {"ok": True, "resumed": False, "need": need}
+                    # 3. 同屏同动作拒绝
+                    if guard.check_repeat(action, obs.state_key, obs.width_px, obs.height_px):
+                        res = ToolResult(ok=False, error="repeated_action", hint="这个动作在当前画面上已经做过且没有变化，换一个。")
+                        msgs.tool_result(action.call_id, res.to_json())
+                        record.update({"validation": "repeated_action", "result": json.loads(res.to_json())})
+                        last_result_text, last_transition = _bound_result(res), None
+                        _flush(record)
+                        if on_step: on_step(record)
+                        consecutive_rejections += 1
+                        if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
+                            end_reason = "model_error"
+                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
+                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
+                                        "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                            break
+                        continue
+
+                    # 3.2 安全闸：写类动作有人确认才做，没人就拒；不可逆的谁说都不做。
+                    # 放在校验和去重之后、执行之前 —— 模型说什么都绕不过这一道（harness/safety.py 说明为什么）。
+                    decision = safety.classify(action, obs)
+                    if decision.level != "read":
+                        what = decision.describe()
+                        if decision.level == "never":
+                            outcome = "blocked_never"
+                        elif confirm is None:
+                            outcome = "blocked_unattended"
+                        else:
+                            t_ask = time.time()
+                            try:
+                                allowed = bool(confirm(safety.ConfirmationRequest(decision.target, action.reason)))
+                            except Exception as e:      # noqa: BLE001 —— 问人的通道坏了按拒绝算，绝不放行
+                                allowed = False
+                                _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "confirm",
+                                            "error": f"{type(e).__name__}: {e}"})
+                            waited = time.time() - t_ask                  # 等人回答的时间不计时限
+                            step_timer.wait("confirm", waited)
+                            started += waited
+                            runner.deadline += waited
+                            outcome = "confirmed" if allowed else "denied"
+                        record["safety"] = {"level": decision.level, "decision": outcome,
+                                            "target": decision.target}
+                        if outcome != "confirmed":
+                            res = ToolResult(ok=False, error=outcome, hint=safety.hint(outcome, what))
+                            msgs.tool_result(action.call_id, res.to_json())
+                            record.update({"validation": outcome, "result": json.loads(res.to_json())})
+                            last_result_text, last_transition = _bound_result(res), None
+                            _flush(record)
+                            if on_step: on_step(record)
+                            consecutive_rejections += 1
+                            if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
+                                end_reason = "model_error"
+                                error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用/安全闸）"
+                                _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
+                                            "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                                break
+                            continue
+
+                    # 3.5 查询记忆的次数上限：每种各 config.RECALL_PER_RUN 次。
+                    # 没有上限时，模型可以把一整轮步数都耗在翻记忆上（每次 recall 都算一步，
+                    # 而且屏幕不变，无进展熔断只会在 6 步之后才拦）。超出按拒绝处理，
+                    # 走既有的连续拒绝熔断，不另发明一套停机机制。
+                    if action.name in recall_used and recall_used[action.name] >= recall_budget[action.name]:
+                        res = ToolResult(ok=False, error="recall_budget_exhausted",
+                                         hint=f"{action.name} 每次运行最多 {recall_budget[action.name]} 次，"
+                                              f"已用完；用当前屏幕上的信息继续。")
+                        msgs.tool_result(action.call_id, res.to_json())
+                        record.update({"validation": "recall_budget_exhausted",
+                                       "result": json.loads(res.to_json())})
+                        last_result_text, last_transition = _bound_result(res), None
+                        _flush(record)
+                        if on_step: on_step(record)
+                        consecutive_rejections += 1
+                        if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
+                            end_reason = "model_error"
+                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
+                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
+                                        "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                            break
+                        continue
+
+                    # 4. 执行
+                    steps += 1
+                    record["step"] = steps
+                    consecutive_rejections = 0
+                    if action.name == "done":
+                        if action.args["status"] == "failed" and _fallback_due():
+                            # ⚠ 2026-09-14（spec 按需看图 §3.5 (a)）：事故的形状恰恰是「模型不知道列表里漏了东西」
+                            #   （工资账户，CLAUDE.md §4）。程序不判断屏幕上缺什么，只在模型要放弃时补齐证据再让它判断 ——
+                            #   这是重试，不是推断隐藏状态（CLAUDE.md §2）。任务不结束，这一步照常计步。
+                            o_fb = _take_fallback("done_failed")
+                            res = ToolResult(ok=False, error="fallback_observe", hint=_fallback_text(o_fb, done=True))
+                            msgs.tool_result(action.call_id, res.to_json())
+                            record.update({"result": json.loads(res.to_json()), "fallback": {"reason": "done_failed"},
+                                           "no_progress": guard.no_progress})
+                            last_result_text, last_transition = _bound_result(res), None
+                            _adopt_new(record, o_fb)
+                            _flush(record)
+                            if on_step: on_step(record)
+                            continue
+                        done_status, done_result = action.args["status"], action.args["result"]
+                        end_reason = "done_success" if done_status == "success" else "done_failed"
+                        # 只记下来，等设备释放之后再落盘（见 finally）。
+                        # used_memories 同理：使用计数要等审计出结论才知道算成功还是失败。
+                        pending_memories = action.args.get("remember", [])
+                        action_used_memories = action.args.get("used_memories", [])
+                        msgs.tool_result(action.call_id, ToolResult(ok=True).to_json())
+                        record["result"] = {"ok": True}
                         _flush(record)
                         if on_step: on_step(record)
                         break
-                    # 人做完了：画面是人改的，必须重新看，不能拿着交接前那一屏接着想。
-                    res = ToolResult(ok=True, extra={"resumed": True, "need": need, "note": note or ""})
+
+                    if action.name == "handover":
+                        # 交给人。没人可交（评测、无人值守）就到此为止，need 原样带出去让人看见。
+                        need = action.args["need"]
+                        note = None
+                        if on_handover is not None:
+                            t_wait = time.time()
+                            try:
+                                note = on_handover(need, action.reason)
+                            except Exception as e:      # noqa: BLE001 —— 交接通道坏了按「没人接」算
+                                note = None
+                                _log_other({"step": steps, "ts": time.time(), "error_phase": "handover",
+                                            "error": f"{type(e).__name__}: {e}"})
+                            waited = time.time() - t_wait                     # 等人的时间不计时限
+                            step_timer.wait("handover", waited)
+                            started += waited
+                            runner.deadline += waited
+                        if note is None:
+                            end_reason = "handover"
+                            error_detail = need
+                            msgs.tool_result(action.call_id, ToolResult(ok=True, extra={"resumed": False}).to_json())
+                            record["result"] = {"ok": True, "resumed": False, "need": need}
+                            _flush(record)
+                            if on_step: on_step(record)
+                            break
+                        # 人做完了：画面是人改的，必须重新看，不能拿着交接前那一屏接着想。
+                        res = ToolResult(ok=True, extra={"resumed": True, "need": need, "note": note or ""})
+                        msgs.tool_result(action.call_id, res.to_json())
+                        record.update({"result": json.loads(res.to_json()), "no_progress": guard.no_progress})
+                        last_result_text, last_transition = _bound_result(res), None
+                        _adopt_new(record, observe_now())
+                        _flush(record)
+                        if on_step: on_step(record)
+                        continue
+
+                    if action.name in recall_used:
+                        recall_used[action.name] += 1
+
+                    t0 = time.time()
+                    is_proc = action.name in proc_by_tool
+                    if is_proc:
+                        # 一次剧本调用 = 一步。内部动作各自走同一套校验/去重/熔断，
+                        # 走不通就带着当时的屏幕整个交回模型（见 harness/procedure.py）。
+                        res, new_obs = runner.run(proc_by_tool[action.name], action.args, obs,
+                                                  action.call_id, action.name)
+                        procedures_used.append({"name": action.name, "ok": res.ok,
+                                                "steps_done": res.extra.get("steps_done", 0),
+                                                "actions": res.extra.get("actions", 0), "error": res.error})
+                    else:
+                        res, new_obs = ex.run(action, obs)
+                    record["exec_ms"] = int((time.time() - t0) * 1000)
+                    step_timer.exec_ms = record["exec_ms"]
+                    if tap_tt is not None and not is_proc:
+                        taps["by_id" if tap_tt.by == "id" else "by_coord"] += 1
+                        taps["coord_unclassified"] += int(tap_tt.unclassified)
+                        res.extra["tapped"] = tap_tt.echo(obs)          # obs 此刻仍是动作之前那一帧
+                    if action.name == "recall" and res.ok:
+                        # 只记真的读到了的那些：召回是否可观测是验收第 A 条的判据，
+                        # 记上一条查无此名的记忆会让复盘以为模型看过它。
+                        recalled_names.append(action.args["name"])
+                    if res.ok and not res.changed:
+                        guard.record_executed(action, obs.state_key, obs.width_px, obs.height_px)
+
+                    # 5/6. 结果、无进展
+                    if is_proc:
+                        # ⚠ 剧本内部每个动作都已经记过账了，这里**绝不能再补一枪**：
+                        #   record_outcome 只在计数**正好等于**阈值时报判决，再调一次
+                        #   只会让计数继续往上爬，判决永远不再出现 —— 熔断等于被拆了。
+                        #   剧本把内部触发的那次判决原样带在 extra 里交回来（Task 6 的集成约定），
+                        #   顶层照顶层的规矩处理它。
+                        verdict = res.extra.get("guard_verdict")
+                    else:
+                        # 第三态（变了但看图复核说没达到预期）也在 record_result 里判，别在这儿拼参数。
+                        verdict = guard.record_result(action, res, new_obs)
+                    if guard.dead_taps >= config.DEAD_TAPS_ALERT:
+                        # 连续几次点击画面纹丝不动：不是模型的事，走恢复阶梯（没法重做那一下，
+                        # 所以只要某一级真的做了事就清计数再看；全失败抛 DeviceChannelDead → device_error）。
+                        recovery.climb("tap")
+                        guard.dead_taps = 0
+                    if recovery.events:
+                        record["recovery"] = recovery.drain()
+                    if verdict == "warn":
+                        res.hint = (res.hint or "") + " 已连续多步无进展：" + no_progress_hint(guard.last_reason)
                     msgs.tool_result(action.call_id, res.to_json())
                     record.update({"result": json.loads(res.to_json()), "no_progress": guard.no_progress})
-                    last_result_text, last_transition = _bound_result(res), None
-                    obs = observe_now()
-                    record["after_frame_id"] = obs.frame_id
-                    record["after_frame_file"] = obs_frame_file
-                    guard.record_screen(obs.state_key)
-                    push_obs(obs)
+
+                    last_result_text = _bound_result(res)
+
+                    _twin_after(record, new_obs)
+
+                    # 7. 新观察
+                    if new_obs is not None:
+                        # ⚠ 变化段要在 obs 被覆盖之前算：before 是动作**之前**那一帧。
+                        #   tap_px 只对 tap 有意义 —— executor 上一次点的位置会一直留着，
+                        #   拿去给 scroll 算局部变化就是在报一个无关位置的噪声。
+                        t = tr.transition(obs, new_obs,
+                                          ex._last_tap_px if action.name == "tap" else None,
+                                          list_max=config.TRANSITION_LIST_MAX)
+                        record["transition"] = {"changed": t.changed, "local_changed": t.local_changed,
+                                                "added": list(t.added), "removed": list(t.removed),
+                                                "added_total": t.added_total,
+                                                "removed_total": t.removed_total}
+                        last_transition = tr.render(t)
+                        obs = new_obs
+                        record["after_frame_id"] = obs.frame_id
+                        obs_frame_file = log.save_frame(_frame_stub(obs))
+                        # 「当前画面」要的是动作**之后**那一帧。
+                        # record["observation"] 里存的是动作**之前**的，用它会永远慢一步。
+                        record["after_frame_file"] = obs_frame_file
+                        push_obs(obs)
+                        # ⚠ 2026-09-14（spec §8.1）：after 帧的快照存在本条记录上。原来只存帧文件名，重放要靠下一条记录的
+                        #   before 找回同一帧；最后一个动作之后若因 max_steps / no_progress / 停止 / 异常结束，就没有下一条，
+                        #   实时孪生用过的标注进不了 steps.jsonl，重放和实时从此分叉。写的时候帧已 finalized。
+                        record["after_observation"] = _observation_snapshot(obs, obs_frame_file)
+                    else:
+                        last_transition = None
+                    prog = None
+                    if verdict == "stop" and _fallback_due():
+                        # spec §3.5 (b)：先补看、推新帧，再落这一步的记录 —— 这一轮的计时（Task 9）因此包含兜底解析。
+                        prog = _no_progress_fallback()
                     _flush(record)
                     if on_step: on_step(record)
-                    continue
-
-                if action.name in recall_used:
-                    recall_used[action.name] += 1
-
-                t0 = time.time()
-                is_proc = action.name in proc_by_tool
-                if is_proc:
-                    # 一次剧本调用 = 一步。内部动作各自走同一套校验/去重/熔断，
-                    # 走不通就带着当时的屏幕整个交回模型（见 harness/procedure.py）。
-                    res, new_obs = runner.run(proc_by_tool[action.name], action.args, obs,
-                                              action.call_id, action.name)
-                    procedures_used.append({"name": action.name, "ok": res.ok,
-                                            "steps_done": res.extra.get("steps_done", 0),
-                                            "actions": res.extra.get("actions", 0), "error": res.error})
-                else:
-                    res, new_obs = ex.run(action, obs)
-                record["exec_ms"] = int((time.time() - t0) * 1000)
-                if action.name == "recall" and res.ok:
-                    # 只记真的读到了的那些：召回是否可观测是验收第 A 条的判据，
-                    # 记上一条查无此名的记忆会让复盘以为模型看过它。
-                    recalled_names.append(action.args["name"])
-                if res.ok and not res.changed:
-                    guard.record_executed(action, obs.state_key, obs.width_px, obs.height_px)
-
-                # 5/6. 结果、无进展
-                if is_proc:
-                    # ⚠ 剧本内部每个动作都已经记过账了，这里**绝不能再补一枪**：
-                    #   record_outcome 只在计数**正好等于**阈值时报判决，再调一次
-                    #   只会让计数继续往上爬，判决永远不再出现 —— 熔断等于被拆了。
-                    #   剧本把内部触发的那次判决原样带在 extra 里交回来（Task 6 的集成约定），
-                    #   顶层照顶层的规矩处理它。
-                    verdict = res.extra.get("guard_verdict")
-                else:
-                    # 第三态（变了但看图复核说没达到预期）也在 record_result 里判，别在这儿拼参数。
-                    verdict = guard.record_result(action, res, new_obs)
-                if guard.dead_taps >= config.DEAD_TAPS_ALERT:
-                    # 连续几次点击画面纹丝不动：不是模型的事，走恢复阶梯（没法重做那一下，
-                    # 所以只要某一级真的做了事就清计数再看；全失败抛 DeviceChannelDead → device_error）。
-                    recovery.climb("tap")
-                    guard.dead_taps = 0
-                if recovery.events:
-                    record["recovery"] = recovery.drain()
-                if verdict == "warn":
-                    res.hint = (res.hint or "") + " 已连续多步无进展：" + no_progress_hint(guard.last_reason)
-                msgs.tool_result(action.call_id, res.to_json())
-                record.update({"result": json.loads(res.to_json()), "no_progress": guard.no_progress})
-
-                last_result_text = _bound_result(res)
-
-                # 7. 新观察
-                if new_obs is not None:
-                    # ⚠ 变化段要在 obs 被覆盖之前算：before 是动作**之前**那一帧。
-                    #   tap_px 只对 tap 有意义 —— executor 上一次点的位置会一直留着，
-                    #   拿去给 scroll 算局部变化就是在报一个无关位置的噪声。
-                    t = tr.transition(obs, new_obs,
-                                      ex._last_tap_px if action.name == "tap" else None,
-                                      list_max=config.TRANSITION_LIST_MAX)
-                    record["transition"] = {"changed": t.changed, "local_changed": t.local_changed,
-                                            "added": list(t.added), "removed": list(t.removed),
-                                            "added_total": t.added_total,
-                                            "removed_total": t.removed_total}
-                    last_transition = tr.render(t)
-                    obs = new_obs
-                    record["after_frame_id"] = obs.frame_id
-                    obs_frame_file = log.save_frame(_frame_stub(obs))
-                    # 「当前画面」要的是动作**之后**那一帧。
-                    # record["observation"] 里存的是动作**之前**的，用它会永远慢一步。
-                    record["after_frame_file"] = obs_frame_file
-                    push_obs(obs)
-                else:
-                    last_transition = None
-                _flush(record)
-                if on_step: on_step(record)
-                if verdict == "stop":
-                    end_reason = "no_progress"
-                    error_detail = (f"连续 {config.NO_PROGRESS_STOP} 步无进展："
-                                    + no_progress_hint(guard.last_reason))
-                    break
+                    if prog is not None:
+                        _log_other(prog)
+                        if on_step: on_step(prog)
+                        continue
+                    if verdict == "stop":
+                        end_reason = "no_progress"
+                        error_detail = (f"连续 {config.NO_PROGRESS_STOP} 步无进展："
+                                        + no_progress_hint(guard.last_reason))
+                        break
+                finally:
+                    # 每轮一个计时器（spec §8.2）：break、continue、异常都经过这里，不会串到下一轮。
+                    timing.close_step()
     except KeyboardInterrupt:
         end_reason = "interrupted"
     except Exception as e:
         end_reason = "device_error"
         error_detail = f"{type(e).__name__}: {e}"
-        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "loop", "error": error_detail})
+        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "loop", "error": error_detail},
+                   ends_step=True)
     finally:
+        timing.close_step()
         try:
             device.release_all()
         finally:
+            # 解除认屏上下文与模式：设备释放优先（它在上面的 try 里），但 release_all 抛了也照样解除。
+            try:
+                _task_scope.close()
+            except Exception:   # noqa: BLE001 —— 解除失败不能影响任务终态
+                pass
             # 最后一条动作记录还挂着（延迟一拍，见 _flush）：它的 eval 不会再有人填了，
             # 现在补写掉。必须在 log.finish 与下面读 steps.jsonl 的审计之前。
             # ⚠ 和这段里其它语句一样，写失败绝不能改任务终态 —— 否则磁盘满/权限错误
@@ -977,11 +1246,42 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             # 「到底审没审」记进 memory.shadow.audit_available，复盘时区分得开。
             audit_clean = end_reason == "done_success" and not audit_miss
 
+            # App 层孪生记账（spec 2026-09-11 §4.4）：唯一写盘入口，按这次的留档重放。失败只留档，不改终态。
+            twin_summary: dict = {"live": None, "errors": twin_errors}
+            try:
+                if twin_live is not None:
+                    twin_summary["live"] = twin_live.summary()
+                from iphone_agent.twin import record as twin_record
+                twin_summary["record"] = twin_record.record_run(ws, log.dir).to_dict()
+            except Exception as e:      # noqa: BLE001
+                twin_summary["record_error"] = f"{type(e).__name__}: {e}"
+            try:
+                log.set_twin(twin_summary)
+            except Exception:           # noqa: BLE001 —— 落盘失败不能影响任务终态
+                pass
+            # 感知记账（spec 2026-09-14 §8.3）：成功失败都写。loop 自己知道的几项并进来（计划 R5）。
+            try:
+                log.set_section("perception", perceiver.stats() | {
+                    "observation_mismatch": observation_mismatch, "fallback_by": fallback_by})
+            except Exception:           # noqa: BLE001 —— 落盘失败不能影响任务终态
+                pass
+            if startup_timing is None and startup_timer is not None:
+                startup_timing = startup_timer.result()     # 启动阶段就结束了（连接失败等）：照样记
+            try:
+                log.set_section("startup_timing", startup_timing)
+            except Exception:           # noqa: BLE001 —— 落盘失败不能影响任务终态
+                pass
+            try:
+                log.set_section("taps", taps)
+            except Exception:           # noqa: BLE001 —— 落盘失败不能影响任务终态
+                pass
+
             # ⚠ 设备释放优先，且写记忆失败绝不改任务终态 ——
             # 落进上面那个 except 会被误标成 device_error（spec §4.2）。
             written: list[dict] = []
             proposed: list[dict] = []
-            if pending_memories:
+            # memory=False（评测对照，spec 2026-09-12 §8.2）：记忆、app_note、scenario 提议一概不写。
+            if pending_memories and rc.memory:
                 # kind 缺省是 knowledge：老模型/老脚本不给这个字段时行为与之前完全一致，
                 # 全部条目都走 commit_memories 这一条路。
                 # knowledge / playbook 落记忆库；app_note / scenario 落 skill 层（下面那个循环）。

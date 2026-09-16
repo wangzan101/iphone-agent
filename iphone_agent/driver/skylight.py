@@ -7,14 +7,14 @@
 镜像窗口本来就一直可见，不需要它占着前台。
 
 先试过更便宜的 `CGEventPostToPid`（把事件直接投给进程）：2026-09-07 真机实测
-**焦点确实没被抢，但手机完全没反应**（hamming=0）。这与 设计说明 记录的
+**焦点确实没被抢，但手机完全没反应**（hamming=0）。这与 docs/11 记录的
 phone-harness 观测一致 —— 那条路对鼠标点击是不通的。
 
 ## 机制来源（按 D12 的参考边界）
 
 机制事实来自 **yabai 的公开源码**（MIT，`src/window_manager.c` 的
 `window_manager_make_key_window`）与苹果公开的 Quartz/AppKit 文档，
-已整理在 `设计说明-技术依赖与上游.md`。本文件按那份规格自己写，不看第三方实现。
+已整理在 `docs/11-技术依赖与上游.md`。本文件按那份规格自己写，不看第三方实现。
 
 macOS 的窗口服务器接受一种**合成事件记录**，经私有框架 SkyLight 的
 `SLPSPostEventRecordTo(psn, buffer)` 直投给进程。yabai 用它「聚焦窗口但不抬起」；

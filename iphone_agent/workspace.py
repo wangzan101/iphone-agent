@@ -2,7 +2,7 @@
 
 为什么要有这两个东西：原来 `runs/`、`.iphone/memory`、`.iphone/config.toml` 是
 四个模块各自的模块级常量，全相对进程 cwd；运行模式 `CONTEXT_MODE` 在 config.py
-import 的那一刻读一次 env。结果是三件事都做不了（设计说明 D3/D7/D8）：
+import 的那一刻读一次 env。结果是三件事都做不了（docs/20 D3/D7/D8）：
 
 - 同一进程里同时管两台设备/两个会话（路径写死在 cwd 下）；
 - 同一进程里跑 window / state 的 2×2 对照实验（模式是进程级的）；
@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from iphone_agent import config
+from iphone_agent.perceive import policy
 
 
 @dataclass(frozen=True)
@@ -52,8 +53,13 @@ class Workspace:
 
     @property
     def twin_device(self) -> Path:
-        """设备层孪生：主屏布局表、系统屏（设计说明）。"""
+        """设备层孪生：主屏布局表、系统屏（docs/32 §1）。"""
         return self.dot / "knowledge" / "device"
+
+    @property
+    def twin_apps(self) -> Path:
+        """App 层孪生：每个 App 的屏文件（spec 2026-09-11 §4.1）。个人层，绝不写仓库里的共享 knowledge/。"""
+        return self.dot / "knowledge" / "apps"
 
     @classmethod
     def default(cls) -> Workspace:
@@ -69,16 +75,29 @@ class Workspace:
 class RunConfig:
     """这一次运行怎么跑。进程级常量只当默认值来源，不再当运行时开关。"""
 
-    context_mode: str = "window"        # window | state（设计说明）
+    context_mode: str = "window"        # window | state（docs/19 §2）
     # ⚠ 不能写成 `max_steps: int = config.MAX_STEPS`：那是 import 时求值一次，
     # 绑死在「第一个 import 这个模块的人」看到的值上。field(default_factory=...) 才是
     # 每次构造 RunConfig() 时才读——同一个坑 Workspace.default 的 env 已经踩过。
     max_steps: int = field(default_factory=lambda: config.MAX_STEPS)
     # None 表示「按步数推」，见 effective_timeout_s。显式给了就以它为准。
     timeout_s: float | None = None
+    # 参考段来自孪生还是旧屏幕图（spec 2026-09-11 §6.4）。调用时取默认值，理由同 max_steps。
+    twin_hints: bool = field(default_factory=lambda: config.TWIN_HINTS)
+    # 给不给【位置】【路线】（spec 2026-09-12 §8.2）。⚠ 不能拿 twin_hints=False 当「无提示」：
+    #   它会退回旧 screenmap 的提示（loop.py push_obs）。学习曲线评测的对照组要的是一段都不给。
+    location_hints: bool = True
+    # 注入 / 写入跨任务记忆。评测时两组都关，差异才归得到孪生上（spec §8.2，codex 评审第 3 条）。
+    memory: bool = True
+    # 整屏解析模式（spec 2026-09-14 §8.4）。直接构造时取代码默认值、不读 env（计划 R4）：
+    #   config.screen_parse_mode 只允许 from_env 一个调用方，模式只有一条来路。
+    screen_parse: str = field(default_factory=lambda: policy.DEFAULT_MODE)
+
+    def __post_init__(self) -> None:
+        policy.check_mode(self.screen_parse)
 
     def effective_timeout_s(self) -> float:
-        """时限和步数是两个保险丝，得对得上量（设计说明 D8）。"""
+        """时限和步数是两个保险丝，得对得上量（docs/20 D8）。"""
         if self.timeout_s is not None:
             return self.timeout_s
         return self.max_steps * config.SECONDS_PER_STEP
@@ -93,5 +112,7 @@ class RunConfig:
             context_mode=(os.environ.get("IPHONE_USE_CONTEXT", "").strip()
                           or config.CONTEXT_MODE),
             max_steps=config.MAX_STEPS,
+            twin_hints=config.env_flag("IPHONE_TWIN_HINTS", config.TWIN_HINTS),
+            screen_parse=config.screen_parse_mode(),
         )
         return replace(base, **overrides) if overrides else base

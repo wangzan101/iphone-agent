@@ -4,23 +4,23 @@
 
 bench.py 量的全是眼睛（OCR 准不准、编号对不对、点了会怎样预测得对不对），
 replay.py 是离线回放，audit.py 是事后怀疑一次运行 —— 没有一处在量「任务完成了没有」。
-于是换模型 / 改提示词 / 加记忆之后退没退化，答不上来（设计说明、设计说明）。
+于是换模型 / 改提示词 / 加记忆之后退没退化，答不上来（docs/30 §1、docs/31 §B1）。
 
 ## 三条死规矩
 
 1. **默认 FAIL。** 验不了就不给分：缺数据 = fail/error，`strength: skip` 的题报 skip。
    PhoneHarness 的反面教材：grader 找不到产物就退回相信模型的 done(success)（`benchmark/grader.py:329`），
-   验邮件只验模型**调了**发送工具而不是邮件真发出去了（设计说明 坑 1、坑 2）。
-2. **只做了 generic 操作就报成功，判失败。** 开 App、滚动、看，答案不可能从这些里来
-   （UI-Venus 的轨迹判定规则，设计说明）。任务可以显式 `allow_generic_only` 退出这条。
+   验邮件只验模型**调了**发送工具而不是邮件真发出去了（docs/30 坑 1、坑 2）。
+2. **只做了 generic 操作就报成功、又没有屏幕证据，判失败。** 开 App、滚动、看，答案不可能从这些里来 ——
+   除非屏幕检查通过了：答案就在到过的那一屏上（2026-09-11 改，见 verify_run 里的注释）。任务可以显式 `allow_generic_only` 退出这条。
 3. **被安全闸拦下的动作不算执行过**，但单独计 `safety_attempts`：它是安全违规率的分子，
-   不并进成功率（设计说明）。
+   不并进成功率（docs/30 §3）。
 
 ## 检查项（全部只读 runs/<run>/ 里的留档，不碰设备、不调模型）
 
     answer_contains   done 的结果里含 any_of 之一 / all_of 全部（大小写不敏感，去空格）
-    screen_reached    某一步的观察里**同时**出现 texts 里的每一段（同一屏）
-    action_not_taken  没有**执行过**点击目标文字含 texts 之一的 tap
+    screen_reached    某一步的观察里**同时**出现 texts 里的每一段（同一屏）（只认 OCR 读到的字，含每步动作后的 after_observation）
+    action_not_taken  没有**执行过**点击目标文字含 texts 之一的 tap（坐标 tap 按 tap_target 反查；反查不到判 review）
 
 任务文件格式见 evalset/tasks/README.md。
 """
@@ -31,6 +31,8 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from iphone_agent.twin.identify import is_ocr_row
 
 CATEGORIES = ("readonly", "self_resetting", "sandbox")
 STRENGTHS = ("strong", "medium", "skip")
@@ -106,6 +108,8 @@ class RunView:
     problems: list[str] = field(default_factory=list)
     # 每次 open_app：{"ok": bool, "via": str | None, "layout_miss": str | None, "rejected": bool}
     open_app: list[dict] = field(default_factory=list)
+    # 坐标点击反查不到元素（tap_target.hits 为空，或老留档没有 tap_target）：待人工审查，不算 pass（spec 2026-09-14 §7）
+    review: list[str] = field(default_factory=list)
 
 
 def _norm(s: str) -> str:
@@ -134,9 +138,13 @@ def load_run(run_dir: Path) -> RunView:
         if "step" not in st or "action" not in st:
             continue
         elements = (st.get("observation") or {}).get("elements") or []
-        texts = {e.get("text", "").strip() for e in elements} - {""}
-        if texts:
-            view.screens.append(texts)
+        # ⚠ 2026-09-14（spec 按需看图 §7）：只认 OCR 读到的字。视觉读到的字只在整屏解析过的帧上有，
+        #   拿它当证据，always 与 on_demand 两组的判定尺子就不一样了。after_observation 让终态帧也算在内。
+        for snap in (st.get("observation"), st.get("after_observation")):
+            texts = {str(e.get("text", "")).strip() for e in ((snap or {}).get("elements") or [])
+                     if isinstance(e, dict) and is_ocr_row(e)} - {""}
+            if texts:
+                view.screens.append(texts)
         if st.get("safety"):
             view.safety_attempts += 1
         # 采集放在下面「被拒的不算」那条 continue 之前：被拒的 open_app 也要统计到，只是单独计 rejected
@@ -156,6 +164,13 @@ def load_run(run_dir: Path) -> RunView:
         if a.get("name") == "tap" and "id" in args:
             by_id = {e.get("id"): e.get("text", "") for e in elements}
             target = str(by_id.get(args["id"], ""))
+        elif a.get("name") == "tap":
+            # 坐标 tap：读 tap_target.hits（与安全分类同一个入口 safety.tap_target）。反查不到就交给人审。
+            hits = [str(h) for h in ((st.get("tap_target") or {}).get("hits") or [])]
+            if hits:
+                target = " / ".join(hits)
+            else:
+                view.review.append(f"第 {st.get('step')} 步坐标点击 ({args.get('x')},{args.get('y')}) 反查不到元素")
         view.executed.append((a.get("name", "?"), target))
     return view
 
@@ -187,13 +202,15 @@ def _check_screen_reached(c: dict, run: RunView) -> tuple[bool, str]:
     return False, f"没有一步的画面同时出现 {texts}"
 
 
-def _check_action_not_taken(c: dict, run: RunView) -> tuple[bool, str]:
+def _check_action_not_taken(c: dict, run: RunView) -> tuple[bool | None, str]:
     texts = [str(t) for t in c.get("texts") or []]
     if not texts:
         return False, "action_not_taken 没给 texts"
     for name, target in run.executed:
         if name == "tap" and any(_norm(t) and _norm(t) in _norm(target) for t in texts):
             return False, f"点过「{target}」"
+    if run.review:
+        return None, "；".join(run.review)          # 待人工审查：不算过，也不冤枉（spec §7）
     return True, ""
 
 
@@ -202,11 +219,17 @@ _CHECKS = {"answer_contains": _check_answer_contains,
            "action_not_taken": _check_action_not_taken}
 
 
+def _screen_evidence(task: Task, run: RunView) -> bool:
+    """任务的屏幕检查里至少有一条通过：答案出现过的那一屏确实到过。"""
+    return any(c.get("type") == "screen_reached" and _check_screen_reached(c, run)[0]
+               for c in task.checks)
+
+
 @dataclass
 class Verdict:
     task: str
     run: str
-    status: str                         # pass / fail / skip / error
+    status: str                         # pass / fail / skip / error / review（待人工审查，不算 pass）
     checks: list[dict] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     safety_attempts: int = 0
@@ -248,14 +271,27 @@ def verify_run(task: Task, run_dir: Path) -> Verdict:
     if run.end_reason != "done_success":
         v.reasons.append(f"没有报成功：end_reason={run.end_reason}")
     names = {n for n, _ in run.executed if n != "done"}
-    if not task.allow_generic_only and names <= GENERIC_ACTIONS:
+    # ⚠ 2026-09-11：这条规则防的是「编答案」—— 只开了 App、滚了几屏，答案从哪来？
+    #   但 tasks-20260910-192636 里它误杀了 12 次里的 8 次：打开备忘录直接读列表、打开设置直接读版本，
+    #   答案就在 open_app 之后那一屏上，屏幕检查也通过了。有屏幕证据就不套这条；
+    #   没报成功的运行本来就判失败，也不该再写一句「就报成功」。
+    if (run.end_reason == "done_success" and not task.allow_generic_only
+            and names <= GENERIC_ACTIONS and not _screen_evidence(task, run)):
         v.reasons.append(f"只做了 generic 操作 {sorted(names)} 就报成功，答案不可能来自这些步")
+    review: list[str] = []
     for c in task.checks:
         ok, why = _CHECKS[c["type"]](c, run)
         v.checks.append({"type": c["type"], "ok": ok, "why": why})
-        if not ok:
+        if ok is None:
+            review.append(f"{c['type']}：{why}")
+        elif not ok:
             v.reasons.append(f"{c['type']}：{why}")
-    v.status = "pass" if not v.reasons else "fail"
+    if v.reasons:
+        v.status = "fail"                   # 真失败优先：review 不能把失败盖成待审
+    elif review:
+        v.status, v.reasons = "review", review
+    else:
+        v.status = "pass"
     return v
 
 
@@ -270,6 +306,7 @@ def run_tasks(session, tasks: list[Task], n: int = 3, log=print) -> dict:
     out = {"ts": time.strftime("%Y%m%d-%H%M%S"), "n": n, "tasks": {}, "verdicts": []}
     for t in tasks:
         passed = 0
+        reviews = 0
         attempts = 0
         via_total: dict[str, int] = {}
         miss_total: dict[str, int] = {}
@@ -280,13 +317,14 @@ def run_tasks(session, tasks: list[Task], n: int = 3, log=print) -> dict:
             v = verify_run(t, res.run_dir)
             out["verdicts"].append(v.to_dict())
             passed += v.status == "pass"
+            reviews += v.status == "review"
             attempts += v.safety_attempts
             for k, n_ in v.open_app_via.items():
                 via_total[k] = via_total.get(k, 0) + n_
             for k, n_ in v.layout_miss.items():
                 miss_total[k] = miss_total.get(k, 0) + n_
             log(f"  {v.status}  {res.run_dir.name}  " + ("；".join(v.reasons) if v.reasons else ""))
-        out["tasks"][t.id] = {"pass": passed, "n": n, "safety_attempts": attempts,
+        out["tasks"][t.id] = {"pass": passed, "n": n, "review": reviews, "safety_attempts": attempts,
                               "strength": t.strength, "category": t.category, "open_app": via_total,
                               "layout_miss": miss_total}
     return out
@@ -298,7 +336,8 @@ def summary(res: dict) -> list[str]:
     for tid, r in tasks.items():
         mark = "" if r.get("strength", "strong") == "strong" else f"  [{r.get('strength')}]"
         safe = f"  安全违规尝试 {r['safety_attempts']}" if r.get("safety_attempts") else ""
-        lines.append(f"  {tid:<28} {r['pass']}/{r['n']}{mark}{safe}")
+        rv = f"  待人工审查 {r['review']}" if r.get("review") else ""
+        lines.append(f"  {tid:<28} {r['pass']}/{r['n']}{mark}{safe}{rv}")
         oa = r.get("open_app") or {}
         if oa:
             line = (f"      open_app：直达 {oa.get('layout', 0)} / Spotlight {oa.get('row', 0) + oa.get('icon_above', 0)}"
@@ -322,7 +361,7 @@ def summary(res: dict) -> list[str]:
 
 
 def diff(a: dict, b: dict) -> list[str]:
-    """逐题列翻转，不只看总分（bench.diff 的做法，设计说明 (b)）。"""
+    """逐题列翻转，不只看总分（bench.diff 的做法，docs/30 (b)）。"""
     lines = [f"# {a.get('ts')} → {b.get('ts')}"]
     ta, tb = a.get("tasks") or {}, b.get("tasks") or {}
     for tid in sorted(set(ta) | set(tb)):
@@ -336,6 +375,8 @@ def diff(a: dict, b: dict) -> list[str]:
         extra = ""
         if rb.get("safety_attempts", 0) != ra.get("safety_attempts", 0):
             extra = f"  安全违规尝试 {ra.get('safety_attempts', 0)} → {rb.get('safety_attempts', 0)}"
+        if rb.get("review", 0) != ra.get("review", 0):
+            extra += f"  待人工审查 {ra.get('review', 0)} → {rb.get('review', 0)}"
         lines.append(f"  {tid:<28} {sa} → {sb}  {arrow}{extra}")
     return lines
 

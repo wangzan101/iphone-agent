@@ -1,6 +1,6 @@
 """暂停 → 补一句话 → 继续。
 
-任务跑偏时，用户以前唯一的选择是停止、推倒重来（设计说明：OpenGUI 的
+任务跑偏时，用户以前唯一的选择是停止、推倒重来（docs/27 §6：OpenGUI 的
 「暂停 → 输入框 → resume(message)」是它 UI 里最划算的一条）。这里把它做成主循环的一个
 回调：每步开头问一次 `wait_if_paused()`，它阻塞到用户点「继续」，返回用户补的那句话
 （可能为空）。暂停期间的时间不算进任务时限 —— 人在想事情，不该让保险丝替他计时。
@@ -51,7 +51,7 @@ def test_note_in_state_mode_is_part_of_the_state_report(fake_env, tmp_path):
 
 
 def test_note_does_not_touch_the_frozen_prefix(fake_env, tmp_path):
-    """插话是任务中途来的，绝不能进冻结前缀（设计说明：前缀一变缓存就砸了）。"""
+    """插话是任务中途来的，绝不能进冻结前缀（docs/19 §2：前缀一变缓存就砸了）。"""
     log = MessageLog()
     log.system("s")
     log.user_text("任务：t", seg="task")

@@ -10,14 +10,14 @@ def test_parse_plain_values_and_body():
 
 
 def test_json_literal_values_are_parsed():
-    meta, _ = parse('---\napps: ["alipay", "yimujizhang"]\nextra: {"a": 1}\n---\n')
-    assert meta["apps"] == ["alipay", "yimujizhang"]
+    meta, _ = parse('---\napps: ["alipay", "jizhangben"]\nextra: {"a": 1}\n---\n')
+    assert meta["apps"] == ["alipay", "jizhangben"]
     assert meta["extra"] == {"a": 1}
 
 
 def test_bad_json_literal_is_rejected():
     with pytest.raises(FrontmatterError):
-        parse("---\napps: [alipay, yimujizhang]\n---\n")
+        parse("---\napps: [alipay, jizhangben]\n---\n")
 
 
 def test_missing_open_or_close_is_rejected():

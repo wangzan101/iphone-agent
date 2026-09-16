@@ -1,4 +1,4 @@
-include LICENSE NOTICE README.md README.zh-CN.md CONTRIBUTING.md ROADMAP.md SECURITY.md
+include LICENSE NOTICE README.md README.zh-CN.md CONTRIBUTING.md ROADMAP.md SECURITY.md CHANGELOG.md
 recursive-include docs *.md
 recursive-include examples *.toml *.md
 recursive-include tests *.py *.json *.cjs

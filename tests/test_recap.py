@@ -369,7 +369,7 @@ def test_three_tier_marks_and_failed_sources_sort_last(tmp_path):
     """三档：用过且有效 ✓、来自成功运行但还没人用过 ○、出处失败 ✗。
 
     ✗ 排最后而不是隐藏：完全不进索引，模型就不知道有这条可以 search
-    （设计说明 的「不进索引」在 top-K 之后自然靠后，这里按排序实现）。
+    （docs/19 §3.5 的「不进索引」在 top-K 之后自然靠后，这里按排序实现）。
     """
     from iphone_agent.memory import MemoryStore
 
@@ -444,7 +444,7 @@ def test_only_unreadable_runs_injects_nothing(store, tmp_path):
 
 def test_memory_index_and_recent_runs_are_separate_messages(store, tmp_path):
     """记忆索引只在写记忆时变、最近运行每次任务都变——拼在一条里会让前缀
-    缓存在第一个字就断（设计说明），所以必须是两条各自独立的消息。"""
+    缓存在第一个字就断（docs/19 §1/§2），所以必须是两条各自独立的消息。"""
     store.write("settings-entry", "设置入口", "在主屏第一页", "runs/x", "done_success")
     runs = tmp_path / "runs"
     _make_run(runs, "20260101-000000-aaaa", "t", "done_success", 3, 1000)

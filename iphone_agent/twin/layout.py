@@ -1,13 +1,14 @@
-"""主屏布局表：第几页第几行第几列是哪个 App（设计说明、§2.2）。
+"""主屏布局表：第几页第几行第几列是哪个 App（docs/32 §1.5、§2.2）。
 
-存**行列号**不存像素：像素每次按当前帧现算。坐标是这个项目里最脆的东西（设计说明），
+存**行列号**不存像素：像素每次按当前帧现算。坐标是这个项目里最脆的东西（docs/14），
 换机器、拉窗口、改缩放都会让它失效；行列号不会。
 
 网格怎么算：主屏上 OCR 读得到的只有图标**下面的标签**。标签的 y 聚成几行、x 聚成几列，
 行列号就是它在两组簇里的序号。图标中心在标签上方 ICON_ABOVE_LABEL_RATIO 倍文字高处，
 点的时候用当前帧的标签框现算（executor 那边做），这里不碰。
 
-dock 里的图标没有标签，OCR 读不到；App 资源库、负一屏、文件夹第一期都不扫（设计说明）。
+dock 里的图标没有标签，OCR 读不到；负一屏、文件夹不扫，App 资源库认出来就停（docs/32 §4.4）。
+2026-09-14 起翻遍所有主屏页、按真实页序写表（twin/scan.walk_home_pages）；原来只扫可见的第 1 页。
 「没读到」不等于「空」：格子标 unknown，页标 complete=False。
 """
 from __future__ import annotations
@@ -157,10 +158,45 @@ class Hit:
 
 
 def norm_label(s: str) -> str:
-    """两个 App 标签算不算同一个：去空格、不分大小写。一个规则一个入口（项目开发约定）——
+    """两个 App 标签算不算同一个：去空格、不分大小写。一个规则一个入口（CLAUDE.md §7）——
     查表（find_app）和 executor 在当前帧上找标签都用它。原来 executor 只去空格不转小写，
     OCR 把「App Store」读成「App store」时查表命中、当前帧却找不到，白白退回 Spotlight。"""
     return s.replace(" ", "").lower()
+
+
+def match_label(name: str, candidates, key=None):
+    """在一组候选里找「就是 name 这个 App」的那一个；没有就 None。key 把候选变成它的文字（默认候选本身）。
+
+    一个 App 名匹配规则一个入口（CLAUDE.md §7）：查表（Layout.find_app）、查表直达在当前帧上找标签、
+    翻主屏找 App（twin/scan.walk_home_pages）都调这里。
+
+    1. norm_label 相等（去空格、不分大小写）的，取第一个 —— 不管前面有没有包含匹配的；
+    2. 没有精确的：包含 name 的候选**只有一个**（按归一化后的文字算，同一个标签读到两次算一个），
+       而且 name 归一化后至少 2 个字，才取它。两个以上都包含 = 说不清是哪个，不猜。
+
+    ⚠ 2026-09-14：原来三处三个规矩 —— 查表「精确优先、否则第一个包含的」，直达「只认精确」，
+      翻主屏「`name in e.text` 的第一个」。主屏第 1 页真实读到的小组件文字（「今天无日程」「大部晴朗无云」
+      「示例城区1」）排在图标标签上面，按元素顺序取第一个包含的就先撞上它们；单字名（「M」）包含在一堆
+      标签里。命中是肯定结论可以直接用（CLAUDE.md §2），所以包含匹配只在唯一时才算命中；
+      不加任何「像不像小组件」的猜测。
+    """
+    want = norm_label(name or "")
+    if not want:
+        return None
+    key = key or (lambda c: c)
+    loose: dict[str, object] = {}
+    for c in candidates:
+        text = key(c)
+        if text is None:
+            continue
+        t = norm_label(text)
+        if t == want:
+            return c
+        if want in t:
+            loose.setdefault(t, c)
+    if len(want) >= 2 and len(loose) == 1:
+        return next(iter(loose.values()))
+    return None
 
 
 class Layout:
@@ -211,7 +247,7 @@ class Layout:
 
     def upsert_page(self, page: Page) -> None:
         """标签集合对得上就整页覆盖（保留 id 和 order），对不上就追加。
-        布局是直接观察到的事实，不是转移的结果 —— 不需要两次确认（设计说明）。"""
+        布局是直接观察到的事实，不是转移的结果 —— 不需要两次确认（docs/32 §4.1）。"""
         for i, old in enumerate(self.pages):
             if same_page(old.labels, page.labels):
                 self.pages[i] = Page(id=old.id, order=old.order, labels=page.labels, cells=page.cells,
@@ -220,18 +256,12 @@ class Layout:
         self.pages.append(page)
 
     def find_app(self, name: str) -> Hit | None:
-        want = norm_label(name)
-        if not want:
+        """表里哪一格是这个 App。规则就是 match_label：按页序排好的全表里，精确的（哪怕在后面的页）
+        赢过前面页的包含匹配；包含匹配只在唯一时才算。没扫完整的页不拿来直达。"""
+        cells = [(p, c) for p in sorted(self.pages, key=lambda p: p.order) if p.complete
+                 for c in p.cells if c.label is not None]
+        got = match_label(name, cells, key=lambda pc: pc[1].label)
+        if got is None:
             return None
-        loose: Hit | None = None
-        for p in sorted(self.pages, key=lambda p: p.order):
-            if not p.complete:
-                continue
-            for c in p.cells:
-                if c.label is None:
-                    continue
-                if norm_label(c.label) == want:
-                    return Hit(p.order, c.row, c.col, c.label)
-                if loose is None and want in norm_label(c.label):
-                    loose = Hit(p.order, c.row, c.col, c.label)
-        return loose
+        p, c = got
+        return Hit(p.order, c.row, c.col, c.label)

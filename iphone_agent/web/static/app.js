@@ -2,7 +2,7 @@
  *
  * 没有构建步骤、没有框架。运行环境被锁死在 macOS 15+ 自带的浏览器上
  * （iPhone 镜像的下限），转译/打包/polyfill 这三件事一件都不需要 —— 而它们
- * 正是前端工具链存在的全部理由（设计说明 D3）。
+ * 正是前端工具链存在的全部理由（docs/22 D3）。
  *
  * ⚠ 所有插进 DOM 的文本一律走 textContent，绝不 innerHTML。
  *   这里显示的东西有一半来自**模型的输出**和**手机屏幕上的文字** —— 那是
@@ -93,6 +93,7 @@ function humanize(s) {
     case 'recall': return a.name ? L('action.recall', { name: Q(cut(a.name, 20)) }) : null;
     case 'recall_runs': return L('action.recallRuns');
     case 'done': return L(a.status === 'success' ? 'action.done' : 'action.failed');
+    case 'start': return L('action.start');           // 回放补的第一帧：发任务时的画面（api.py run_detail）
     default: return null;
   }
 }
@@ -313,8 +314,8 @@ function markCurrent(node) {
 /* ══════════════════════════════════════════════════════════════════════
    富文本：模型的回复里带 markdown
    ══════════════════════════════════════════════════════════════════════
-   合成示例：带格式的回复 ——
-     1. **示例标题** - "一段用于验证富文本显示的说明"
+   实测：真实回复长这样 ——
+     1. **22万赞** - "20分钟学会Codex！零基础终极教程"
    原来用 createTextNode 整段塞进去，星号原样显示、列表没有缩进。
    任务越复杂、回复越长，越难看。
 
@@ -592,6 +593,12 @@ async function ask() {
   if (r && r.error) banner('bad', L("error.send"), apiMessage(r, 'error'));
 }
 
+async function newChat() {
+  const r = await api.post('/api/new-chat');
+  if (r && r.ok) { turn = null; tl = null; lastG = null; showEmpty(); }
+  else banner('bad', L("error.title"), apiMessage(r || {}, 'error'));
+}
+
 async function stop() {
   send.disabled = true;
   try { await api.post('/api/stop'); } finally { send.disabled = false; }
@@ -611,6 +618,7 @@ async function resume() {
 
 send.onclick = ask;
 pauseBtn.onclick = () => (paused ? resume() : pause());
+$('#newchat').onclick = newChat;
 q.addEventListener('input', () => { q.style.height = 'auto'; q.style.height = uiCat(Math.min(q.scrollHeight, 100), 'px'); });
 q.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!running || paused) ask(); }
@@ -958,7 +966,7 @@ async function renderSettings() {
 
   sync(false);
 
-  /* 连接与权限放最后 —— 第一次打开不该被一串系统授权拦住（设计说明 P2）。 */
+  /* 连接与权限放最后 —— 第一次打开不该被一串系统授权拦住（docs/22 P2）。 */
   const g3 = el('group');
   const h3 = document.createElement('h3'); I18n.bind(h3, "textContent", L("settings.permissions")); g3.appendChild(h3);
   const list3 = el('list');

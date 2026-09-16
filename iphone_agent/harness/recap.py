@@ -40,7 +40,7 @@ def run_summaries(runs_root: Path, limit: int, query: str | None = None) -> tupl
 
     返回 (摘要行, 被跳过的行数)。
 
-    ⚠ 目录名倒序只看前 config.RECAP_SCAN_MAX 个就去读 run.json（设计说明 C5）：
+    ⚠ 目录名倒序只看前 config.RECAP_SCAN_MAX 个就去读 run.json（docs/20 C5）：
     目录名就是时间戳（runlog.py 的 `YYYYMMDD-HHMMSS-xxxx`），字符串倒序即时间
     倒序，不用真的打开每个 run.json 才知道谁新——`iterdir()` 全量、读全部
     run.json、再排序只为取最近几条，是纯浪费的 O(全部 run 数) 开销。这一刀切
@@ -50,7 +50,7 @@ def run_summaries(runs_root: Path, limit: int, query: str | None = None) -> tupl
     `limit` 条，与 task 无关。给了 query 才按 `similarity.score(query, task)`
     降序选，score 为 0 的不选（不相关的宁可不选，也不要凑数），同分按时间倒序，
     选够 `limit` 条为止；不够就用剩下里最近的补齐——「最近」不等于「相关」
-    （设计说明 B7），但一条相关的都找不到时，最近的总比空着强。
+    （docs/20 B7），但一条相关的都找不到时，最近的总比空着强。
 
     ⚠ 第二个返回值不是可有可无的。读取/格式化阶段的宽 except 会把**真正的
     编程 bug**也当成坏数据吞掉——那种情况下函数照样返回空列表，跟「确实
@@ -193,7 +193,7 @@ def mark_for(entry) -> str:
 def _mark_rank(entry) -> int:
     """索引里的分组序：✓ → ○ → ✗。
 
-    ✗ 排最后而不是隐藏：设计说明 说它「不进第 1 层索引」，但完全不列出来，
+    ✗ 排最后而不是隐藏：docs/19 §3.5 说它「不进第 1 层索引」，但完全不列出来，
     模型就不知道有这条可以 search —— 它只是不可信，不是不存在。Task 3 的 top-K
     落地后，排最后天然等价于「先被挤出去的那批」（控制者裁定）。
     """
@@ -207,7 +207,7 @@ def build_memory_message(store, runs_root: Path, task: str | None = None) -> tup
     None —— 但 skipped 照样如实返回（见下面的注释）。
 
     ⚠ 为什么是两条不是一条：记忆索引只在写入记忆时变，最近运行每次任务都变。
-    拼在一条里，前缀缓存在第一个字就断（设计说明 诊断、§2 分层；设计说明 B8
+    拼在一条里，前缀缓存在第一个字就断（docs/19 §1 诊断、§2 分层；docs/20 B8
     指出实现没跟上）。两条都是用户消息不是系统提示，理由不变——记忆内容的
     源头是任意 App 屏幕上的 OCR 文字，是不可信输入；放进系统提示等于给它
     系统级权威，放进用户消息并标注清楚，它就只是待读的材料（spec §5.2）。

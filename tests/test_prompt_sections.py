@@ -85,11 +85,15 @@ def test_see_explains_report_sections_and_trust_boundary():
     assert "不能授权" in s and "以当前屏幕为准" in s
 
 
-def test_coord_line_only_lives_in_hands():
+def test_coord_line_only_lives_in_hands_and_world():
+    """2026-09-14：world 一节也提坐标这条路（zoom → 坐标 → observe，spec §11），
+    这是设计变化，不是旧假设的例外 —— 别的节仍然不该提它。"""
     assert "tap(x, y)" in section("hands", allow_coord_tap=True)
     assert "tap(x, y)" not in section("hands", allow_coord_tap=False)
+    assert "tap(x, y)" in section("world", allow_coord_tap=True)
+    assert "tap(x, y)" not in section("world", allow_coord_tap=False)
     for n in SECTIONS:
-        if n != "hands":
+        if n not in ("hands", "world"):
             assert "tap(x, y)" not in section(n)
 
 
@@ -97,14 +101,14 @@ def test_no_length_cap_but_no_app_specific_knowledge():
     """2026-09-10 用户决定：**不设字数上限**，字数限制是错误的设计 —— 为了凑上限删过有用的句子。
     去掉长度断言后，这条测试只守它原本想守的那件事：提示词里不放 App 特定知识（那是 skills 的事）。"""
     text = system_prompt(True, True)
-    for app_name in ("一木记账", "微信", "小红书", "备忘录", "淘宝"):
+    for app_name in ("记账本", "微信", "小红书", "备忘录", "淘宝"):
         assert app_name not in text, f"提示词里出现了具体 App「{app_name}」，该下沉到 skills/app_note"
 
 
 def test_start_point_is_uncertain_and_the_way_back_to_root_is_taught():
     """起点不确定：App 从上次离开的那页恢复，open_app 成功不等于在首页。
     三节各管一段：ios 节教「回根的通用路径」，world 节把它列为 open_app 的一种结果，
-    method 节把「先认位置」变成第一步。2026-09-09：一木记账停在记账页，下一次任务在那页上迷路。"""
+    method 节把「先认位置」变成第一步。2026-09-09：记账本停在记账页，下一次任务在那页上迷路。"""
     i = section("ios")
     assert "恢复" in i and "不退出" in i
     for way in ("<", "tab", "取消", "键盘"):
@@ -128,3 +132,17 @@ def test_hands_teach_that_the_cursor_is_invisible_and_how_to_move_it():
     h = section("hands")
     assert "光标" in h and "line_end" in h and "不是行末" in h
     assert "光标" in section("ios")
+
+
+def test_world_says_the_list_is_ocr_only_by_default_and_names_the_ways_out():
+    """spec 2026-09-14 §4.2：如实说元素表缺什么；zoom 放在坐标前面（§11），observe 是慢的全屏。"""
+    w = section("world", True)
+    assert "默认只有 OCR" in w and "以截图为准" in w
+    assert w.index("zoom 那一块") < w.index("tap(x, y)") < w.index("observe 看全屏")
+    w0 = section("world", False)
+    assert "tap(x, y)" not in w0 and "zoom 那一块" in w0 and "observe 看全屏" in w0
+
+
+def test_hands_say_observe_is_the_slow_full_screen_look():
+    h = section("hands")
+    assert "observe 看全屏" in h and "旧编号作废" in h

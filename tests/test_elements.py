@@ -40,6 +40,20 @@ def test_marked_image_same_size_and_text_set():
     assert isinstance(obs.ahash, int)
 
 
+def test_header_says_whether_the_full_screen_was_looked_at():
+    """spec 2026-09-14 §4.2：头部那一行按这帧有没有解析二选一加一句；视觉项前面有一行分隔。"""
+    from iphone_agent.perceive.elements import HEAD_FULL, HEAD_OCR_ONLY, VISION_SEPARATOR
+    from iphone_agent.perceive.screen import ScreenItem
+    box = RawBox("通用", 0.87, 0.1, 0.5, 0.2, 0.05)
+    plain = build_observation(frame(), [box], observation_id=1)
+    assert plain.elements_text.splitlines()[0].endswith(HEAD_OCR_ONLY)
+    full = build_observation(frame(), [box], observation_id=2, full_screen=True,
+                             screen_items=[ScreenItem("icon", "加号", (150, 10, 190, 40))])
+    lines = full.elements_text.splitlines()
+    assert lines[0].endswith(HEAD_FULL)
+    assert lines[1].startswith("[1] 通用") and lines[2] == VISION_SEPARATOR and lines[3].startswith("[2] 加号")
+
+
 # --- 坐标约定：头部说的必须就是适配器做的 ---
 #
 # 2026-09-08 真机踩过：当时还是全局配置项，标定翻成了 norm1000，头部那行却还写着
@@ -94,9 +108,13 @@ def test_header_says_pixels_when_the_adapter_takes_pixels():
     assert "200x400" in head
 
 
-def test_out_of_image_error_explains_the_convention():
-    """光说「越界」，模型只会换个像素值再试一遍。真机上它连试了五次。
-    提示语读的是 obs.coord_mode —— 和头部同一个来源。"""
+def test_out_of_image_error_speaks_the_models_own_scale():
+    """越界提示要用模型自己那一套数说话，提示语读的是 obs.coord_mode —— 和头部同一个来源。
+
+    ⚠ 2026-09-16 改了口径：原来这句一律说「要用 0-1000 的归一化值，不是像素」。
+      桥补齐 zoom 框的换算之后，走到这里的就是真出界，再说约定就是在教模型犯错
+      （它给对了 0-1000，被这句话劝去改成像素，连试五次熔断）。
+      norm1000 下报换回 0-1000 的数：模型写的是 1280，不能拿换算后的像素去问它。"""
     from types import SimpleNamespace
 
     import pytest
@@ -105,12 +123,14 @@ def test_out_of_image_error_explains_the_convention():
     o = SimpleNamespace(observation_id=1, width_px=624, height_px=1388, elements=[], coord_mode="norm1000")
     o.element = lambda eid: None
     with pytest.raises(ValidationError) as ei:
+        # 桥换算后的像素 1777 ← 模型写的是 1280（1388 高的屏）
         validate_action(Action("tap", {"x": 222, "y": 1777}, "r", None, "c"), o)
-    assert "0-1000" in ei.value.message, ei.value.message
+    assert "1280" in ei.value.message and "1000" in ei.value.message, ei.value.message
+    assert "不是像素" not in ei.value.message, ei.value.message
     o.coord_mode = "pixel"
     with pytest.raises(ValidationError) as ei:
         validate_action(Action("tap", {"x": 222, "y": 1777}, "r", None, "c"), o)
-    assert "0-1000" not in ei.value.message
+    assert "1777" in ei.value.message and "1388" in ei.value.message
 
 
 def test_perceiver_passes_coord_mode_through():

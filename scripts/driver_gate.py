@@ -180,7 +180,7 @@ try:
     dev.key("home"); time.sleep(1.2)
     step("key spotlight", "弹出 Spotlight 搜索", lambda o: dev.key("spotlight"))
     # type 现在优先逐键、非 ASCII 才退回粘贴，两条路要分开测：
-    # 逐键实测可用，粘贴实测四种情况全败（见 设计说明）。
+    # 逐键实测可用，粘贴实测四种情况全败（见 docs/14）。
     step("type ASCII（走逐键）", "搜索框里出现 safari",
          lambda o: f"路径={dev.type('safari')}")
     dev.key("home"); time.sleep(1.0); dev.key("spotlight"); time.sleep(1.2)

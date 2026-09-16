@@ -40,6 +40,16 @@ class FakePerceiver:
                             kind=e.get("kind"), state=e.get("state"), source=e.get("source", "ocr"))
             for e in els])
 
+    def observe_text(self, frame):
+        from types import SimpleNamespace
+        full = self.observe(frame)
+        return SimpleNamespace(elements=[e for e in full.elements if e.source != "vision"])
+
+    def task_scope(self, identity, mode):
+        import contextlib
+        self.modes = getattr(self, "modes", []) + [mode]
+        return contextlib.nullcontext(self)
+
 
 _PER = FakePerceiver()
 
@@ -133,7 +143,7 @@ def test_switch_state_is_scored_against_the_label(evalset):
 
 
 def test_clickable_precision_flags_info_rows_labelled_as_cells(evalset):
-    """「型号名称 iPhone 16e」这种信息行，agent 标成 cell 就是在骗模型去点。"""
+    """「型号名称 iPhone 15」这种信息行，agent 标成 cell 就是在骗模型去点。"""
     fp = _label(evalset, "c.png", [{"label": "型号名称", "kind": "cell", "center": [50, 100],
                                    "clickable": False}])
     _cache(evalset, fp, [_el("型号名称", 50, 100, kind="cell")])
@@ -181,7 +191,9 @@ def test_each_frame_is_perceived_once_per_bench(evalset):
         B.bench(evalset, _PER)
     finally:
         _PER.observe = orig
-    assert len(calls) == 1
+    # Task 10：bench 现在跑两列（整屏 + OCR），各自独立记忆；OCR 列在这个 FakePerceiver 里也经过 observe()
+    # （observe_text 委托给 observe，见上面的 FakePerceiver.observe_text）。每列各摊一次，不是 5 次。
+    assert len(calls) == 2
 
 
 # ---------- diff ----------
@@ -232,7 +244,7 @@ def test_clickable_precision_matches_cells_by_row_not_distance(evalset):
     不等于「没标成可点」—— 基线第一版 100% 就是这么白得的。"""
     fp = _label(evalset, "row.png", [{"label": "型号名称", "kind": "cell", "center": [312, 418],
                                      "clickable": False}])
-    _cache(evalset, fp, [_el("型号名称", 100, 418, kind="cell"), _el("iPhone 16e", 500, 418)])
+    _cache(evalset, fp, [_el("型号名称", 100, 418, kind="cell"), _el("iPhone 15", 500, 418)])
     r = B.bench(evalset, _PER)["metrics"]["clickable_precision"]
     assert (r["hits"], r["total"]) == (0, 1), "行首那个 cell 就在同一行上，该算错"
 
@@ -241,3 +253,97 @@ def test_text_readback_ignores_punctuation_width():
     assert B._norm("到期：2026/11/28") == B._norm("到期:2026/11/28")
     assert B._norm("正在载入…") == B._norm("正在载入.")
     assert "18.3.1" in B._norm("iOS版本 18.3.1〉")
+
+
+# ---------- Task 10：整屏列不变（always 里跑）、新增 OCR 列、label_agree、twin_fingerprint ----------
+
+def test_ocr_column_is_scored_from_observe_text_and_the_full_column_runs_in_always(evalset):
+    """spec 2026-09-14 §10.2：整屏那一列不变（在 always 里跑）；OCR 那一列量 on_demand 默认元素表的盲区。"""
+    fp = _frame(evalset, "explore/app/frames/001.png", "red")
+    _cache(evalset, fp, [_el("按钮", 50, 100), {**_el("图标", 80, 150, kind="icon"), "source": "vision"}])
+    _taps(evalset, [{"before": "001.png", "after": "002.png", "text": "图标", "x": 80, "y": 150,
+                     "changed": True, "hamming": 9, "local_mad": 30.0}])
+    _PER.modes = []
+    r = B.bench(evalset, _PER)
+    assert r["metrics"]["tap_coverage"]["hits"] == 1 and r["ocr"]["metrics"]["tap_coverage"]["hits"] == 0
+    assert _PER.modes == ["always"]
+    assert "[OCR 列]" in "\n".join(B.diff(r, r)) and "OCR 列" in "\n".join(B.summary(r))
+
+
+def test_label_agree_compares_both_prompts_on_the_same_real_candidates(evalset):
+    from iphone_agent.perceive.observe import Perceiver
+    from iphone_agent.perceive.ocr import RawBox
+    from iphone_agent.perceive.screen import PROMPT_LABEL, Candidate
+    _frame(evalset, "explore/app/frames/001.png", "red")
+    row = {"before": "001.png", "after": "002.png", "text": "a", "x": 1, "y": 1,
+           "changed": True, "hamming": 9, "local_mad": 30.0}
+    _taps(evalset, [row, row])                       # 同一帧两行：只比一次
+
+    class Ctx:
+        def candidates(self, texts):
+            return [Candidate(1, "she-zhi", "设置", "s_1", "通用")]
+
+    class Asker:
+        prompts: list = []
+
+        def ask_json(self, prompt, images, max_tokens=None):
+            Asker.prompts.append(prompt)
+            short = prompt.startswith(PROMPT_LABEL)
+            return {"screen": {"app": "设置", "name": "通用" if short else " 通用 ", "same_as": 1,
+                               "anchors": ["通用", "关于本机"] if short else ["关于本机"]}}
+    per = Perceiver(ocr=lambda im: [RawBox("通用", 0.99, 0.1, 0.8, 0.3, 0.04)], asker=Asker())
+    r = B.label_agree(evalset, per, Ctx(), "rev-1")
+    assert r["frames"] == 1 and r["both_ok"] == 1 and len(Asker.prompts) == 2
+    assert all("1. 设置 / 通用" in p for p in Asker.prompts), "两个提示词拿到同一份候选"
+    assert r["agree"] == {"app": 1.0, "name": 1.0, "same_as": 1.0, "anchors": 0.0}
+    assert r["mismatches"][0]["fields"] == ["anchors"] and r["twin_revision"] == "rev-1"
+
+
+def test_twin_fingerprint_changes_with_the_twin(tmp_path):
+    d = tmp_path / "apps"
+    assert B.twin_fingerprint(d) == "0:empty"
+    (d / "she-zhi" / "screens").mkdir(parents=True)
+    (d / "she-zhi" / "screens" / "s_1.json").write_text("{}", encoding="utf-8")
+    one = B.twin_fingerprint(d)
+    (d / "she-zhi" / "screens" / "s_1.json").write_text('{"x": 1}', encoding="utf-8")
+    assert one.startswith("1:") and B.twin_fingerprint(d) != one
+
+
+# ---------- 终审 I3：--label-agree-limit 的取样器 —— 按 App 分层轮询，确定性 ----------
+
+def _frames(root, spec):
+    """spec: {app_name: n}，生成 root/explore/<app>/frames/NNN.png 路径列表（不用真的写文件）。"""
+    out = []
+    for app, n in spec.items():
+        for i in range(n):
+            out.append(root / "explore" / app / "frames" / f"{i:03d}.png")
+    return out
+
+
+def test_sampler_caps_at_the_limit_and_is_deterministic(tmp_path):
+    frames = _frames(tmp_path, {"a": 5, "b": 5, "c": 5})
+    r1 = B.sample_label_agree_frames(tmp_path, frames, 6)
+    r2 = B.sample_label_agree_frames(tmp_path, frames, 6)
+    assert len(r1) == 6
+    assert r1 == r2, "同样的输入必须得到同样的样本——没有随机数"
+
+
+def test_sampler_represents_every_app_when_n_covers_all_of_them(tmp_path):
+    frames = _frames(tmp_path, {"a": 1, "b": 4, "c": 2})
+    r = B.sample_label_agree_frames(tmp_path, frames, 3)
+    apps = {B._frame_app(tmp_path, fp) for fp in r}
+    assert apps == {"a", "b", "c"}, "N ≥ App 数时每个 App 都要有代表"
+
+
+def test_sampler_round_robins_not_one_app_first(tmp_path):
+    """轮询：不是先把 a 拿满再拿 b，是每一轮每个 App 各拿一个。"""
+    frames = _frames(tmp_path, {"a": 5, "b": 5})
+    r = B.sample_label_agree_frames(tmp_path, frames, 4)
+    apps = [B._frame_app(tmp_path, fp) for fp in r]
+    assert apps == ["a", "b", "a", "b"]
+
+
+def test_sampler_returns_everything_when_limit_covers_all_frames(tmp_path):
+    frames = _frames(tmp_path, {"a": 2, "b": 2})
+    assert B.sample_label_agree_frames(tmp_path, frames, 100) == frames
+    assert B.sample_label_agree_frames(tmp_path, frames, None) == frames

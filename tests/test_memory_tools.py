@@ -15,7 +15,7 @@ def test_system_prompt_states_the_trust_boundary():
 
 def test_prompt_version_bumped():
     """提示词变了就要改版本号，否则 run.json 的 prompt_hash 对不上历史运行。"""
-    assert PROMPT_VERSION == "22"
+    assert PROMPT_VERSION == "23"
 
 
 import pytest
@@ -656,7 +656,7 @@ def test_prompt_does_not_lump_tab_bars_with_labelled_icons():
     但 tab 栏是**纯图标没有标签** —— OCR 把图标本身读成乱码单字（'◎'、'曲'、'G'），
     那个乱码就在图标位置上，直接 tap 就中；用 icon_above 会往上推到 tab 栏上方的内容里。
 
-    真机踩过三次：一木记账的底部 tab 栏连点 icon_above，每次都打开某笔账单详情页，
+    真机踩过三次：记账本的底部 tab 栏连点 icon_above，每次都打开某笔账单详情页，
     任务因「原地打转」被熔断。是提示词把模型教错了，不是模型的问题。
     """
     from iphone_agent.harness.prompt import system_prompt

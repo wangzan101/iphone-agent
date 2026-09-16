@@ -175,3 +175,47 @@ def test_render_history_uses_earlier_block_instead_of_ellipsis():
     assert "[…" not in s
     assert "【更早】第 2–16 步（15 步）" in s
     assert s.splitlines()[-1].startswith("20 |")
+
+
+def test_expected_column_comes_from_the_expect_check():
+    """2026-09-11：点击的预期由程序核对，这一列按核对结果填，并标明是怎么核的。"""
+    def row(ec, **result):
+        return row_from_record(rec(3, "tap", {"id": 1}, {"ok": True, "changed": True, "expect_check": ec, **result}))
+    assert row({"met": True, "by": "text", "matched": "关于本机"}).expected == "yes(文字)"
+    assert row({"met": True, "by": "vision"}).expected == "yes(看图)"
+    r = row({"met": False, "by": "vision"}, judged={"worked": False, "why": "进的是通知页", "on_change": True})
+    assert r.expected == "no(看图)" and "通知页" in r.note
+    assert row({"met": None, "by": "unverified"}).expected == "unknown"
+    assert row({"met": None, "by": "missing"}).expected == "unknown"
+
+
+def test_model_eval_still_beats_the_expect_check():
+    row = row_from_record(rec(3, "tap", {"id": 1},
+                              {"ok": True, "changed": True, "expect_check": {"met": False, "by": "vision"}},
+                              eval={"expected": "yes", "note": "其实到了"}))
+    assert row.expected == "yes" and row.note == "其实到了"
+
+
+def test_unchanged_tap_that_vision_says_did_not_work_is_no_by_vision():
+    """点完没变 + 看图也说没生效：这一列写 no(看图)，说明里是判官看到的（终审 2026-09-11 M2，只钉行为）。"""
+    row = row_from_record(rec(4, "tap", {"id": 1},
+                              {"ok": True, "changed": False, "expect_check": {"met": False, "by": "vision"},
+                               "judged": {"worked": False, "why": "两张图一样"}}))
+    assert row.changed == "no"
+    assert row.expected == "no(看图)"
+    assert "两张图一样" in row.note
+
+
+def test_earlier_block_lists_steps_the_check_said_missed():
+    """expected 实际写的是「no(看图)」，不是裸「no」。只认 == "no" 时【更早】的「没达到预期的」一节
+    从来没命中过，长任务会把走错页的步静默压掉（终审 2026-09-11 T5-b）。"""
+    recs = [rec(i, "scroll", {"direction": "down"}, {"ok": True, "changed": True}) for i in range(1, 8)]
+    recs[2] = rec(3, "tap", {"id": 1},
+                  {"ok": True, "changed": True, "expect_check": {"met": False, "by": "vision"},
+                   "judged": {"worked": False, "why": "进的是通知页", "on_change": True}})
+    rows = [row_from_record(r, elements_by_id={1: "通知"}) for r in recs]
+    assert rows[2].expected == "no(看图)"
+    s = render_history(rows, keep=3)                   # 第 3 步被压进【更早】
+    assert "【更早】" in s
+    missed = next((line for line in s.splitlines() if line.startswith("没达到预期的")), None)
+    assert missed == '没达到预期的：3 tap "通知"（进的是通知页）', s

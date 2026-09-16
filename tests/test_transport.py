@@ -59,6 +59,54 @@ def test_norm1000_tolerates_bbox_coordinates_takes_midpoint():
     assert r.actions[0].args == {"x": 400, "y": 850}
 
 
+def test_norm1000_zoom_box_converts_to_pixels():
+    """⚠ 2026-09-16 真机：桥只给 tap 换算，zoom 的框原样送进校验，被当像素比。
+    624 宽的屏上 x>624 的框（右边 38%：搜索、⋮ 菜单、开关）永远点不到。"""
+    t = ChatCompletionsTransport(fake_resolved())
+    r = t.parse_response(resp([tc("c1", "zoom", {"x1": 750, "y1": 60, "x2": 980, "y2": 160, "reason": "r"})]),
+                         (624, 1388))
+    assert r.actions[0].args == {"x1": 468, "y1": 83, "x2": 612, "y2": 222}
+
+
+def test_pixel_mode_zoom_box_untouched():
+    t = ChatCompletionsTransport(fake_resolved(coord_mode="pixel", allow_coord_tap=True))
+    r = t.parse_response(resp([tc("c1", "zoom", {"x1": 480, "y1": 890, "x2": 620, "y2": 940, "reason": "r"})]),
+                         (624, 1388))
+    assert r.actions[0].args == {"x1": 480, "y1": 890, "x2": 620, "y2": 940}
+
+
+def test_norm1000_zoom_box_survives_validation_and_crops_the_asked_region():
+    """桥 → 校验 一条路走完：那个被连拒五次的框（20260916-121854/off 那一跑）必须过，
+    而且裁的就是模型框的那一块（右上角的搜索/菜单区）。"""
+    from iphone_agent.harness.actions import validate_action
+    t = ChatCompletionsTransport(fake_resolved())
+    a = t.parse_response(resp([tc("c1", "zoom", {"x1": 750, "y1": 60, "x2": 980, "y2": 160, "reason": "r"})]),
+                         (624, 1388)).actions[0]
+    o = SimpleNamespace(observation_id=1, width_px=624, height_px=1388, elements=[],
+                        coord_mode="norm1000", element=lambda _i: None)
+    v = validate_action(a, o)
+    assert (v.args["x1"], v.args["y1"], v.args["x2"], v.args["y2"]) == (468, 83, 612, 222)
+
+
+def test_out_of_range_zoom_box_still_rejected_without_blaming_the_convention():
+    """换算之后被拒的框是**真的**出界。提示语不能再教模型「要用归一化值」——
+    它已经用了；那句话让它把正确的框换成像素再试，真机上连试五次熔断。"""
+    import pytest as _pytest
+
+    from iphone_agent.harness.actions import ValidationError, validate_action
+    t = ChatCompletionsTransport(fake_resolved())
+    a = t.parse_response(resp([tc("c1", "zoom", {"x1": 100, "y1": 100, "x2": 1200, "y2": 300, "reason": "r"})]),
+                         (624, 1388)).actions[0]
+    o = SimpleNamespace(observation_id=1, width_px=624, height_px=1388, elements=[],
+                        coord_mode="norm1000", element=lambda _i: None)
+    with _pytest.raises(ValidationError) as ei:
+        validate_action(a, o)
+    assert ei.value.code == "out_of_image"
+    msg = ei.value.message
+    assert "1200" in msg, f"要用模型自己写的那个数说话：{msg}"
+    assert "不是像素" not in msg, f"提示语在教模型换约定，而它本来就是对的：{msg}"
+
+
 def test_multiple_tool_calls_all_returned_for_rejection():
     t = ChatCompletionsTransport(fake_resolved())
     r = t.parse_response(resp([tc("c1", "tap", {"id": 1, "reason": "a"}),

@@ -10,7 +10,7 @@ def test_top_level_ints_add_up():
 
 def test_nested_dict_is_flattened_one_level():
     """cached_tokens 藏在 prompt_tokens_details 里；原来的累加器只收顶层 int，把它整个丢了。
-    这就是我们一直看不见缓存命中率的原因(设计说明)。"""
+    这就是我们一直看不见缓存命中率的原因(docs/19 §1)。"""
     t = {}
     accumulate(t, {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 60}})
     accumulate(t, {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 0}})

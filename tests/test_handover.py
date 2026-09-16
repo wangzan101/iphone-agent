@@ -1,6 +1,6 @@
 """handover：把「这一步我不该自己做」做成一个一等动作，交给人。
 
-五个参考项目都有它（设计说明：Open-AutoGLM Take_over / Interact、Mobile-Agent interact、
+五个参考项目都有它（docs/31 §3.3：Open-AutoGLM Take_over / Interact、Mobile-Agent interact、
 UI-Venus CallUser、OpenGUI call_user、PhoneAgent HUMAN_INPUT）。我们以前只有 done ——
 登录、验证码、支付确认、Face ID、拿不准的二选一，要么撞熔断要么 done(failed)。
 

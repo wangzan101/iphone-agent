@@ -10,9 +10,15 @@ from pathlib import Path
 from iphone_agent.driver.geometry import Frame, Rect
 
 
+def frame_name(frame_id: int) -> str:
+    """帧文件名的唯一入口：落盘（save_frame）和孪生的屏 id（twin 按 run:frame_file 建屏）共用 ——
+    两边各写一遍，实时与重放算出的屏 id 就会分叉（spec 2026-09-12 §4.1，codex 评审第 1 条）。"""
+    return f"frame_{frame_id:03d}.png"
+
+
 def observation_snapshot(obs, frame_file: str) -> dict:
     r = obs.window_rect
-    return {
+    snap = {
         "frame_file": frame_file,
         "width_px": obs.width_px,
         "height_px": obs.height_px,
@@ -20,6 +26,17 @@ def observation_snapshot(obs, frame_file: str) -> dict:
         "ahash": obs.ahash,
         "elements": [_element_row(e) for e in obs.elements],
     }
+    # 感知状态：视觉那一路失败要在日志里看得见（spec 2026-09-11 §3.1）。没有就不写，老调用方不变。
+    perception = getattr(obs, "perception", None)
+    if perception:
+        snap["perception"] = dict(perception)
+    label = getattr(obs, "screen", None)
+    if label is not None:
+        snap["screen"] = label.to_json()
+    cands = getattr(obs, "screen_candidates", None)
+    if cands:
+        snap["screen_candidates"] = [c.to_json() for c in cands]
+    return snap
 
 
 def _element_row(e) -> dict:
@@ -65,7 +82,7 @@ class RunLog:
         (self.dir / "run.json").write_text(json.dumps(self._run, ensure_ascii=False, indent=2))
 
     def save_frame(self, frame: Frame) -> str:
-        name = f"frame_{frame.frame_id:03d}.png"
+        name = frame_name(frame.frame_id)
         if frame.frame_id not in self._saved:
             frame.image.save(self.dir / name)
             self._saved.add(frame.frame_id)
@@ -99,6 +116,17 @@ class RunLog:
         """事后审计的留档。**只是提请注意，不改任务终态** ——
         它当前的覆盖率很低（见 harness/audit.py），把它变成判定会误伤正确的运行。"""
         self._run["audit"] = note
+        self._write_run()
+
+    def set_twin(self, summary: dict) -> None:
+        """孪生这次的账：实时认屏计数、收尾记账统计、错误。成功失败都写 —— 能失败的东西要看得见。"""
+        self._run["twin"] = summary
+        self._write_run()
+
+    def set_section(self, key: str, value) -> None:
+        """run.json 顶层的一节（perception / taps / startup_timing，spec 2026-09-14 §8）。
+        只改这一项再整体重写，排在 finish() 之后调用也不会抹掉终态。"""
+        self._run[key] = value
         self._write_run()
 
     def set_memory(self, injected: str | None, recalled: list[str],

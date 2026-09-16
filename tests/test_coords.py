@@ -21,6 +21,29 @@ def test_missing_axis_left_alone():
     assert to_pixels({"x": 500}, "norm1000", (800, 1700)) == {"x": 500}
 
 
+def test_zoom_box_scales_all_four_corners():
+    """⚠ 2026-09-16：zoom 的框以前**根本不换算**（只认 x/y 两个键），
+    模型给的 0-1000 被当像素用 —— 624 宽的屏上，x>624 的框一律 out_of_image。"""
+    assert to_pixels({"x1": 750, "y1": 60, "x2": 980, "y2": 160}, "norm1000", (624, 1388)) == {
+        "x1": 468, "y1": 83, "x2": 612, "y2": 222}
+
+
+def test_zoom_box_untouched_in_pixel_mode():
+    args = {"x1": 480, "y1": 890, "x2": 620, "y2": 940}
+    assert to_pixels(args, "pixel", (624, 1388)) is args
+
+
+def test_zoom_box_with_a_bad_corner_left_for_validation():
+    args = {"x1": "abc", "y1": 60, "x2": 980, "y2": 160}
+    assert to_pixels(args, "norm1000", (624, 1388)) is args
+
+
+def test_partial_zoom_box_left_alone():
+    """少一个角就不是框：原样交给 validate_action 以 invalid_args 拒（x2 必须是有限数字）。"""
+    args = {"x1": 750, "y1": 60, "x2": 980}
+    assert to_pixels(args, "norm1000", (624, 1388)) == args
+
+
 def test_unconvertible_value_left_for_validation():
     """原来 float("abc") 会在桥里炸成 ModelError，整个任务以 model_error 收场；
     现在原样交给 validate_action，它会以 invalid_args 拒绝并给模型提示，任务继续。"""

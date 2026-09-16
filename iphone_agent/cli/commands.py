@@ -6,6 +6,7 @@ import json
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from iphone_agent import config
@@ -26,7 +27,7 @@ class Session:
     桥换算坐标用的也是它。两者分叉就是 elements.py 注释里那次「一个规则两个入口」的事故。
 
     工作区显式挂在 session 上（原来是模块级 RUNS_ROOT，写死相对 cwd）——
-    一个进程要能同时管两个工作区（设计说明 D3）。
+    一个进程要能同时管两个工作区（docs/20 D3）。
     """
     def __init__(self, workspace: Workspace | None = None,
                  model_spec: str | None = None, resolved: ResolvedModel | None = None):
@@ -122,7 +123,7 @@ class Session:
                 return None
             from iphone_agent.model.vision import VisionAsker
             # enabled 是「视觉能力可不可用」，不是「要不要每次观察都整屏解析」——
-            # 后者由 config.SCREEN_PARSE 在 Perceiver.observe 里管。混在一起会把
+            # 后者由整屏解析模式（perceive/policy.py，经 Perceiver.task_scope）管。混在一起会把
             # zoom 和各种看图复核一起关掉，那些正是要留着的。
             self._asker = VisionAsker(transport)
         return self._asker
@@ -151,26 +152,40 @@ def _recovery(session: Session):
     return Recovery(session.dev, session.per)
 
 
+@contextlib.contextmanager
+def _perception_scope(session):
+    """CLI 的观察和任务走同一条链路：env → RunConfig.from_env → task_scope（spec 2026-09-14 §7）。
+    不在 scope 里观察就会落回代码默认值，和 `iphone serve` 里跑的任务不是一个模式。
+    ⚠ 2026-09-15（按需看图终审 minor 4）：调用方打的「# 整屏解析模式 …」走 stderr —— tap/type/open/skill run
+      的 stdout 要能直接当 JSON 读，原来排在 JSON 前面，测试只好改成取最后一行。`iphone screen` 那行是列表的表头，留在 stdout。"""
+    from iphone_agent.workspace import RunConfig
+    mode = RunConfig.from_env().screen_parse
+    with session.per.task_scope(None, mode):
+        yield mode
+
+
 def _manual(session: Session, fn):
     """手动动作：观察 → 动作 → 稳定等待 → 打印 changed。"""
     from iphone_agent.driver.timing import IOS_TIMING
     from iphone_agent.harness.settle import settle
     from iphone_agent.perceive.hashing import ahash
     dev, per = session.dev, session.per
-    before_frame = dev.capture()
-    before = per.observe(before_frame)
-    try:
-        kind = fn(before, before_frame)
-        frame, settled = settle(dev, before_frame, IOS_TIMING[kind], ahash)
-        after = per.observe(frame)
-        print(f"settled={settled} ", end="")
-        _print_change(before, after)
-    finally:
-        dev.release_all()
+    with _perception_scope(session) as mode:
+        print(f"# 整屏解析模式 {mode}", file=sys.stderr)
+        before_frame = dev.capture()
+        before = per.observe(before_frame)
+        try:
+            kind = fn(before, before_frame)
+            frame, settled = settle(dev, before_frame, IOS_TIMING[kind], ahash)
+            after = per.observe(frame)
+            print(f"settled={settled} ", end="")
+            _print_change(before, after)
+        finally:
+            dev.release_all()
 
 
 def cmd_doctor(session: Session, args):
-    """判断在 health.py 里，这里只负责渲染 —— 网页向导消费的是同一份 Check（设计说明 P0）。"""
+    """判断在 health.py 里，这里只负责渲染 —— 网页向导消费的是同一份 Check（docs/22 P0）。"""
     from iphone_agent import health
     checks = health.run_checks(session)
     for c in checks:
@@ -187,8 +202,12 @@ def cmd_doctor(session: Session, args):
 
 
 def cmd_screen(session, args):
-    frame = session.dev.capture()
-    obs = session.per.observe(frame)
+    """`iphone screen` = 看全屏：抓一帧、整屏解析、标好编号（spec 2026-09-14 §7）。"""
+    from iphone_agent.harness.executor import full_screen_note
+    with _perception_scope(session) as mode:
+        obs = session.per.observe(session.dev.capture(), requested=True)
+    note = full_screen_note(obs)
+    print(f"# 整屏解析模式 {mode}；" + ("这帧整屏看过" if note is None else f"这帧只有 OCR：{note}"))
     print(obs.elements_text)
     out = Path("screen_marked.png"); obs.marked_image.save(out)
     print(f"标记图已存 {out}")
@@ -231,18 +250,20 @@ def _run_action(session, name: str, args: dict) -> int:
     """
     from iphone_agent.harness.actions import Action, ValidationError, validate_action
     from iphone_agent.harness.executor import Executor
-    obs = session.per.observe(session.dev.capture())
-    try:
-        action = validate_action(Action(name, args, "manual", None, "m"), obs)
-    except ValidationError as e:
-        print(f"{e.code}: {e.message}", file=sys.stderr)
-        return 2
-    ex = Executor(session.dev, session.per, asker=session.asker, recovery=_recovery(session))
-    try:
-        res, _ = ex.run(action, obs)
-        print(res.to_json())
-    finally:
-        session.dev.release_all()
+    with _perception_scope(session) as mode:
+        print(f"# 整屏解析模式 {mode}", file=sys.stderr)
+        obs = session.per.observe(session.dev.capture())
+        try:
+            action = validate_action(Action(name, args, "manual", None, "m"), obs)
+        except ValidationError as e:
+            print(f"{e.code}: {e.message}", file=sys.stderr)
+            return 2
+        ex = Executor(session.dev, session.per, asker=session.asker, recovery=_recovery(session))
+        try:
+            res, _ = ex.run(action, obs)
+            print(res.to_json())
+        finally:
+            session.dev.release_all()
     return 0 if res.ok else 1
 
 
@@ -265,13 +286,15 @@ def cmd_type(session, args):
     """走 Executor 而非 _manual：只有这样才能拿到 `_verify_type` 的落屏校验（spec §10.3）。"""
     from iphone_agent.harness.actions import Action
     from iphone_agent.harness.executor import Executor
-    frame = session.dev.capture(); obs = session.per.observe(frame)
-    ex = Executor(session.dev, session.per, asker=session.asker, recovery=_recovery(session))
-    try:
-        res, _ = ex.run(Action("type", {"text": " ".join(args)}, "manual", None, "m"), obs)
-        print(res.to_json())
-    finally:
-        session.dev.release_all()
+    with _perception_scope(session) as mode:
+        print(f"# 整屏解析模式 {mode}", file=sys.stderr)
+        frame = session.dev.capture(); obs = session.per.observe(frame)
+        ex = Executor(session.dev, session.per, asker=session.asker, recovery=_recovery(session))
+        try:
+            res, _ = ex.run(Action("type", {"text": " ".join(args)}, "manual", None, "m"), obs)
+            print(res.to_json())
+        finally:
+            session.dev.release_all()
     return 0
 
 
@@ -292,14 +315,16 @@ def _layout(session):
 def cmd_open(session, args):
     from iphone_agent.harness.actions import Action
     from iphone_agent.harness.executor import Executor
-    frame = session.dev.capture(); obs = session.per.observe(frame)
-    ex = Executor(session.dev, session.per, asker=session.asker, recovery=_recovery(session),
-                  layout=_layout(session))
-    try:
-        res, _ = ex.run(Action("open_app", {"name": " ".join(args)}, "manual", None, "m"), obs)
-        print(res.to_json())
-    finally:
-        session.dev.release_all()
+    with _perception_scope(session) as mode:
+        print(f"# 整屏解析模式 {mode}", file=sys.stderr)
+        frame = session.dev.capture(); obs = session.per.observe(frame)
+        ex = Executor(session.dev, session.per, asker=session.asker, recovery=_recovery(session),
+                      layout=_layout(session), layout_path=session.workspace.twin_device / "layout.json")
+        try:
+            res, _ = ex.run(Action("open_app", {"name": " ".join(args)}, "manual", None, "m"), obs)
+            print(res.to_json())
+        finally:
+            session.dev.release_all()
     return 0
 
 
@@ -449,7 +474,7 @@ def cmd_run(session, args):
     import argparse
     p = argparse.ArgumentParser(prog="iphone run")
     p.add_argument("task")
-    # 默认留 None：由 RunConfig 在**调用时**取，才改得动（设计说明 D8）。
+    # 默认留 None：由 RunConfig 在**调用时**取，才改得动（docs/20 D8）。
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--timeout", type=float, default=None)
     p.add_argument("--model", help="provider:model，如 deepseek:deepseek-v3；覆盖 IPHONE_USE_MODEL 与 config.toml")
@@ -733,15 +758,17 @@ def _skill_run(session, store, ref: str, kv: list[str]) -> int:
     runner = ProcedureRunner(ex, ActionGuard(), log, deadline=time.time() + config.TASK_TIMEOUT_S,
                              on_step=lambda rec: print(f"  ↳ {rec['action']['name']} {rec['result'].get('error', 'ok')}"))
     res = None
-    try:
-        obs = session.per.observe(session.dev.capture())
-        res, _ = runner.run(p, kv_args, obs, "manual", p.tool_name)
-        print(res.to_json())
-        store.record_run(app, name, ok=res.ok, counted=res.error in COUNTED_FAILURES, run_id=log.dir.name)
-    finally:
-        session.dev.release_all()
-        ok = res is not None and res.ok
-        log.finish("done_success" if ok else "done_failed", 1, None, None, "manual", {})
+    with _perception_scope(session) as mode:
+        print(f"# 整屏解析模式 {mode}", file=sys.stderr)
+        try:
+            obs = session.per.observe(session.dev.capture())
+            res, _ = runner.run(p, kv_args, obs, "manual", p.tool_name)
+            print(res.to_json())
+            store.record_run(app, name, ok=res.ok, counted=res.error in COUNTED_FAILURES, run_id=log.dir.name)
+        finally:
+            session.dev.release_all()
+            ok = res is not None and res.ok
+            log.finish("done_success" if ok else "done_failed", 1, None, None, "manual", {})
     return 0 if ok else 1
 
 
@@ -780,11 +807,14 @@ def cmd_skill(session, args) -> int:
 
 
 def cmd_twin(session, args) -> int:
-    """设备层孪生：主屏布局表。见 设计说明。"""
+    """设备层孪生：主屏布局表。见 docs/32 §1.5。"""
     from iphone_agent.twin.layout import Layout
-    usage = ("用法: iphone twin <scan|show>\n"
-             "  scan   回主屏第一页看一眼，把这一页的 App 位置写进布局表（只看不点）\n"
-             "  show   打印布局表")
+    usage = ("用法: iphone twin <scan|show|rebuild|report|bench>\n"
+             "  scan     回主屏第一页，一页页往右翻到底，把每一页的 App 位置按页序写进布局表（只看不点）\n"
+             "  show     打印布局表\n"
+             "  rebuild  从全部留档重建 App 层孪生（屏文件）\n"
+             "  report   离线报告：每个 App 认出了多少屏、五态占比\n"
+             "  bench    合入闸门：错合、错归必须为 0（标注在 evalset/twin/）")
     what = args[0] if args else ""
     path = session.workspace.twin_device / "layout.json"
     if what == "scan":
@@ -811,6 +841,31 @@ def cmd_twin(session, args) -> int:
             for r in sorted(rows):
                 print("  " + " | ".join(rows[r]))
         return 0
+    if what == "rebuild":
+        from iphone_agent.twin.record import LockTimeout, rebuild
+        try:
+            st = rebuild(session.workspace)
+        except LockTimeout:
+            print("孪生正被另一个任务写入，稍后再试。", file=sys.stderr)
+            return 1
+        print(f"重建完成：{st.runs} 个运行，建屏 {st.screens_created}，转正 {st.screens_confirmed}，"
+              f"转移 {st.transitions}；撞车 {st.collisions}，坏文件 {st.corrupt}，孤儿 {st.orphans}")
+        return 0
+    if what == "report":
+        from iphone_agent.twin.report import report_text
+        print(report_text(session.workspace))
+        return 0
+    if what == "bench":
+        from iphone_agent.twin import bench
+        from iphone_agent.twin.record import simulate
+        # 标注和其他评测集一样按当前目录找，留档按工作区找
+        pairs, owners = bench.load_labels(Path("evalset") / "twin")
+        if not pairs and not owners:
+            print("evalset/twin/ 下没有标注（pairs.json / owners.json）。", file=sys.stderr)
+            return 2
+        r = bench.run_bench(simulate(session.workspace), pairs, owners)
+        print(bench.format_result(r))
+        return 0 if r.passed else 1
     print(usage, file=sys.stderr)
     return 2
 
@@ -818,17 +873,80 @@ def cmd_twin(session, args) -> int:
 def cmd_eval(session: Session, args: list[str]) -> int:
     """离线回放评测：拿历史运行当尺子。见 iphone_agent/eval/replay.py 的模块注释。"""
     from iphone_agent.eval import replay
-    usage = ("用法: iphone eval <bench|diff|tasks|tasks-diff|verify|elements|effect> …\n"
-             "  bench            跑评测集（evalset/），存 results/<ts>.json，打印摘要。几秒，不调模型\n"
+    usage = ("用法: iphone eval <bench|diff|tasks|tasks-diff|verify|curve|ab|elements|effect> …\n"
+             "  bench [--label-agree] [--label-agree-limit N]  跑评测集（evalset/），存 results/<ts>.json，打印摘要。"
+             "几秒，不调模型；--label-agree 另比两种标注（第一次要真调视觉）；"
+             "--label-agree-limit N 把 label_agree 限到最多 N 帧（按 App 分层轮询，确定性）\n"
              "  diff <a> <b>     两次 bench 结果对比，列出翻转的样本\n"
              "  tasks [--n 3] [--only <id>]  真机上每题跑 n 次再判「办成了没」，存 results/tasks-<ts>.json\n"
              "  tasks-diff <a> <b>  两次 tasks 结果逐题对比，列出翻转的题\n"
              "  verify <id> <run_dir>  离线：拿一次历史运行对着某道题判\n"
+             "  curve [--reps 5] [--only <id>]  学习曲线：开孪生提示 vs 无位置提示，ABBA 交替，存 results/curve-<ts>.json\n"
+             "  ab [--reps 3] [--only <id>]  按需看图 A/B：always 对 on_demand，A B B A A B，硬闸题多一层无坐标，存 results/ab-<ts>.json（要人在场）\n"
              "  elements  同一张历史截图，纯 OCR 与加上屏幕解析各认出多少元素\n"
              "  effect    当时判成「没有变化」的步，让看图的那一方重判一次\n"
              "  --limit N 只跑前 N 步（后两项都要真调模型，先用小样本试花销）\n"
              "  --no-vision 完全不调模型，只验证纯 OCR 那一路没被改坏")
     what = args[0] if args else ""
+    if what == "ab":
+        from iphone_agent.eval import ab as AB
+        root = Path("evalset")
+        regular, hard, errors = AB.load_ab_tasks(root)
+        for e in errors:
+            print(f"⚠ 任务文件有问题，已跳过：{e}", file=sys.stderr)
+        not_ready = [msg for t in hard if (msg := AB.ready(t))]
+        if not_ready:
+            print("硬闸题还不能跑（spec 2026-09-14 §10.3）：" + "；".join(not_ready), file=sys.stderr)
+            return 2
+        reps = 3
+        if "--reps" in args:
+            i = args.index("--reps")
+            if i + 1 >= len(args) or not args[i + 1].isdigit():
+                print("--reps 后面要跟一个数字", file=sys.stderr)
+                return 2
+            reps = int(args[i + 1])
+        if "--only" in args:
+            i = args.index("--only")
+            keep = args[i + 1] if i + 1 < len(args) else ""
+            regular = [t for t in regular if t.id == keep]
+            hard = [t for t in hard if t.id == keep]
+        if not regular and not hard:
+            print("没有可跑的题", file=sys.stderr)
+            return 2
+        ws_root = root / "ab-ws" / time.strftime("%Y%m%d-%H%M%S")
+        res = AB.run_ab(session, regular, hard, reps, ws_root)
+        path = AB.save(res, root / "results")
+        for line in AB.table(res):
+            print(line)
+        print(f"# 存到 {path}；两组工作区在 {ws_root}（on = always，off = on_demand）")
+        return 0
+    if what == "curve":
+        from iphone_agent.eval import curve as C
+        from iphone_agent.eval import verify as V
+        root = Path("evalset")
+        tasks, errors = V.load_tasks(root / "tasks" / "curve")
+        for e in errors:
+            print(f"⚠ 任务文件有问题，已跳过：{e}", file=sys.stderr)
+        reps = 5
+        if "--reps" in args:
+            i = args.index("--reps")
+            if i + 1 >= len(args) or not args[i + 1].isdigit():
+                print("--reps 后面要跟一个数字", file=sys.stderr)
+                return 2
+            reps = int(args[i + 1])
+        if "--only" in args:
+            i = args.index("--only")
+            tasks = [t for t in tasks if i + 1 < len(args) and t.id == args[i + 1]]
+        if not tasks:
+            print("没有可跑的题（evalset/tasks/curve/*.json）", file=sys.stderr)
+            return 2
+        ws_root = root / "curve-ws" / time.strftime("%Y%m%d-%H%M%S")
+        res = C.run_curve(session, tasks, reps, ws_root)
+        path = C.save(res, root / "results")
+        for line in C.table(res):
+            print(line)
+        print(f"# 存到 {path}；两组工作区在 {ws_root}")
+        return 0
     if what in ("tasks", "tasks-diff", "verify"):
         from iphone_agent.eval import verify as V
         root = Path("evalset")
@@ -855,10 +973,12 @@ def cmd_eval(session: Session, args: list[str]) -> int:
             v = V.verify_run(t, Path(args[2]))
             print(f"{v.status}  {v.run}  安全违规尝试 {v.safety_attempts}")
             for c in v.checks:
-                print(f"  {'✓' if c['ok'] else '✗'} {c['type']}  {c['why']}")
+                # ok=None：坐标点击反查不到元素，待人工审查——不算失败，不打 ✗（m9 终审）
+                mark = "待审" if c["ok"] is None else ("✓" if c["ok"] else "✗")
+                print(f"  {mark} {c['type']}  {c['why']}")
             for r in v.reasons:
                 print(f"  · {r}")
-            return 0 if v.status == "pass" else 1
+            return 0 if v.status in ("pass", "review") else 1
         n = 3
         if "--n" in args:
             i = args.index("--n")
@@ -885,6 +1005,25 @@ def cmd_eval(session: Session, args: list[str]) -> int:
         if asker is not None:
             asker.cache_dir = root / "vision-cache"    # 视觉回复缓存在这，bench 才能天天跑
         res = B.bench(root, session.per)
+        if "--label-agree" in args:
+            if asker is None:
+                print("没有配看图的模型，label_agree 跑不了", file=sys.stderr)
+                return 2
+            from iphone_agent.twin.context import ScreenIdentityContext
+            from iphone_agent.twin.live import LiveTwin
+            from iphone_agent.twin.record import known_apps
+            limit = None
+            if "--label-agree-limit" in args:
+                i = args.index("--label-agree-limit")
+                if i + 1 >= len(args) or not args[i + 1].isdigit():
+                    print("--label-agree-limit 后面要跟一个数字", file=sys.stderr)
+                    return 2
+                limit = int(args[i + 1])
+            ws = session.workspace
+            # 用当前工作区的孪生挑真实候选（只读；LiveTwin 不写盘）。先记下孪生的版本再跑。
+            rev = B.twin_fingerprint(ws.twin_apps)
+            ctx = ScreenIdentityContext(LiveTwin(ws.twin_apps, "bench", known_apps=known_apps(ws)))
+            res["label_agree"] = B.label_agree(root, session.per, ctx, rev, limit=limit)
         path = B.save(res, root)
         for line in B.summary(res):
             print(line)

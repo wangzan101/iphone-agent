@@ -252,8 +252,8 @@ def test_ownership_walk_follows_open_app_home_spotlight_and_switcher():
 
 def test_apps_seen_maps_id_to_original_open_name():
     from iphone_agent.memory.screenmap import apps_seen
-    recs = [_rec(["主屏"], {"name": "open_app", "args": {"name": "一木记账"}}), _rec(["记账"])]
-    assert apps_seen(recs) == {"yi-mu-ji-zhang": "一木记账"}
+    recs = [_rec(["主屏"], {"name": "open_app", "args": {"name": "记账本"}}), _rec(["记账"])]
+    assert apps_seen(recs) == {"ji-zhang-ben": "记账本"}
 
 
 # --- 主屏图标点开一个 App，也算「进入」（真机 44 个「从未进过任何 App」里 10 个是这样丢的）---

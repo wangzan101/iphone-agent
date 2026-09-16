@@ -17,11 +17,13 @@ from iphone_agent.driver.timing import IOS_TIMING
 from iphone_agent.harness import judge, recap
 from iphone_agent.harness.actions import Action, icon_y_above_label, screen_neutral
 from iphone_agent.harness.settle import settle
+from iphone_agent.memory.screenmap import app_id_for
 from iphone_agent.perceive import transition as tr
 from iphone_agent.perceive.change import did_change, local_mad
 from iphone_agent.perceive.elements import Observation
 from iphone_agent.perceive.hashing import ahash
-from iphone_agent.twin.layout import infer_page, norm_label, same_page
+from iphone_agent.twin.identify import plain_app_id
+from iphone_agent.twin.layout import infer_page, match_label, same_page
 
 HINTS = {
     "tap": "未检测到明显变化：可能没点中，也可能该处本就无反应。换目标或换方式，不要原样重复。",
@@ -59,6 +61,23 @@ class ToolResult:
 # 09-09 改成第三次说「别试了」，模型照样换 20 种方式试。设备故障不该交给模型：
 # 有恢复阶梯（recovery.py）时它根本看不到这句；没有阶梯时它看到的也只是事实。
 TYPING_NOT_LANDED = "按键没有落进输入框（这次是 {what!r}）：键盘通道可能失效了。"
+
+
+def full_screen_note(obs) -> str | None:
+    """看全屏（observe 工具、兜底）交回的这一帧怎么说。只读本帧的 perception（spec 2026-09-14 §9），
+    不读共享的 VisionAsker.last_error —— 那个会被下一次调用覆盖。拿到了整屏结果就返回 None。
+    ⚠ 解析失败不能交回一个看起来正常、实际只有 OCR 的列表：必须说出来。"""
+    p = getattr(obs, "perception", None) or {}
+    parse, err = p.get("parse"), p.get("parse_error") or {}
+    if parse == "no_asker":
+        return "没有配看图的模型，整屏解析做不了，元素表只有 OCR；看不清就 zoom"
+    if parse is None:
+        return "整屏解析已关闭（模式 off），元素表只有 OCR；看不清就 zoom"
+    if p.get("vision") in ("ok", "empty"):
+        if err.get("kind") == "partial":
+            return f"看全屏的回复被截断，元素表里只有能解析出来的那部分（{err.get('detail', '')}）"
+        return None
+    return f"看全屏失败（{err.get('kind', 'failed')}：{err.get('detail', '')}），元素表仍只有 OCR"
 
 
 # 还在 Spotlight 里的标志。open_app 开没开成看它，不看画面变没变；自动探索（eval/explore.py）
@@ -100,6 +119,58 @@ def looks_like_home(obs) -> bool:
 LAYOUT_MISSES = ("no_hit", "page_out_of_range", "label_missing", "out_of_window", "still_home", "error",
                  "wrong_app")
 
+# 翻主屏找 App 没开成的原因（2026-09-14，写进最终结果的 extra["home_miss"]，和 layout_miss 一样让评测看得见）：
+#   not_found      翻到头 / 到 App 资源库 / 到 HOME_PAGES_MAX 页，哪一页上都没有这个标签
+#   not_home       回主屏后第 1 页认不出主屏（looks_like_home 不成立），没往下翻
+#   out_of_window  标签上方的图标算出来在窗口外
+#   still_home     点完还在 Spotlight / 主屏 / 同一页网格上：没开成
+#   wrong_app      点开的不是它（看图说的）
+#   error          孪生自己的逻辑抛了异常（认页 / 网格推断坏了）
+HOME_MISSES = ("not_found", "not_home", "out_of_window", "still_home", "wrong_app", "error")
+
+
+# ---- 点击的预期核对（docs/superpowers/specs/2026-09-11-点击预期核对-design.md §3.2）----
+_QUOTED = re.compile(r"「([^」]+)」")
+
+
+_SPACES = re.compile(r"\s+")      # 含全角空格 —— 原来只去 ASCII 空格，「关于　本机」对不上「关于本机」
+_DIGIT = re.compile(r"\d")
+
+
+def expect_keys(expect: str | None) -> list[str]:
+    """预期里用「」括起来的关键字（去空白）。没有就是空列表；空引号「」「 」不算关键字。"""
+    keys = (_SPACES.sub("", k) for k in _QUOTED.findall(expect or ""))
+    return [k for k in keys if k]
+
+
+def _key_in(k: str, a: str) -> bool:
+    """一个关键字算不算出现在一条（去过空白的）新文字里。规矩只在这一处（CLAUDE.md §7）。"""
+    if _DIGIT.search(k):
+        return re.search(r"(?<!\d)" + re.escape(k) + r"(?!\d)", a) is not None
+    return k == a or (len(k) >= 2 and k in a)
+
+
+def expect_met_by_text(expect: str | None, appeared) -> str | None:
+    """「」里的字有没有出现在**新出现的文字**里；命中就返回那个关键字，否则 None。
+
+    只认新出现的：点「通用」这一行进入「通用」页，「通用」两个字点前就在屏上，它还在证明不了到达。
+    命中是肯定信号，可以直接用；没命中是否定结论，调用方交给看图的一方（CLAUDE.md §2）。
+    ⚠ 单字关键字只认整条相等 —— 「1」包含在「11」里不能算数（2026-09-09 金额 '1' 连点成 '11' 就是这个形状）。
+    ⚠ 2026-09-11 终审：含数字的关键字前后都不许紧挨数字。原来 ≥2 字一律按子串认，「13」命中「113」、
+      「100」命中「1100」—— 还是「金额 1 连点成 11」那一类，只是换成了两位数。文字核对一旦误确认就
+      不看图、不给 hint，历史表写 yes(文字)：静默的错误肯定（CLAUDE.md §3）。「-13.00」「13元」仍算命中。
+    """
+    texts = [_SPACES.sub("", a) for a in appeared]
+    for k in expect_keys(expect):
+        if any(_key_in(k, a) for a in texts):
+            return k
+    return None
+
+
+def _vision_check(eff) -> dict:
+    """看图复核的结论 → expect_check。没问成就是没问成，不和「看图说没达到」混（CLAUDE.md §3）。"""
+    return {"met": None, "by": "unverified"} if eff is None else {"met": bool(eff.worked), "by": "vision"}
+
 
 def _still_on_same_home_page(before, after) -> bool:
     """点完之后还认得出点之前那一页主屏的网格 = 没开成。
@@ -123,8 +194,9 @@ HOME_PRESSES = 3
 def return_to_first_home_page(dev, frame):
     """回主屏第一页：连按 HOME_PRESSES 次 home，每次之后 settle，返回最后一次 settle 到的帧。
 
-    一个规则一个入口（项目开发约定）：`_open_app_from_layout`、`_open_app_from_home`、
-    `twin/scan.scan_home` 都要回主屏第一页，统一调这里，别再各写一份「按 3 次 home」。
+    一个规则一个入口（CLAUDE.md §7）：`_open_app_from_layout`、`twin/scan.walk_home_pages`
+    （open_app 翻主屏找 App、`iphone twin scan` 都走它）都要回主屏第一页，统一调这里，
+    别再各写一份「按 3 次 home」。
 
     每轮传给 settle 的帧选哪个都不影响行为：它的 `before` 从不被读（见 harness/settle.py 的 docstring）。
     """
@@ -134,11 +206,32 @@ def return_to_first_home_page(dev, frame):
     return frame
 
 
+def wait_out_page_flip(rested_at: float | None) -> None:
+    """要点之前，把翻页之后的 AFTER_PAGE_FLIP_S 等满（从那一页翻停的时刻算）。rested_at=None = 没翻过页，不等。
+
+    一个规则一个入口（CLAUDE.md §7）：查表直达和翻主屏找 App，点图标之前都调这里。
+    ⚠ 2026-09-14：原来每翻一页就硬等 AFTER_PAGE_FLIP_S —— 那条管的是「翻页后多久才能点」
+      （config 那条注释：翻页后约 2 秒内的点击会落错地方），只看不点的翻页用不着。翻主屏找 App
+      一页一等，6 页白等 12 秒。现在翻页只 settle，要点的时候才把剩下的等满。
+      从「翻停」（settle 返回）算、不从按下翻页算：原来的硬等也是 settle 之后才开始计时，
+      2026-09-07 那次是「翻完、静止 2 秒再点」才对，这段不能缩短。
+    """
+    if rested_at is None:
+        return
+    left = config.AFTER_PAGE_FLIP_S - (time.monotonic() - rested_at)
+    if left > 0:
+        time.sleep(left)
+
+
+def _no_log(*_a) -> None:
+    pass
+
+
 def spotlight_query(name: str) -> str:
     """App 名 → 往 Spotlight 里打的那串字母。
 
     · 纯英文：原样。
-    · 纯中文：整个转拼音（'一木记账' → 'yimujizhang'）。Spotlight 按拼音匹配 App 名，
+    · 纯中文：整个转拼音（'记账本' → 'jizhangben'）。Spotlight 按拼音匹配 App 名，
       2026-09-08 实测干净的搜索框里打这串，它直接出现在「最佳搜索结果」。
     · **中英混合：只用英文部分**（'Safari 浏览器' → 'Safari'）。
       2026-09-09 评测集跑出来的：lazy_pinyin 把整个名字转成 'Safari liulanqi'，
@@ -155,15 +248,18 @@ def spotlight_query(name: str) -> str:
 
 class Executor:
     def __init__(self, device, perceiver, store=None, runs_root=None, catalog=None,
-                 asker=None, recovery=None, layout=None):
+                 asker=None, recovery=None, layout=None, identity=None, layout_path=None):
         self.dev = device
         self.per = perceiver
         # 恢复阶梯（harness/recovery.py）。None = 不救，验证失败就原样报错 —— 测试和纯观察的场合用。
         # 设备的事是系统的事：有 recovery 时，通道失效对模型是透明的，它只看到成功或 device_error。
         self.recovery = recovery
         # 设备层孪生的布局表（twin/layout.Layout）。None = 没有，open_app 直接走 Spotlight。
-        # 它只是参考：给候选页和格子，标签在当前帧上找、坐标用当前帧算、开没开成看身份（设计说明）。
+        # 它只是参考：给候选页和格子，标签在当前帧上找、坐标用当前帧算、开没开成看身份（docs/32 §5.1）。
         self.layout = layout
+        # 布局表在磁盘上的位置。open_app 翻主屏找 App 时，翻过的页按真实页序写回这里（twin/scan.walk_home_pages）；
+        # None = 不写（测试、纯观察）。写回的就是 self.layout 这个对象，任务中刷新也用它（loop.push_obs）。
+        self.layout_path = layout_path
         # 会看图的那一方。只在硬规则给出**否定结论**时才问它 —— 见 harness/judge.py。
         # None 就是全部退回老行为，一行都不差。
         self.asker = asker
@@ -175,6 +271,9 @@ class Executor:
         # 只能从证据推：打一串拼音字母，出候选栏就是中文，没候选就是英文。
         # None = 还不知道。切换之后必须重新验证，不能想当然地翻转。
         self._ime_chinese: bool | None = None
+        # 本次任务的认屏上下文（twin.context.ScreenIdentityContext）：_identity 用它换算标注里的 App 名、
+        # 学 App 名别名。None = 没有孪生，按标注原名比（spec 2026-09-12 §5.3）。
+        self.identity = identity
 
     def run(self, action: Action, obs: Observation) -> tuple[ToolResult, Observation | None]:
         """跑一个动作；验证说通道失效且有恢复阶梯，就爬梯重做。模型看不到中间过程。"""
@@ -235,8 +334,11 @@ class Executor:
                                                           config.SEARCH_MEMORY_TOPK)]
             return ToolResult(ok=True, extra={"hits": hits}), None
         if n == "observe":
-            new = self.per.observe(self.dev.capture())
-            return ToolResult(ok=True, changed=None), new
+            # ⚠ 2026-09-14（spec 按需看图 §4.1）：observe 改义为「看全屏」，而且**重新截一帧**。
+            #   模型想了约 5 秒、解析又要几十秒，它刚才看到的那一帧可能已经过期（页面刚加载完）；
+            #   后面的 tap 和窗口核对都以新帧为准。新帧有新的 observation_id，旧编号作废。
+            new = self.per.observe(self.dev.capture(), requested=True)
+            return ToolResult(ok=True, changed=None, hint=full_screen_note(new)), new
         if n == "zoom":
             # 只看不动。changed=None 而不是 False：屏幕**本来就不该**变，
             # 报 False 会被 guard 记成一次无进展，攒够就熔断 —— 而它明明在好好干活。
@@ -347,6 +449,10 @@ class Executor:
                          text_diff=ch.text_diff, settled=settled)
         if local is not None:
             res.extra["local_mad"] = round(local, 2)
+        # 「新出现的文字」只有一个入口：transition 的集合差（CLAUDE.md §7）。这里取全量不截断 ——
+        # 预期核对要看全部；给模型的 appeared/disappeared 仍按 TRANSITION_LIST_MAX 截断（见本函数末尾）。
+        # ⚠ tap_px 传 None：local_mad 是像素级循环，上面真正需要它时已经算过一次了。
+        t = tr.transition(before, new, None, max(len(before.elements), len(new.elements)) + 1)
         if action.name == "type":
             extra_target = extra.get("_target", "")
             verified = self._verify_type(new, extra.pop("_baseline"), extra.pop("_target"),
@@ -377,22 +483,52 @@ class Executor:
                                            "why": eff.why}
                     # 模型看过两张图说没生效 —— 这比汉明距离有说服力得多，交给模型当线索。
                     res.hint += f"（看图复核也说没生效：{eff.why}）"
+            if action.name == "tap":
+                res.extra["expect_check"] = (_vision_check(eff) if action.expect
+                                             else {"met": None, "by": "missing"})
         elif changed and action.expect and action.name in HINTS:
             # ---- 像素判据说「变了」：变了 ≠ 做对了 ----
             # 上面那条「只在否定侧问」的规矩管的是**动作生效没**；这里问的是另一件事：
             # **生效了，但去的是不是对的地方**。误点进一个错页面正是「变了」——
             # 以前一律当成功，guard 还把它记成进展（guard.py record_outcome 的注释）。
-            # 只在模型给了 expect 时问：没有预期就没有可核对的东西，也省下这次调用。
-            # 2026-09-09 统计 runs/：1113 步里模型自评字段一次没填过，expect 只有 12% 的步带 ——
-            # 所以这条信号现在覆盖有限；tools.py 里 expect 的描述该改成「换页动作请填」，等 token 重标一起改。
+            # ⚠ 2026-09-11：tap 的 expect 改成必填（tools.py）。先看「」里的字有没有新出现 ——
+            #   肯定信号，直接确认、不花钱看图；对不上才问判官。改之前留档里只有 9.7% 的点击带 expect，
+            #   这条复核只触发过 1 次。
             # on_change=True 让 guard.record_result 分得清这次 judged 是哪一路来的（那边的注释）。
-            eff = judge.did_action_work(before.image, new.image, action.describe(),
-                                        action.expect, self.asker)
-            if eff is not None:
-                res.extra["judged"] = {"worked": eff.worked, "confidence": eff.confidence,
-                                       "why": eff.why, "on_change": True}
-                if not eff.worked:
-                    res.hint = f"画面变了，但看图复核说没达到预期：{eff.why}。先确认自己在哪。"
+            matched = expect_met_by_text(action.expect, t.added) if action.name == "tap" else None
+            if matched is not None:
+                res.extra["expect_check"] = {"met": True, "by": "text", "matched": matched}
+            else:
+                # ⚠ 2026-09-11 终审：tap 在这里问「画面是不是预期的样子」（judge.met_expectation），
+                #   不问「这个动作生效了吗」（did_action_work，给「画面没变」那一侧写的）—— 画面已经变了，
+                #   按字面答「点中了、页面动了 = 生效」会放过错页面。非 tap 动作行为不变。
+                #   judged 的键名保持 worked / on_change：guard 的 off_track、孪生的记账都读它，改名会静默坏掉。
+                ask = judge.met_expectation if action.name == "tap" else judge.did_action_work
+                eff = ask(before.image, new.image, action.describe(), action.expect, self.asker)
+                if eff is not None:
+                    res.extra["judged"] = {"worked": eff.worked, "confidence": eff.confidence,
+                                           "why": eff.why, "on_change": True}
+                    if not eff.worked:
+                        res.hint = f"画面变了，但看图复核说没达到预期：{eff.why}。先确认自己在哪。"
+                if action.name == "tap":
+                    res.extra["expect_check"] = _vision_check(eff)
+        elif changed and action.name == "tap":
+            res.extra["expect_check"] = {"met": None, "by": "missing"}
+        # ---- 主屏 / Spotlight 上点图标（icon_above）也要核对打开的是不是那个 App ----
+        # ⚠ 2026-09-11 闸门 B 错归（runs/20260907-142838-fbc1:2）：模型在主屏第 2 页的前帧上
+        #   tap icon_above「设置」，点击那一刻手机其实已经翻到第 1 页（前帧过期），
+        #   同一位置是 Gemini —— 打开了 Gemini，孪生按标签记成「设置」。前帧里没有任何结构
+        #   信号能发现这件事：画面确实变了，点的也确实是 icon_above。只有**核对打开后的身份**
+        #   才能抓到，跟 open_app 用的是同一条规则（CLAUDE.md §7 一个规则一个入口）。
+        #   只记录核对结果：不改变这次点击算不算成功、不重试、不降级、不改 hint ——
+        #   执行层可以重试，不该替模型推断隐藏状态（CLAUDE.md §2）。
+        #   代价：这会让每次在主屏 / Spotlight 上点图标多一次看图调用（与 open_app 相同）。
+        if (action.name == "tap" and action.args.get("target") == "icon_above"
+                and res.ok and res.changed
+                and (looks_like_home(before) or in_spotlight(before))):
+            el = before.element(action.args.get("id")) if "id" in action.args else None
+            if el is not None and el.text.strip():
+                res.extra["identity"] = self._identity(el.text, new)
         # ---- 不光说「变了」，还要说**变成了什么** ----
         # changed=True 只是一个布尔。模型得自己从几十个元素里认出哪一格变了 ——
         # 2026-09-09 真机（记一笔账）：点了数字 1，金额从 '0.00' 变成 '1'，
@@ -404,13 +540,13 @@ class Executor:
         # 它以前只在 context_mode=state 时注入（loop.py），而默认是 window ——
         # 算出来了，然后扔掉。放进 extra 就落在「上一步结果」里，两种模式都看得到。
         #
-        # ⚠ tap_px 传 None：local_mad 是像素级循环，上面真正需要它时已经算过一次了，
-        #   这里再算一遍纯属白烧 CPU（而且结果上面已经用掉了）。
-        t = tr.transition(before, new, None, config.TRANSITION_LIST_MAX)
+        # t 已经在本函数前面算过（全量，供预期核对用），这里只按 TRANSITION_LIST_MAX 截断给模型，
+        # 对外输出与原来逐字节相同。
+        cap = config.TRANSITION_LIST_MAX
         if t.added:
-            res.extra["appeared"] = list(t.added)
+            res.extra["appeared"] = list(t.added[:cap])
         if t.removed:
-            res.extra["disappeared"] = list(t.removed)
+            res.extra["disappeared"] = list(t.removed[:cap])
         res.extra.update({k: v for k, v in extra.items() if not k.startswith("_")})
         return res, new
 
@@ -515,8 +651,8 @@ class Executor:
     def _type_via_ime(self, text: str, obs: Observation):
         """中文走 iOS 自己的输入法：发拼音 → 看候选 → 点选。
 
-        为什么必须这样：镜像只转发 keycode、不读事件里的 unicode 载荷（`设计说明`），
-        汉字没有 keycode 打不出来；而粘贴这条路在本环境实测不通（`设计说明`）。
+        为什么必须这样：镜像只转发 keycode、不读事件里的 unicode 载荷（`docs/14`），
+        汉字没有 keycode 打不出来；而粘贴这条路在本环境实测不通（`docs/15`）。
         剩下唯一能用的就是让 iOS 的输入法自己把拼音转成汉字。
 
         ⚠ 只认「剥掉编号后正好等于目标」的候选，不做包含匹配 ——
@@ -599,7 +735,7 @@ class Executor:
             #   空的意味着 iOS 键盘根本不在中文模式 —— 拼音字母是直接上屏的，
             #   再换个词、再试一次都没有用。2026-09-08 实测撞到过：
             #   打 'shezhi' 搜索框显示 'Q shezhi — 设置'，一个候选都没有。
-            #   输入法模式是个隐藏的全局量（设计说明），什么时候会变还没查清。
+            #   输入法模式是个隐藏的全局量（docs/14），什么时候会变还没查清。
             self.dev.backspace(len(pinyin))     # 只撤销自己打的那几个，绝不多删
             frame, settled = settle(self.dev, frame, IOS_TIMING["type"], ahash)
             new = self.per.observe(frame)
@@ -752,10 +888,10 @@ class Executor:
         reached_end = False
         still = 0               # 连续几屏没变化 —— 见下面为什么不能只看一次
         # ⚠ 「一次都没动过」和「滚到底了」是两回事，必须分开报。
-        #   2026-09-08 真机（runs/example-run）：在通用页 scroll_until
+        #   2026-09-08 真机（runs/20260908-022551-5204）：在通用页 scroll_until
         #   找「关于本机」，滚了两次画面纹丝不动，工具报「滚不动了（到底/到顶）」。
         #   模型于是相信关于本机不在通用里，改去设置首页找，把「更新到 iOS 26.6.1」
-        #   这条**可更新版本**当成当前版本报了 done(success) —— 设备版本与报告不一致。
+        #   这条**可更新版本**当成当前版本报了 done(success) —— 真值是 18.3.1。
         #   误导性的诊断直接造出了一次假成功。
         any_change = False
         truncated = False
@@ -865,42 +1001,91 @@ class Executor:
     def _identity(self, name: str, new: Observation) -> dict:
         """点完之后问看图的那一方：进的是不是「name」。结果原样写进 extra["identity"]。
 
-        三条路（直达 / Spotlight / 翻主屏）报 ok 之前都过这一道 —— 一个规则一个入口（项目开发约定）。
+        三条路（直达 / Spotlight / 翻主屏）报 ok 之前都过这一道 —— 一个规则一个入口（CLAUDE.md §7）。
         verified=True/False 是看过图的结论；None = 没问成（没有看图的一方 / 调用失败 / 答非所问），
         照旧当开成了，但「没核对」留在结果里看得见（§3）。为什么每次都问见 judge.is_target_app。
+
+        ⚠ 2026-09-12（spec §5.3）：新帧的整屏解析本来就标了「这一屏属于哪个 App」。标注换算出的 App id
+          与 name 对上 = 看过图的肯定结论，直接用，省掉一次单独的看图调用。对不上可能只是叫法不同
+          （「App Store」/「应用商店」）—— 否定结论，照旧交给 judge 复核（CLAUDE.md §2）；
+          judge 确认进对了，就当场学一条 App 名别名，下次打开同一个 App 不必再问。
+
+        ⚠ 2026-09-14（spec 按需看图 §5.2）：on_demand 下 new 没有整屏标注，先补一次短标注再读 new.screen。
+          开对了的那一路，new 就是交回 loop 的 after 帧，loop 的 adopt 不会再标一次（幂等）；开错了换路的帧、
+          主屏 icon_above 的核验帧不进 loop，这次标注记为 identity。成本从一次整屏解析降到一次短标注。
         """
+        if self.per is not None:
+            self.per.ensure_label(new, "identity")
+        want = app_id_for(name)
+        label = getattr(new, "screen", None)
+        if label is not None:
+            try:
+                got = self.identity.resolve_app(label.app) if self.identity is not None else plain_app_id(label.app)
+            except Exception:       # noqa: BLE001 —— 孪生坏了 = 没有孪生，退回问 judge
+                got = None
+            if got is not None and got == want:
+                return {"verified": True, "by": "screen_label", "seen": label.app}
         chk = judge.is_target_app(new.image, name, self.asker)
-        if chk is None:
-            return {"verified": None}
-        return {"verified": chk.is_app, "confidence": chk.confidence, "seen": chk.seen, "why": chk.why}
+        out = ({"verified": None} if chk is None else
+               {"verified": chk.is_app, "confidence": chk.confidence, "seen": chk.seen, "why": chk.why})
+        out["by"] = "judge"
+        if label is not None:
+            out["label_app"] = label.app
+            if chk is not None and chk.is_app and self.identity is not None:
+                try:
+                    self.identity.learn_app_alias(label.app, want)
+                except Exception:   # noqa: BLE001
+                    pass
+        return out
 
     def _open_app(self, name: str, obs: Observation):
-        """开 App：先查布局表直达（`_open_app_from_layout`），走不通走 Spotlight（`_open_app_via_spotlight`）。
+        """开 App：三条路按顺序，前一条没开成才走下一条。
 
-        直达没成的原因（LAYOUT_MISSES 之一）写进**最终返回的那个结果**的 extra["layout_miss"] ——
-        不论后面是 Spotlight 成功、翻主屏成功还是 app_not_found。原来这几种没成全都不留痕，
+        1. 查布局表直达（`_open_app_from_layout`）：回第一页、翻到表里那一页、当前帧上找到标签、点。
+        2. 翻主屏找（`_open_app_from_home`）：回第一页、一页页往右翻（每页只跑 OCR）、找到就点。
+        3. Spotlight 打字（`_open_app_via_spotlight`）：只在主屏上没开成时才走，是最后一条路。
+
+        直达没成的原因（LAYOUT_MISSES 之一）写进**最终返回的那个结果**的 extra["layout_miss"]，
+        翻主屏没成的原因（HOME_MISSES 之一）写进 extra["home_miss"] ——
+        不论后面是翻主屏成功、Spotlight 成功还是 app_not_found。原来这几种没成全都不留痕，
         评测里「表里没有 / 当前帧找不到标签 / 点完还在主屏」统统显示成 Spotlight，
-        和根本没有布局表时一模一样（项目开发约定 失败必须能被看见）。没表不记：没表 = 没尝试。
+        和根本没有布局表时一模一样（CLAUDE.md §3 失败必须能被看见）。没表不记：没表 = 没尝试。
 
         每条路点开之后都核对身份（`_identity`）：看图说「不是」就不算开成，换下一条路走；
         一路上开错的每一次都记进最终结果的 extra["wrong_app"]（开错了哪条路、点了什么、看图说是什么）。
+        三条路都没成时，最终结果是 Spotlight 那条路的 app_not_found，extra["typed"] 照带 ——
+        恢复阶梯靠 typed=False 认出键盘通道死了（_channel_failure）。
         """
-        # ⚠ 先查布局表直达：翻页 + 点图标，零打字。打字是这个项目最脆的通道（设计说明 的键盘排查
+        # ⚠ 先查布局表直达：翻页 + 点图标，零打字。打字是这个项目最脆的通道（docs/15 的键盘排查
         #   全在 Spotlight 上撞的；2026-09-08 批跑 39/40 次打字失败），能不打就不打。
         #   走不通（表里没有 / 翻到了当前帧上没这个标签 / 点了还在主屏）退回 Spotlight，
         #   那条路原样不动。
+        # ⚠ 2026-09-14：顺序从「直达 → Spotlight → 翻主屏（Spotlight 的退路）」改成「直达 → 翻主屏 → Spotlight」。
+        #   · 布局表只有第 1 页（扫描只扫可见页、刷新从不追加）；这台手机上设置 / 备忘录 / 提醒事项在第 2 页、
+        #     记账本在第 3 页 —— 直达 layout_miss=no_hit 23/23 次，等于没有；
+        #   · 翻主屏那条退路每页做一次完整观察（OCR + 整屏视觉解析，20–30 秒），为比 aHash 又完整观察一次，
+        #     每翻一页还硬等 2 秒 —— 中位 112 秒（n=23），比 Spotlight（44–53 秒）还慢；
+        #   · 打字仍是最脆的通道（上一条 ⚠）。
+        #   现在翻主屏每页只跑 OCR、只在要点之前等翻页，排到打字前面；翻过的页按真实页序写回布局表，
+        #   下一次直达就用得上 —— 这台手机的「了解」随使用增长，而不是永远只有第 1 页。
         wrong: list[dict] = []
         direct = self._open_app_from_layout(name, obs, wrong)
         if isinstance(direct, tuple):
             return direct
-        res, new = self._open_app_via_spotlight(name, obs, wrong)
+        home = self._open_app_from_home(name, obs, wrong)
+        if isinstance(home, tuple):
+            res, new = home
+        else:
+            res, new = self._open_app_via_spotlight(name, obs, wrong, home)
+            res.extra["home_miss"] = home["why"]
         if direct is not None:
             res.extra["layout_miss"] = direct
         if wrong:
             res.extra["wrong_app"] = wrong
         return res, new
 
-    def _open_app_via_spotlight(self, name: str, obs: Observation, wrong: list | None = None):
+    def _open_app_via_spotlight(self, name: str, obs: Observation, wrong: list | None = None,
+                                home: dict | None = None):
         """Spotlight 打开 App：输入 → 确认输入落屏 → **点匹配的那一行**，不盲按回车。
 
         原实现有两个真缺陷（2026-09-07 真机暴露）：
@@ -912,6 +1097,9 @@ class Executor:
 
         现在：输入后只在**搜索框那一行**上找目标文字来确认输入成功；再在结果列表里
         找文字匹配的那一行去点它。两处都失败才报 app_not_found。
+
+        home：这次 open_app 翻主屏没开成的经过（`_open_app_from_home` 交回的 dict），报 app_not_found 时
+        写进 hint；None = 没翻过主屏。
         """
         wrong = [] if wrong is None else wrong
         self.dev.key("spotlight")
@@ -920,12 +1108,12 @@ class Executor:
 
         # ⚠ 中文 App 名**不走输入法**，直接打拼音字母。
         #   2026-09-08 实测：Spotlight 自己就按拼音匹配 App 名 ——
-        #   干净的搜索框里打 "yimujizhang"，「一木记账」直接出现在「最佳搜索结果」；
+        #   干净的搜索框里打 "jizhangben"，「记账本」直接出现在「最佳搜索结果」；
         #   而空搜索框里它不在（对照过，基线是干净的）。
         #
-        #   为什么不走输入法：「一木记账」这种 App 名根本不在输入法词库里，
-        #   打 yimujizhang 给出的候选是「以募集章」「一目几张」，永远选不中。
-        #   而 dev.type() 拿到中文会走粘贴通道，粘贴在本环境实测不通（设计说明）。
+        #   为什么不走输入法：「记账本」这种 App 名根本不在输入法词库里，
+        #   打 jizhangben 给出的候选是同音的普通词组，永远选不中 App 名。
+        #   而 dev.type() 拿到中文会走粘贴通道，粘贴在本环境实测不通（docs/15）。
         #   所以以前 open_app 对中文 App 名是**坏的** —— 之前能打开纯属侥幸：
         #   模型手搓的流程里输入法失败了，反而把拼音字母留在了框里。
         query = spotlight_query(name)
@@ -943,7 +1131,9 @@ class Executor:
             #   39/40 次打字失败，而同一时间点击 6/6、滚动正常）—— 那时候 open_app
             #   就彻底没辙，整个任务卡死在"打不开 App"上。
             #   所以退路必须走**另一条通道**：回主屏、翻页、点图标，全程只用点击和滚动。
-            return self._open_app_from_home(name, obs, typed, query, wrong)
+            # ⚠ 2026-09-14：那条不打字的路现在排在 Spotlight **前面**（_open_app）。走到这里说明这次
+            #   open_app 刚在主屏翻过、没开成；再翻一遍只会得到同一个结论，还白花几十秒 —— 不翻，直接报。
+            return self._spotlight_gave_up(name, typed, query, home, cand)
 
         sx, sy = image_to_screen(*row.center, self._frame_of(cand))
         self.dev.tap(sx, sy)
@@ -964,15 +1154,16 @@ class Executor:
             new = self.per.observe(frame)
             via = "icon_above"
             if in_spotlight(new):
-                return self._open_app_from_home(name, obs, typed, query, wrong)
+                return self._spotlight_gave_up(name, typed, query, home, new)
         # ⚠ 离开了 Spotlight ≠ 进了目标 App。2026-09-10 真机：打字没落屏，搜索框里留着旧词
         #   beiwanglu，结果列表底部的分组标题「设置」被精确匹配中；点它没反应 → 点它上方 →
-        #   进了一条备忘录 → 报 ok via=icon_above（runs/example-run）。
+        #   进了一条备忘录 → 报 ok via=icon_above（runs/20260910-193640-bfd7）。
         #   身份交给看图的一方；说不是就当没开成，走不打字的那条退路。
+        #   （2026-09-14 起那条退路排在前面、已经走过了，这里直接报 app_not_found，见上面 row is None 那条 ⚠。）
         ident = self._identity(name, new)
         if ident["verified"] is False:
             wrong.append({"via": via, "tapped": row.text, "seen": ident["seen"], "why": ident["why"]})
-            return self._open_app_from_home(name, obs, typed, query, wrong)
+            return self._spotlight_gave_up(name, typed, query, home, new)
         ch = did_change(cand, new)
         return (ToolResult(ok=True, changed=ch.changed, hamming=ch.hamming, text_diff=ch.text_diff,
                            settled=settled, hint=None if ch.changed else HINTS["open_app"],
@@ -983,8 +1174,8 @@ class Executor:
     def _open_app_from_layout(self, name: str, obs: Observation, wrong: list | None = None):
         """按布局表直达：回第一页 → 翻到第 k 页 → **在当前帧上找到标签** → 点标签上方的图标 → 核身份。
 
-        任何一步对不上都交给 Spotlight 那条路，绝不按旧行列盲点：布局表是参考，
-        当前帧才是真源（设计说明 第 3 条）。点完 in_spotlight / looks_like_home / 还是同一页网格
+        任何一步对不上都交给下一条路（翻主屏找），绝不按旧行列盲点：布局表是参考，
+        当前帧才是真源（docs/32 §0 第 3 条）。点完 in_spotlight / looks_like_home / 还是同一页网格
         任一成立就不算开成 —— 和 Spotlight 那条路一样，开没开成看身份不看画面变没变（2026-09-10）。
 
         返回三种之一：(ToolResult, 新观察) = 开成了；str = 没开成的原因（LAYOUT_MISSES 之一）；
@@ -995,7 +1186,7 @@ class Executor:
         wrong = [] if wrong is None else wrong
         # ⚠ 2026-09-10 终审（I2）：表里一个 label 是 123，find_app 抛 AttributeError，冒到 _run_once
         #   的 `except Exception` 变成 device_error —— Spotlight 一次都没按，本来能开的 App 开不了。
-        #   孪生任何一处坏了都等于没有孪生（设计说明 不变式 5），所以**孪生自己的逻辑**（查表、页码校验、
+        #   孪生任何一处坏了都等于没有孪生（docs/32 不变式 5），所以**孪生自己的逻辑**（查表、页码校验、
         #   标签归一化）包起来，坏了记 error 退回 Spotlight。**设备调用（key/scroll/tap/capture/observe）
         #   不包**：设备的异常照旧往外抛，与 Spotlight 那条路一致 —— 镜像断了不是「表没用上」，
         #   吞掉它再去走 Spotlight 只会在一个死通道上再撞一次，还把真正的原因藏起来。
@@ -1005,20 +1196,23 @@ class Executor:
                 return "no_hit"
             if not 1 <= hit.page_order <= config.HOME_PAGES_MAX:
                 return "page_out_of_range"      # 表被写坏 / 手改：别翻 49 页再退回来
-            want = norm_label(hit.label)
+            want = hit.label
+            if not isinstance(want, str):
+                raise TypeError(f"label 不是 str：{want!r}")
         except Exception:       # noqa: BLE001 —— 孪生坏了 = 没有孪生
             return "error"
         return_to_first_home_page(self.dev, self._frame_of(obs))
         frame = self.dev.capture()
+        rested_at = None
         for _ in range(hit.page_order - 1):
             self.dev.scroll("right", "page")
             frame, _ = settle(self.dev, frame, IOS_TIMING["scroll"], ahash)
-            time.sleep(config.AFTER_PAGE_FLIP_S)    # 翻页后 2 秒不可点（config 里那条注释）
-            frame = self.dev.capture()
-        cur = self.per.observe(frame)
-        # 标签相等用和查表同一个 norm_label（去空格、不分大小写）：OCR 把「App Store」读成
-        # 「App store」时，查表命中而这里找不到，就白回一趟主屏。
-        label = next((e for e in cur.elements if norm_label(e.text) == want), None)
+            rested_at = time.monotonic()    # 翻页后 2 秒不可点（config 里那条注释）：点之前等满，不是每翻一页等
+        # ⚠ 2026-09-14：点之前这一帧只跑 OCR —— 要的只是标签在哪；整屏视觉解析一次 20–30 秒。
+        cur = self.per.observe_text(frame)
+        # 标签匹配用和查表同一条规则 match_label（norm_label 去空格、不分大小写，精确优先、包含只认唯一）：
+        # OCR 把「App Store」读成「App store」时，查表命中而这里找不到，就白回一趟主屏。
+        label = match_label(want, cur.elements, key=lambda e: e.text)
         if label is None:
             return "label_missing"            # 布局过时（用户挪了图标 / 翻错页）：不猜
         iy = icon_y_above_label(label.center[1], label.box)
@@ -1026,6 +1220,7 @@ class Executor:
             sx, sy = image_to_screen(label.center[0], iy, self._frame_of(cur))
         except OutOfWindow:
             return "out_of_window"
+        wait_out_page_flip(rested_at)
         self.dev.tap(sx, sy)
         frame, settled = settle(self.dev, frame, IOS_TIMING["open_app"], ahash)
         new = self.per.observe(frame)
@@ -1049,67 +1244,109 @@ class Executor:
                                   "identity": ident}),
                 new)
 
-    def _open_app_from_home(self, name: str, obs: Observation, typed: bool, query: str,
-                            wrong: list | None = None):
-        """退路：回主屏幕，一页页翻着找 App 图标。**全程不打字。**
+    def _open_app_from_home(self, name: str, obs: Observation, wrong: list | None = None):
+        """第二条路：回主屏第一页，一页页往右翻着找 App 的标签，点它上方的图标。**全程不打字。**
 
         为什么值得单独做一条：Spotlight 要打字，而打字这条通道会整个死掉
         （2026-09-08 批跑：39/40 次打字失败，同一时间点击和滚动完全正常）。
-        退路走另一条通道，才在那种时候还救得回来。
+        这条路走另一条通道，才在那种时候还救得回来。2026-09-14 起它排在 Spotlight 前面（_open_app）。
+
+        翻页、认页、找标签交给 `twin/scan.walk_home_pages`（和 `iphone twin scan` 同一个例程）：
+        每页只跑 OCR，找标签用 match_label，翻过的页按真实页序写回布局表（有 layout_path 时）。
+        点开之后那一帧才做完整观察（per.observe）—— 它是下一步的观察，`_identity` 也要它的整屏标注。
+        设备的异常照旧往外抛（walk_home_pages 不包设备调用，和直达那条路一致）。
+
+        返回 (ToolResult, 新观察) = 开成了；否则一个 dict 说明怎么没成，交给 Spotlight 那条路：
+        {"why": HOME_MISSES 之一, "pages": 看过几页, 点过的话还有 "page"/"tapped"/"seen"}。
 
         ⚠ 点图标要用 `icon_above` —— 主屏幕上 OCR 只读得到图标**下面**的标签，
-          点标签本身打不开 App（`设计说明`）。
+          点标签本身打不开 App（`docs/14`）。
         ⚠ 翻页之后必须硬等 `AFTER_PAGE_FLIP_S`，见那个常量的注释。
+          （2026-09-14 起只在要点之前等满 —— wait_out_page_flip；只翻页找、不点的那几页不等。）
+        ⚠ 2026-09-14（M3 终审）：这个晚 import 原来没包 try —— import 本身失败（模块坏了 / 循环
+          import）会冒成 device_error，把整个 open_app 打断，Spotlight 一次都没走到。孪生（这里是
+          `twin.scan` 这个模块）坏了 = 没有孪生（docs/32 不变式 5），跟 walk 内部的异常处理是同一个
+          规矩，只是这次坏在 import 这一步：接住，交回 `{"why": "error"}`（和 walk 自己吐出来的
+          `stop="error"` 同一个语义），让 open_app 照旧退到 Spotlight。
         """
         wrong = [] if wrong is None else wrong
-        return_to_first_home_page(self.dev, self._frame_of(obs))
-        frame = self.dev.capture()
-        seen_pages = []
-        for page in range(config.HOME_PAGES_MAX):
-            cur = self.per.observe(frame)
-            hit = next((e for e in cur.elements if name in e.text), None)
-            if hit is not None:
-                y = icon_y_above_label(hit.center[1], hit.box)
-                self.dev.tap(*image_to_screen(hit.center[0], y, self._frame_of(cur)))
-                frame, settled = settle(self.dev, frame, IOS_TIMING["open_app"], ahash)
-                new = self.per.observe(frame)
-                if in_spotlight(new) or looks_like_home(new):
-                    # 点了图标还在主屏 / Spotlight：没开成。和 Spotlight 那条路一样，
-                    # 开没开成看身份不看变化 —— 报 ok 就是假成功（2026-09-10）。
-                    break
-                ident = self._identity(name, new)
-                if ident["verified"] is False:
-                    # 点的是「名字里含 {name}」的那个东西（包含匹配），进的却是别的 App：
-                    # 如实说点开了什么 —— 不能再说「翻了几页也没找到」，那是另一种失败。
-                    # error 仍是 app_not_found、typed 照带：打字通道失效的阶梯靠它俩触发。
-                    wrong.append({"via": "home_icon", "tapped": hit.text, "seen": ident["seen"],
-                                  "why": ident["why"]})
-                    return ToolResult(
-                        ok=False, error="app_not_found",
-                        hint=f"主屏第 {page + 1} 页上点了「{hit.text}」，打开的却不是「{name}」"
-                             f"（看图说现在是：{ident['seen'] or '别的界面'}）。先看清当前画面再决定下一步。",
-                        extra={"typed": typed}), new
-                ch = did_change(cur, new)
-                return (ToolResult(
-                    ok=True, changed=ch.changed, hamming=ch.hamming,
-                    text_diff=ch.text_diff, settled=settled,
-                    hint=f"Spotlight 那条路没走通（打字没落进去），"
-                         f"改在主屏第 {page + 1} 页上点开了「{name}」的图标。",
-                    extra={"via": "home_icon", "page": page + 1, "identity": ident}), new)
-            seen_pages.append(cur.ahash)
-            self.dev.scroll("right", "page")
-            frame, _ = settle(self.dev, frame, IOS_TIMING["scroll"], ahash)
-            time.sleep(config.AFTER_PAGE_FLIP_S)
-            frame = self.dev.capture()
-            if self.per.observe(frame).ahash in seen_pages:
-                break                          # 翻不动了（到最后一页），别空转
+        # scan 在模块级 import 了本模块，这里只能晚 import；import 本身也可能坏（M3, 见上）。
+        try:
+            from iphone_agent.twin import scan as twin_scan
+        except Exception:      # noqa: BLE001 —— import 坏了 = 没有孪生，走 Spotlight
+            return {"why": "error", "pages": 0}
+        walk = twin_scan.walk_home_pages(self.dev, self.per, self.layout_path, want=name,
+                                         layout=self.layout, start=self._frame_of(obs), log=_no_log)
+        if walk.layout is not None:
+            self.layout = walk.layout          # 同一个任务里下一次 open_app 直接用翻过的页
+        if walk.found is None:
+            why = walk.stop if walk.stop in ("not_home", "error") else "not_found"
+            return {"why": why, "pages": walk.looked}
+        f = walk.found
+        label = f.element
+        miss = {"pages": walk.looked, "page": f.order, "tapped": label.text}
+        iy = icon_y_above_label(label.center[1], label.box)
+        try:
+            sx, sy = image_to_screen(label.center[0], iy, self._frame_of(f.obs))
+        except OutOfWindow:
+            return miss | {"why": "out_of_window"}
+        wait_out_page_flip(f.rested_at)
+        self.dev.tap(sx, sy)
+        frame, settled = settle(self.dev, self._frame_of(f.obs), IOS_TIMING["open_app"], ahash)
         new = self.per.observe(frame)
+        if in_spotlight(new) or looks_like_home(new):
+            # 点了图标还在主屏 / Spotlight：没开成。和 Spotlight 那条路一样，
+            # 开没开成看身份不看变化 —— 报 ok 就是假成功（2026-09-10）。
+            return miss | {"why": "still_home"}
+        try:
+            same = _still_on_same_home_page(f.obs, new)
+        except Exception:       # noqa: BLE001 —— 孪生的网格推断坏了 = 没有孪生
+            return miss | {"why": "error"}
+        if same:
+            return miss | {"why": "still_home"}    # 第三方 App 页上点空了：画面还是这一页（M2）
+        ident = self._identity(name, new)
+        if ident["verified"] is False:
+            # 点的是 match_label 认出的那个标签，进的却是别的 App：如实记下点开了什么，换下一条路
+            wrong.append({"via": "home_icon", "tapped": label.text, "seen": ident["seen"],
+                          "why": ident["why"]})
+            return miss | {"why": "wrong_app", "seen": ident["seen"]}
+        ch = did_change(f.obs, new)
+        return (ToolResult(ok=True, changed=ch.changed, hamming=ch.hamming, text_diff=ch.text_diff,
+                           settled=settled,
+                           extra={"via": "home_icon", "page": f.order, "tapped": label.text,
+                                  "screen": [sx, sy], "identity": ident}),
+                new)
+
+    @staticmethod
+    def _home_summary(name: str, home: dict) -> str:
+        """翻主屏没开成的经过 → 一句话（写进 app_not_found 的 hint）。"""
+        why = home.get("why")
+        at = f"主屏第 {home.get('page')} 页上"
+        if why == "not_found":
+            return f"主屏翻了 {home.get('pages', 0)} 页也没找到这个图标"
+        if why == "not_home":
+            return "回到主屏后认不出主屏第 1 页，没有翻页找"
+        if why == "out_of_window":
+            return f"{at}找到了「{home.get('tapped')}」，但它上方的图标算出来在窗口外，没点"
+        if why == "still_home":
+            return f"{at}点了「{home.get('tapped')}」的图标，没打开"
+        if why == "wrong_app":
+            return (f"{at}点了「{home.get('tapped')}」，打开的却不是「{name}」"
+                    f"（看图说是：{home.get('seen') or '别的界面'}）")
+        return "在主屏上找的时候出错了"
+
+    def _spotlight_gave_up(self, name: str, typed: bool, query: str, home: dict | None, new: Observation):
+        """三条路都没开成：app_not_found。typed 照带 —— 恢复阶梯靠 typed=False 认出键盘通道死了。
+
+        hint 把两条路各自怎么没成都说出来：只说「Spotlight 没搜到」，模型会以为主屏上也没有；
+        只说「翻了几页没找到」，点开了别的 App 的那种失败就被说成了另一件事。
+        """
         why = ("Spotlight 里没有匹配的结果" if typed
                else f"{query!r} 没能输入到搜索框（打字通道可能失效了）")
+        tried = f"{self._home_summary(name, home)}；再用 Spotlight：{why}" if home is not None else why
         return ToolResult(
             ok=False, error="app_not_found",
-            hint=f"打不开「{name}」：{why}；退回主屏幕翻了 {page + 1} 页也没找到这个图标。"
-                 f"确认一下 App 名字对不对，或者它是不是在某个文件夹里。",
+            hint=f"打不开「{name}」：{tried}。确认一下 App 名字对不对，或者它是不是在某个文件夹里。",
             extra={"typed": typed}), new
 
     @staticmethod

@@ -8,9 +8,9 @@ from iphone_agent.skills.store import Catalog
 def catalog():
     cat = Catalog()
     cat.apps["settings"] = M.AppProfile("settings", "设置", "设置", "read", "verified", "2026-09-08", "系统设置")
-    cat.apps["yimujizhang"] = M.AppProfile("yimujizhang", "一木记账", "一木记账", "write", "verified", "2026-09-08", "记账")
+    cat.apps["jizhangben"] = M.AppProfile("jizhangben", "记账本", "记账本", "write", "verified", "2026-09-08", "记账")
     cat.apps["draft-app"] = M.AppProfile("draft-app", "草稿", "草稿", "write", "draft", "2026-09-08", "")
-    cat.scenarios["daily-expense"] = M.Scenario("daily-expense", "记今天的账", ("alipay", "yimujizhang"), "write", "manual", "…")
+    cat.scenarios["daily-expense"] = M.Scenario("daily-expense", "记今天的账", ("alipay", "jizhangben"), "write", "manual", "…")
     cat.scenarios["proposed"] = M.Scenario("proposed", "x", ("settings",), "read", "proposed", "…")
     return cat
 
@@ -21,11 +21,11 @@ def reply(scenario, apps, reason="因为", name="route"):
 
 
 def test_messages_contain_index_task_and_name_hints():
-    msgs = R.routing_messages("【知识】…", "把今天的花销记进一木记账，别动设置", catalog())
+    msgs = R.routing_messages("【知识】…", "把今天的花销记进记账本，别动设置", catalog())
     assert msgs[0]["role"] == "system" and msgs[0]["content"] == R.ROUTE_SYSTEM
     text = msgs[1]["content"][0]["text"]
     assert "【知识】…" in text and "任务：把今天的花销" in text
-    assert "yimujizhang" in text and "settings" in text and "误命中" in text
+    assert "jizhangben" in text and "settings" in text and "误命中" in text
 
 
 def test_parse_keeps_only_names_that_exist_and_are_visible():
@@ -50,12 +50,12 @@ def test_resolve_scenario_decides_apps_and_ignores_model_apps():
     r = R.parse_route(reply("daily-expense", ["settings"]), cat)
     scen, expand, scope = R.resolve(r, cat)
     assert scen.name == "daily-expense"
-    assert [a.name for a in expand] == ["yimujizhang"], "alipay 不在 catalog 里，只展开存在且 verified 的"
-    assert scope == ["alipay", "yimujizhang"]
+    assert [a.name for a in expand] == ["jizhangben"], "alipay 不在 catalog 里，只展开存在且 verified 的"
+    assert scope == ["alipay", "jizhangben"]
 
 
 def test_resolve_apps_only_and_nothing():
     cat = catalog()
-    scen, expand, scope = R.resolve(R.parse_route(reply("", ["yimujizhang", "settings"]), cat), cat)
-    assert scen is None and [a.name for a in expand] == ["yimujizhang", "settings"] and scope == ["yimujizhang", "settings"]
+    scen, expand, scope = R.resolve(R.parse_route(reply("", ["jizhangben", "settings"]), cat), cat)
+    assert scen is None and [a.name for a in expand] == ["jizhangben", "settings"] and scope == ["jizhangben", "settings"]
     assert R.resolve(R.parse_route(reply("", []), cat), cat) == (None, [], None)

@@ -1,6 +1,6 @@
 """「连接暂停」自愈：点「继续」之后要给握手留够时间，握手期间不能再点。
 
-iphone-use 真机记录（`iphone-use upstream: crates/server/src/main.rs:465-469`，2026-06-12）：
+iphone-use 真机记录（`reference/iphone-use/crates/server/src/main.rs:465-469`，2026-06-12）：
 镜像重连握手要 10–30 秒，**握手中途落下的一次点击会取消它**，急着重试会把
 「能连上」变成「连上就断」。所以点完「继续」只能看，不能点；看够一个握手窗口还没回来，
 才允许第二次。
