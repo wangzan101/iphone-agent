@@ -23,7 +23,14 @@ def frame_with_text(texts, frame_id, w=400, h=800, rect=Rect(0, 0, 200, 400), fi
 
 
 class FakeDevice:
-    """帧序列可编程；记录所有动作调用。"""
+    """帧序列可编程；记录所有动作调用。
+
+    ⚠ 2026-09-16：帧是按 **capture 次数** 往后走的，而 settle 轮询几次由墙钟决定
+      （判稳看的是 stable_span_ms，慢机器上一次轮询就够）—— 用「前 N 帧是旧页、后面是新页」
+      编排「动作前后画面不同」的测试，在 CI 的 macOS runner 上会读到前后同一帧，changed=False。
+      要验「动作让画面变了」，用 ActionDrivenDevice / action_env：页面只随动作切，截图次数再怎么变都不影响。
+      这个类留给**真的要逐帧动画**（渐变、加载中）的测试。
+    """
     def __init__(self, frames):
         self._frames = list(frames)      # [(Frame, texts)]
         self.calls = []
@@ -282,6 +289,36 @@ def settle_clock(monkeypatch, request):
 
     clock = Clock()
     monkeypatch.setattr(settle_mod, "time", clock)
+    return clock
+
+
+@pytest.fixture
+def loop_clock(monkeypatch):
+    """冻结 loop 看到的 `time.time()`，只由测试显式推进（别的时间函数照旧走真实 time）。
+
+    ⚠ 2026-09-16：验「时限刚好用完」的用例原来靠模型 `time.sleep(0.5)` 加上前五步的真实耗时
+      去逼近 timeout_s=0.6 —— 前五步在开发机上几十毫秒、在 CI 的 macOS runner 上就超了 0.6s，
+      时限在第 6 步之前先炸，end_reason 成了 timeout。改成推进这只钟：loop 比的是
+      `time.time() - started`，钟不自己走，「第几次决策时花掉多少预算」就是测试写死的那一个数，
+      跟机器快慢无关。
+    """
+    import iphone_agent.harness.loop as loop_mod
+
+    class Clock:
+        def __init__(self):
+            self.now = time.time()
+
+        def time(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+        def __getattr__(self, name):        # sleep / perf_counter 等一律照旧
+            return getattr(time, name)
+
+    clock = Clock()
+    monkeypatch.setattr(loop_mod, "time", clock)
     return clock
 
 

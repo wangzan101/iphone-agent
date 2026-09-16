@@ -61,13 +61,16 @@ def test_note_does_not_touch_the_frozen_prefix(fake_env, tmp_path):
     assert log.prefix_hash() == before
 
 
-def test_time_spent_paused_does_not_count_toward_timeout(fake_env, tmp_path):
+def test_time_spent_paused_does_not_count_toward_timeout(fake_env, tmp_path, loop_clock):
+    """⚠ 2026-09-16：原来暂停的 0.6 秒是真睡的，timeout_s=0.5 里还要装下其余各步的真实耗时 ——
+    慢机器（CI 的 macOS runner）上没暂停也会超时，这条用例就变成在考机器快慢。
+    改成推 loop 的钟：暂停花掉 0.6 秒是构造的，别的步不耗预算。"""
     calls = {"n": 0}
 
     def wait_if_paused():
         calls["n"] += 1
         if calls["n"] == 2:
-            time.sleep(0.6)
+            loop_clock.advance(0.6)
         return None
 
     r, dev, m = run(fake_env, [["通用"], ["关于本机"], ["关于本机"], ["关于本机"]], [TAP, DONE], tmp_path,

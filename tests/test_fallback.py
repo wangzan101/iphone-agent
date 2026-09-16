@@ -1,6 +1,5 @@
 """放弃或熔断之前，程序补看一次全屏（spec 2026-09-14 §3.5）：不看屏幕内容，只在两个程序自己知道的时刻补证据。"""
 import json
-import time
 from dataclasses import replace
 
 from iphone_agent.harness.loop import run_task
@@ -126,22 +125,32 @@ def test_no_progress_stop_on_the_last_allowed_step_ends_clean_without_a_wasted_f
     assert not [x for x in _recs(r) if x.get("by") == "program"]
 
 
-class SlowAtSixthDecision(FirstTapExpectsModel):
-    """在熔断本该触发兜底的第 6 次决策前睡到明显超过 timeout_s，逼近『决定要不要兜底那一刻』
-    时限已经用完（评审发现 1，时限分支——和步数分支走同一条预算判断）。"""
+class BurnsBudgetAtSixthDecision(FirstTapExpectsModel):
+    """在熔断本该触发兜底的第 6 次决策里把任务时限花光，逼近『决定要不要兜底那一刻』
+    时限已经用完（评审发现 1，时限分支——和步数分支走同一条预算判断）。
+
+    ⚠ 2026-09-16：原来是 `time.sleep(0.5)` 配 timeout_s=0.6，剩下的 0.1s 要装下前五步的真实耗时——
+      CI 的 macOS runner 上前五步就超了 0.1s，循环顶部的时限判断先于第 6 步触发，
+      end_reason 变成 timeout。现在不睡觉：直接把 loop 的钟推过时限（loop_clock），
+      「跑到第 6 步时预算还在、决策完就没了」是构造出来的，不是掐出来的。
+    """
+
+    def __init__(self, scripts, clock, spend):
+        super().__init__(scripts)
+        self._clock, self._spend = clock, spend
 
     def decide(self, messages, image_size, tools=None, max_tokens=None):
-        if len(self.seen) == 5:
-            time.sleep(0.5)
+        if len(self.seen) == 5:                 # 第 6 次决策；循环顶部的时限判断已经过了
+            self._clock.advance(self._spend)
         return super().decide(messages, image_size, tools, max_tokens)
 
 
-def test_no_progress_stop_near_timeout_ends_clean_without_a_wasted_fallback(action_env, tmp_path):
-    """沿用第一次熔断兜底那个用例的画面（两屏来回，第 6 步会判 stop）；这里给一个刚好够跑到
-    第 6 步、但不够再打一次整屏解析的 timeout_s，验证兜底真的被跳过而不是白打一次再被时限吞掉。"""
+def test_no_progress_stop_near_timeout_ends_clean_without_a_wasted_fallback(action_env, tmp_path, loop_clock):
+    """沿用第一次熔断兜底那个用例的画面（两屏来回，第 6 步会判 stop）；时限在第 6 次决策里刚好用完，
+    验证兜底真的被跳过而不是白打一次再被时限吞掉。"""
     dev, per, _ = action_env([LOOP[0]] * INITIAL_SETTLE_FRAMES + LOOP, LOOP_MOVES)
     per.asker = WrongPageJudge()
-    m = SlowAtSixthDecision(TAPS)
+    m = BurnsBudgetAtSixthDecision(TAPS, loop_clock, spend=0.9)
     r = run_task("t", dev, per, m, tmp_path, run_config=RunConfig(screen_parse="on_demand"),
                  store=isolated_store(tmp_path), workspace=Workspace(tmp_path), timeout_s=0.6)
     assert r.end_reason == "no_progress" and r.steps == 6

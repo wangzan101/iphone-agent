@@ -84,9 +84,12 @@ def test_human_declining_ends_the_run_as_handover(fake_env, tmp_path):
     assert r.end_reason == "handover" and len(m.seen) == 1
 
 
-def test_time_waiting_for_the_human_does_not_count_toward_timeout(fake_env, tmp_path):
+def test_time_waiting_for_the_human_does_not_count_toward_timeout(fake_env, tmp_path, loop_clock):
+    """⚠ 2026-09-16：原来人「花」的 0.6 秒是真睡的，timeout_s=0.5 里要装下其余各步的真实耗时 ——
+    慢机器（CI 的 macOS runner）上光是那几步就超时了，验的东西还没验到就先炸。
+    改成推 loop 的钟：等人的 0.6 秒是钟走出来的，别的步不耗预算，扣不扣得对一目了然。"""
     def slow(need, reason):
-        time.sleep(0.6)
+        loop_clock.advance(0.6)
         return ""
 
     r, dev, m = run(fake_env, [["登录"]] * 6, [HAND, DONE], tmp_path, on_handover=slow, timeout_s=0.5)

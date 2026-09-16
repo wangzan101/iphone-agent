@@ -462,7 +462,7 @@ def test_open_app_types_pinyin_not_chinese(fake_env):
     2026-09-08 实测：Spotlight 自己按拼音匹配 App 名 —— 干净的搜索框里打
     "jizhangben"，「记账本」直接出现在「最佳搜索结果」（空框里它不在，对照过）。
 
-    不能走输入法：「记账本」这种 App 名不在词库里，候选是同音的普通词组，
+    不能走输入法：「记账本」不在词库里，候选是「以募集章」「一目几张」，
     永远选不中；而 dev.type() 拿到中文会走粘贴，粘贴在本环境不通（docs/15）。
     """
     dev, per, _ = fake_env([["Q 搜索"]] * 4 + [["Q 搜索", "记账本"]] * 6)
@@ -1037,10 +1037,16 @@ def _icon_of(obs, text):
     return next(e for e in obs.elements if e.text == text)
 
 
-def test_icon_above_tap_on_home_verifies_identity_when_it_leaves_home(fake_env):
+# ⚠ 2026-09-16：这一组原来用 fake_env（帧按 capture 次数往后走：前 4 帧主屏、后 8 帧新页），
+#   靠「settle 会轮询几次」刚好把动作后的帧落在新页上。轮询次数是墙钟决定的
+#   （settle 按 stable_span_ms 判稳，慢机器上一次轮询就够 20ms），CI 的 macOS runner 上
+#   settle 只轮询两次就返回，动作后的帧还停在主屏 —— 前后同一张图，changed=False，
+#   四个用例一起挂。改成 action_env：画面只在 tap 时切页，截图多少次都不动，
+#   轮询次数再怎么变都不影响「点之前是主屏、点之后是新页」。
+def test_icon_above_tap_on_home_verifies_identity_when_it_leaves_home(action_env):
     """主屏帧上 tap icon_above 点「设置」、画面变了、看图说是 → verified True，ok 仍为真。"""
     from tests.conftest import SeesApps
-    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 4 + [["通用", "关于本机"]] * 8)
+    dev, per, frames = action_env([["设置", "微信", "相机"], ["通用", "关于本机"]], {(0, "tap"): 1})
     obs = per.observe(dev.capture())
     label = _icon_of(obs, "设置")
     asker = SeesApps(frames, lambda texts: "设置" if "通用" in texts else "主屏")
@@ -1051,10 +1057,10 @@ def test_icon_above_tap_on_home_verifies_identity_when_it_leaves_home(fake_env):
     assert "通用" in new.text_set
 
 
-def test_icon_above_tap_on_home_verified_false_does_not_change_ok_or_hint(fake_env):
+def test_icon_above_tap_on_home_verified_false_does_not_change_ok_or_hint(action_env):
     """看图说不是「设置」→ verified False，但只记录：不改这次点击算不算成功、不改 hint。"""
     from tests.conftest import SeesApps
-    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 4 + [["你好", "新建备忘录"]] * 8)
+    dev, per, frames = action_env([["设置", "微信", "相机"], ["你好", "新建备忘录"]], {(0, "tap"): 1})
     obs = per.observe(dev.capture())
     label = _icon_of(obs, "设置")
     asker = SeesApps(frames, lambda texts: "备忘录" if "你好" in texts else "主屏")
@@ -1065,11 +1071,11 @@ def test_icon_above_tap_on_home_verified_false_does_not_change_ok_or_hint(fake_e
     assert res.hint is None, "只记录核对结果，不改 hint"
 
 
-def test_icon_above_tap_off_home_and_off_spotlight_is_not_identity_checked(fake_env):
+def test_icon_above_tap_off_home_and_off_spotlight_is_not_identity_checked(action_env):
     """App 内点底部 tab 图标（同样是 icon_above）：动作前那一帧不是主屏也不是 Spotlight，
     不核身份、也不该问看图。"""
     from tests.conftest import SeesApps
-    dev, per, frames = fake_env([["聊天", "通讯录", "发现", "我"]] * 4 + [["会话列表"]] * 8)
+    dev, per, frames = action_env([["聊天", "通讯录", "发现", "我"], ["会话列表"]], {(0, "tap"): 1})
     obs = per.observe(dev.capture())
     label = _icon_of(obs, "我")
     asker = SeesApps(frames, lambda texts: "会话")
@@ -1080,10 +1086,10 @@ def test_icon_above_tap_off_home_and_off_spotlight_is_not_identity_checked(fake_
     assert asker.asked == [], "非主屏 / 非 Spotlight 不该问看图"
 
 
-def test_icon_above_tap_on_home_with_no_screen_change_is_not_identity_checked(fake_env):
+def test_icon_above_tap_on_home_with_no_screen_change_is_not_identity_checked(action_env):
     """点了但画面没变：不核身份。"""
     from tests.conftest import SeesApps
-    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 8)
+    dev, per, frames = action_env([["设置", "微信", "相机"]], {})
     obs = per.observe(dev.capture())
     label = _icon_of(obs, "设置")
     asker = SeesApps(frames, lambda texts: "主屏")
@@ -1094,9 +1100,9 @@ def test_icon_above_tap_on_home_with_no_screen_change_is_not_identity_checked(fa
     assert asker.asked == []
 
 
-def test_icon_above_tap_on_home_without_an_asker_is_verified_none(fake_env):
+def test_icon_above_tap_on_home_without_an_asker_is_verified_none(action_env):
     """没有看图的一方：verified None，照记即可（§3 失败必须能被看见）。"""
-    dev, per, frames = fake_env([["设置", "微信", "相机"]] * 4 + [["通用", "关于本机"]] * 8)
+    dev, per, frames = action_env([["设置", "微信", "相机"], ["通用", "关于本机"]], {(0, "tap"): 1})
     obs = per.observe(dev.capture())
     label = _icon_of(obs, "设置")
     res, new = Executor(dev, per).run(
