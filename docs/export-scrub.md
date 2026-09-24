@@ -102,10 +102,11 @@ whatever was on the screen that day. Substitutions applied so far:
   numbered design doc, which does not ship.
 - `knowledge/apps/files/APP.md`: the truncated-filename example was a real file
   from the maintainer's iCloud Drive; public uses an invented filename.
-- Device model strings (`iPhone 16e`) are device identifiers. Existing public
-  text uses either a bare `iPhone` (`iphone_agent/health.py`) or a different
-  model number where a concrete-looking example reads better
-  (`tests/test_bench.py`). Either is fine; do not reintroduce the real one.
+- The maintainer's exact phone model is a device identifier; do not write it
+  here either. Existing public text uses either a bare `iPhone`
+  (`iphone_agent/health.py`) or an unrelated model number where a
+  concrete-looking example reads better (`tests/test_bench.py`). Either is
+  fine; do not reintroduce the real one.
 - Third-party app names that merely appear as home-screen labels or as apps a
   task drives (微博, 小红书, Reddit, YouTube, Chrome …) are not private and stay.
   The bookkeeping app in §2 and §3 is the exception, because it is the one the
