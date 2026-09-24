@@ -94,7 +94,7 @@ def test_not_done_success_fails_whatever_the_screens_say(tmp_path):
 
 def test_generic_only_success_is_trusted_when_the_answer_screen_was_reached(tmp_path):
     """只开了 App、滚了几屏就报成功，但到过的屏幕上确实有答案（屏幕检查通过）：答案能从屏幕上读到，
-    不算编的。2026-09-11 前这条规则在 tasks-20260910-192636 里误杀了 12 次里的 8 次 ——
+    不算编的。2026-09-11 前这条规则在一次真机 tasks 跑里误杀了 12 次里的 8 次 ——
     打开备忘录直接读列表、打开设置直接读版本，本来就不需要点击。"""
     steps = [_step(1, "open_app", {"name": "设置"}, ["设置", "通用", "关于本机", "iOS 版本", "18.3.1"]),
              _step(2, "scroll", {"direction": "down", "amount": "page"}, ["关于本机", "iOS 版本", "18.3.1"]),
@@ -104,11 +104,119 @@ def test_generic_only_success_is_trusted_when_the_answer_screen_was_reached(tmp_
 
 
 def test_generic_only_success_without_screen_evidence_still_fails(tmp_path):
-    """没有屏幕检查，就没有证据证明答案来自屏幕：只做 generic 操作就报成功，照旧判失败（防编答案）。"""
+    """屏幕检查没有、答案值也没在到过的屏上出现过：只做 generic 操作就报成功，照旧判失败（防编答案）。"""
     t = V.Task.from_dict({**TASK, "checks": [{"type": "answer_contains", "any_of": ["18.3.1"]}]})
-    steps = [_step(1, "open_app", {"name": "设置"}, ["18.3.1"]),
-             _step(2, "done", {"status": "success", "result": "18.3.1"}, ["18.3.1"])]
-    v = V.verify_run(t, _run(tmp_path, "a", "done_success", "18.3.1", steps))
+    steps = [_step(1, "open_app", {"name": "设置"}, ["设置", "通用"]),
+             _step(2, "done", {"status": "success", "result": "18.3.1"}, ["设置", "通用"])]
+    v = V.verify_run(t, _run(tmp_path, "a", "done_success", "iOS 18.3.1", steps))
+    assert v.status == "fail" and any("generic" in r for r in v.reasons)
+
+
+ANSWER_ONLY = {**TASK, "id": "spotlight-calc", "prompt": "用 iPhone 的搜索（Spotlight）算一下 128 乘以 37 等于多少",
+               "checks": [{"type": "answer_contains", "any_of": ["4736", "4,736"]},
+                          {"type": "action_not_taken", "texts": ["登录"]}]}
+
+
+def test_generic_only_success_passes_when_the_answer_value_was_read_off_a_screen(tmp_path):
+    """2026-09-22：题目有答案检查、没写屏幕检查；答案值本身在到过的屏上读到过 —— 读来的，不是编的。
+    一次真机 tasks 跑里的 spotlight-calc：Spotlight 留着上次的算式，按一下就出 4,736，被这条规则误杀。
+    也是 2026-09-22 前这条测试的原场景（答案值就在 open_app 那一屏上），那时判失败，现在判通过。"""
+    steps = [_step(1, "key", {"name": "spotlight"}, ["计算", "128*37 = 4,736"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["计算", "128*37 = 4,736"])]
+    v = V.verify_run(V.Task.from_dict(ANSWER_ONLY), _run(tmp_path, "a", "done_success", "128 乘以 37 等于 4,736", steps))
+    assert v.status == "pass", v.reasons
+
+
+def test_an_answer_value_only_inside_a_longer_number_is_not_evidence(tmp_path):
+    """数字要有边界：答案检查写的「4736」不算在屏上的「14736」里（评审 H2）。"""
+    t = V.Task.from_dict({**ANSWER_ONLY, "checks": [{"type": "answer_contains", "any_of": ["4736"]}]})
+    steps = [_step(1, "key", {"name": "spotlight"}, ["14736"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["14736"])]
+    v = V.verify_run(t, _run(tmp_path, "a", "done_success", "等于 4736", steps))
+    assert v.status == "fail" and any("generic" in r for r in v.reasons)
+
+
+def test_screen_words_in_the_answer_do_not_help_when_the_task_checks_the_answer(tmp_path):
+    """有答案检查的题，证据只看答案值：答案里引了屏上的界面字（「计算结果」），值却不在屏上 —— 照旧判失败。"""
+    steps = [_step(1, "key", {"name": "spotlight"}, ["计算结果", "建议"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["计算结果", "建议"])]
+    v = V.verify_run(V.Task.from_dict(ANSWER_ONLY), _run(tmp_path, "a", "done_success", "计算结果是 4736", steps))
+    assert v.status == "fail" and any("generic" in r for r in v.reasons)
+
+
+def test_the_answer_check_still_applies_after_the_generic_rule_is_lifted(tmp_path):
+    """豁免只拿掉 generic 这一条：答案值在屏上，但答案检查本身没过（答了别的数），照旧判失败。"""
+    steps = [_step(1, "key", {"name": "spotlight"}, ["4,736", "4,737"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["4,736", "4,737"])]
+    v = V.verify_run(V.Task.from_dict({**ANSWER_ONLY, "checks": [{"type": "answer_contains", "all_of": ["4,736", "5000"]}]}),
+                     _run(tmp_path, "a", "done_success", "4,736 或 4,737", steps))
+    assert v.status == "fail" and any("answer_contains" in r for r in v.reasons)
+
+
+def test_vision_only_rows_are_not_evidence_for_the_answer_value(tmp_path):
+    """与 screen_reached 同一把尺子：只认 OCR 读到的字（spec 2026-09-14 §7）。"""
+    steps = [_step(1, "key", {"name": "spotlight"}, []),
+             _step(2, "done", {"status": "success", "result": "x"}, [])]
+    steps[1]["observation"]["elements"] = [_el(1, "4,736", "vision")]
+    v = V.verify_run(V.Task.from_dict(ANSWER_ONLY), _run(tmp_path, "a", "done_success", "等于 4,736", steps))
+    assert v.status == "fail" and any("generic" in r for r in v.reasons)
+
+
+REDDIT = {**TASK, "id": "reddit-top-post", "prompt": "打开 Reddit，告诉我首页第一条帖子的标题",
+          "checks": [{"type": "action_not_taken", "texts": ["登录"]}]}
+
+
+def test_no_answer_check_and_the_answer_echoes_a_screen_row_is_review_not_pass(tmp_path):
+    """题目没有答案检查（reddit 首页第一条每天在变）：答案里有屏上读到的一整行字，只说明「可能是读来的」——
+    待人工审查，不判通过，也不再冤判失败。一次真机 tasks 跑里这次是答对的，被判了失败。"""
+    steps = [_step(1, "open_app", {"name": "Reddit"}, ["搜索 Reddit", "一条很长的帖子标题", "主页"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["搜索 Reddit", "一条很长的帖子标题", "主页"])]
+    v = V.verify_run(V.Task.from_dict(REDDIT), _run(tmp_path, "a", "done_success", "首页第一条帖子的标题是：「一条很长的帖子标题」", steps))
+    assert v.status == "review", v.reasons
+    assert any("一条很长的帖子标题" in r for r in v.reasons)
+
+
+def test_a_fabricated_answer_citing_a_ui_label_is_review_never_pass(tmp_path):
+    """已知偏松、有意接受（评审 H1）：编的标题带一个界面标签（「Popular」）也凑得上屏上的字 ——
+    所以这一档只能是待人工审查，永远不判通过。"""
+    steps = [_step(1, "open_app", {"name": "Reddit"}, ["Home", "Popular", "搜索 Reddit"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["Home", "Popular"])]
+    v = V.verify_run(V.Task.from_dict(REDDIT), _run(tmp_path, "a", "done_success", "在 Popular 标签下第一条是「编的标题」", steps))
+    assert v.status == "review"
+
+
+def test_a_real_failure_is_never_softened_to_review_by_an_echo(tmp_path):
+    """真失败优先：答案回显了屏上的字（本该待审），但屏幕检查没过 —— 判失败，不是待审（评审复审第 2 条）。"""
+    t = V.Task.from_dict({**REDDIT, "checks": [{"type": "screen_reached", "texts": ["热门"]},
+                                               {"type": "action_not_taken", "texts": ["登录"]}]})
+    steps = [_step(1, "open_app", {"name": "Reddit"}, ["搜索 Reddit", "一条很长的帖子标题"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["搜索 Reddit", "一条很长的帖子标题"])]
+    v = V.verify_run(t, _run(tmp_path, "a", "done_success", "第一条是「一条很长的帖子标题」", steps))
+    assert v.status == "fail" and any("screen_reached" in r for r in v.reasons)
+
+
+def test_a_three_char_row_is_enough_to_echo(tmp_path):
+    """门槛是 3 个字（去空格后）：「1本书」算。"""
+    t = V.Task.from_dict({**REDDIT, "prompt": "打开图书，告诉我书库里有几本书"})
+    steps = [_step(1, "open_app", {"name": "图书"}, ["1 本书"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["1 本书"])]
+    v = V.verify_run(t, _run(tmp_path, "a", "done_success", "有 1本书", steps))
+    assert v.status == "review"
+
+
+def test_screen_text_that_only_echoes_the_prompt_is_not_evidence(tmp_path):
+    """答案里和屏上共有的字若是题目本身的字（「Reddit」），照抄题目也能凑上 —— 不算。"""
+    steps = [_step(1, "open_app", {"name": "Reddit"}, ["Reddit", "主页"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["Reddit", "主页"])]
+    v = V.verify_run(V.Task.from_dict(REDDIT), _run(tmp_path, "a", "done_success", "Reddit 首页第一条是「今天天气很好」", steps))
+    assert v.status == "fail" and any("generic" in r for r in v.reasons)
+
+
+def test_short_screen_text_is_not_evidence(tmp_path):
+    """一两个字的行（「主页」「你」）太容易碰巧落进任何答案里，不算。"""
+    steps = [_step(1, "open_app", {"name": "Reddit"}, ["主页", "你"]),
+             _step(2, "done", {"status": "success", "result": "x"}, ["主页", "你"])]
+    v = V.verify_run(V.Task.from_dict(REDDIT), _run(tmp_path, "a", "done_success", "主页第一条是你想不到的新闻", steps))
     assert v.status == "fail" and any("generic" in r for r in v.reasons)
 
 
@@ -343,3 +451,13 @@ def test_summary_and_diff_list_review_separately():
     b = {"ts": "b", "tasks": {"t": {"pass": 1, "n": 3, "review": 2}}}
     assert "待人工审查 2" in "\n".join(V.summary(b))
     assert "待人工审查 0 → 2" in "\n".join(V.diff(a, b))
+
+
+def test_hard_set_loads_and_stays_out_of_the_daily_set():
+    """难题集是单独一档尺子（iphone eval tasks --set hard）：自己能加载，
+    又不能混进顶层那几道日常题里 —— 混进去就把日常成功率拖成另一回事。"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "evalset" / "tasks"
+    tasks, errors = V.load_tasks(root / "hard")
+    assert errors == [] and len(tasks) >= 10
+    assert not {t.id for t in V.load_tasks(root)[0]} & {t.id for t in tasks}

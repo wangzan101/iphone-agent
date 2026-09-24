@@ -44,3 +44,21 @@ def test_review_never_masks_a_real_failure_in_the_cli_exit_code(monkeypatch, cap
     out = capsys.readouterr().out
     assert "fail" in out
     assert rc == 1
+
+
+def test_set_loads_tasks_from_a_subdirectory_and_keeps_them_out_of_the_top_level(monkeypatch, capsys, tmp_path):
+    """--set hard：只从 evalset/tasks/hard 读题；顶层没有这道题时，不带 --set 就找不到。"""
+    monkeypatch.chdir(tmp_path)
+    d = tmp_path / "evalset" / "tasks" / "hard"
+    d.mkdir(parents=True)
+    (d / f"{TASK['id']}.json").write_text(json.dumps(TASK, ensure_ascii=False), encoding="utf-8")
+    run_dir = _run(tmp_path / "evalset", "a", "done_success", "18.3.1", GOOD)
+    assert C.cmd_eval(SimpleNamespace(), ["verify", TASK["id"], str(run_dir), "--set", "hard"]) == 0
+    assert C.cmd_eval(SimpleNamespace(), ["verify", TASK["id"], str(run_dir)]) == 2
+
+
+def test_set_with_a_missing_directory_is_a_clear_error(monkeypatch, capsys, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "evalset" / "tasks").mkdir(parents=True)
+    assert C.cmd_eval(SimpleNamespace(), ["tasks", "--set", "nope"]) == 2
+    assert "没有这个题集" in capsys.readouterr().err

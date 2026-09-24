@@ -1,0 +1,28 @@
+{
+  "id": "music-library",
+  "prompt": "打开音乐，告诉我资料库里有哪些分类",
+  "category": "readonly",
+  "strength": "medium",
+  "device_note": "难题集（2026-09-18）：资料库导航。只读；搜索类结果每天在变，只判「搜索框里真打进了这些字、到了结果页」。",
+  "checks": [
+    {
+      "type": "screen_reached",
+      "texts": [
+        "资料库"
+      ]
+    },
+    {
+      "type": "action_not_taken",
+      "texts": [
+        "登录",
+        "Log in",
+        "Sign in",
+        "注册",
+        "购买",
+        "订阅",
+        "删除",
+        "移除"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "spotlight-calc",
+  "prompt": "用 iPhone 的搜索（Spotlight）算一下 128 乘以 37 等于多少",
+  "category": "readonly",
+  "strength": "medium",
+  "device_note": "难题集（2026-09-18）：Spotlight 输入；答案固定。只读；搜索类结果每天在变，只判「搜索框里真打进了这些字、到了结果页」。",
+  "checks": [
+    {
+      "type": "answer_contains",
+      "any_of": [
+        "4736",
+        "4,736"
+      ]
+    },
+    {
+      "type": "action_not_taken",
+      "texts": [
+        "登录",
+        "Log in",
+        "Sign in",
+        "注册",
+        "购买",
+        "订阅",
+        "删除",
+        "移除"
+      ]
+    }
+  ]
+}

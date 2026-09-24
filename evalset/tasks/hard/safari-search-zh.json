@@ -1,0 +1,28 @@
+{
+  "id": "safari-search-zh",
+  "prompt": "用 Safari 搜索「iOS 18 新功能」，告诉我第一条结果的标题",
+  "category": "readonly",
+  "strength": "medium",
+  "device_note": "难题集（2026-09-18）：中文输入 + 网页。只读；搜索类结果每天在变，只判「搜索框里真打进了这些字、到了结果页」。",
+  "checks": [
+    {
+      "type": "screen_reached",
+      "texts": [
+        "iOS 18"
+      ]
+    },
+    {
+      "type": "action_not_taken",
+      "texts": [
+        "登录",
+        "Log in",
+        "Sign in",
+        "注册",
+        "购买",
+        "订阅",
+        "删除",
+        "移除"
+      ]
+    }
+  ]
+}
