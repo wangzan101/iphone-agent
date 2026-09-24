@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field
 
-from iphone_agent.memory.screenmap import app_id_for
+from iphone_agent.appids import app_id_for
 from iphone_agent.twin.schema import new_id
 
 SCHEMA = 1

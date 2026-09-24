@@ -21,7 +21,7 @@ def rec(step, frame, name, after=None, result=None, args=None, **extra):
 
 
 def test_event_id_uses_line_number_not_step():
-    # 真实留档 runs/20260909-150415-5d25 第 7、8 行：被拒的 tap 与随后的 type 都是 step 6
+    # 真实留档 一次真机运行 第 7、8 行：被拒的 tap 与随后的 type 都是 step 6
     lines = [rec(6, "f1.png", "tap", validation="repeated_action"),
              rec(6, "f1.png", "type", after="f2.png"), rec(7, "f2.png", "done")]
     assert [e.event_id for e in extract_events("r1", lines)] == ["r1:2", "r1:3"]
@@ -62,11 +62,11 @@ def ev(name, args=None, result=None, texts=("a",)):
 def test_open_app_counts_only_when_identity_verified():
     t = AppTracker()
     t.advance(ev("open_app", {"name": "设置"}, {"ok": True, "changed": True, "identity": {"verified": True}}))
-    assert t.owner == "she-zhi" and t.display["she-zhi"] == "设置"
+    assert t.owner == "settings" and t.display["settings"] == "设置"
 
 
 def test_open_app_without_verified_identity_is_unknown():
-    # runs/20260910-193640-bfd7：open_app 设置 返回 ok，画面是备忘录 —— 没核过身份就不能当开对
+    # 一次真机运行：open_app 设置 返回 ok，画面是备忘录 —— 没核过身份就不能当开对
     for result in ({"ok": True, "changed": True}, {"ok": True, "changed": True, "identity": {"verified": None}}):
         t = AppTracker()
         t.advance(ev("open_app", {"name": "设置"}, result))
@@ -77,29 +77,29 @@ def test_failed_open_app_from_inside_an_app_becomes_unknown():
     # 每条 open_app 路线失败前都先回第一张主屏（executor.return_to_first_home_page），
     # 错 App 的路线又在错 App 里返回 ok=False —— 失败之后手机不可能还停在原来那个 App。
     t = AppTracker()
-    t.owner = "bei-wang-lu"
+    t.owner = "notes"
     t.advance(ev("open_app", {"name": "设置"}, {"ok": False, "error": "x"}))
     assert t.owner == "unknown"
 
 
 def test_open_app_ok_but_unchanged_becomes_unknown():
     t = AppTracker()
-    t.owner = "bei-wang-lu"
+    t.owner = "notes"
     t.advance(ev("open_app", {"name": "设置"}, {"ok": True, "changed": False}))
     assert t.owner == "unknown"
 
 
 def test_home_spotlight_switcher_and_handover():
     t = AppTracker()
-    t.owner = "she-zhi"
+    t.owner = "settings"
     t.advance(ev("key", {"name": "app_switcher"}))
     assert t.owner == "unknown"
     t.advance(ev("key", {"name": "home"}))
     assert t.owner == "system"
-    t.owner = "she-zhi"
+    t.owner = "settings"
     t.advance(ev("key", {"name": "spotlight"}))
     assert t.owner == "system"
-    t.owner = "she-zhi"
+    t.owner = "settings"
     t.advance(ev("handover", {"need": "登录"}))
     assert t.owner == "unknown"
 
@@ -108,7 +108,7 @@ def test_icon_tap_on_home_enters_app():
     t = AppTracker()
     t.advance(ev("tap", {"id": 1, "target": "icon_above"},
                  {"ok": True, "changed": True, "identity": {"verified": True}}, texts=("备忘录",)))
-    assert t.owner == "bei-wang-lu" and t.display["bei-wang-lu"] == "备忘录"
+    assert t.owner == "notes" and t.display["notes"] == "备忘录"
 
 
 def test_icon_tap_on_home_without_verified_identity_is_unknown():
@@ -127,11 +127,11 @@ def _snap(els):
 
 
 def test_leaving_system_by_a_non_icon_tap_is_unknown_and_later_tab_icons_do_not_enter_apps():
-    # ⚠ 真实留档 runs/20260908-022024-e257（闸门 B 错归）：Spotlight 里点结果文字「记账本」（target=text）
+    # ⚠ 真实留档 一次真机运行（闸门 B 错归）：Spotlight 里点结果文字「记账本」（target=text）
     #   进了 App，状态机仍当 system；之后在 App 里点底部 tab 图标（icon_above，id 45 的 OCR 读成「G」）
     #   被当成「主屏点图标」，整段被记到了 App「g」。元素照抄第 5、13 行。
     t = AppTracker()
-    spotlight = _snap([{"id": 4, "text": "一木", "center": [120, 1283], "confidence": 1.0},
+    spotlight = _snap([{"id": 4, "text": "记账", "center": [120, 1283], "confidence": 1.0},
                        {"id": 5, "text": "记账本", "center": [104, 341], "confidence": 1.0}])
     t.advance(Event("r:5", 0.0, spotlight, {"name": "tap", "args": {"id": 5, "target": "text", "x": 104, "y": 341}},
                     {"ok": True, "changed": True}, None, None))
@@ -155,21 +155,21 @@ def test_system_actions_that_may_launch_an_app_become_unknown_others_stay_system
         assert t.owner == "unknown", (name, args)
     # 画面没变的点击、翻页、在搜索框里打字、等待：仍在系统界面
     for name, args, result in (("tap", {"id": 1, "target": "text"}, {"ok": True, "changed": False}),
-                               ("scroll", {"direction": "left"}, None), ("type", {"text": "一木"}, None),
+                               ("scroll", {"direction": "left"}, None), ("type", {"text": "记账"}, None),
                                ("wait", {}, None)):
         t = AppTracker()
         t.advance(ev(name, args, result))
         assert t.owner == "system", (name, args)
     # 已在 App 里：点文字不改归属（在 App 内导航）
     t = AppTracker()
-    t.owner = "she-zhi"
+    t.owner = "settings"
     t.advance(ev("tap", {"id": 1, "target": "text"}))
-    assert t.owner == "she-zhi"
+    assert t.owner == "settings"
 
 
 def test_mark_unknown():
     t = AppTracker()
-    t.owner = "she-zhi"
+    t.owner = "settings"
     t.mark_unknown()
     assert t.owner == "unknown"
 
@@ -196,10 +196,10 @@ def test_snapshot_reads_label_status_and_candidates():
     obs = {"elements": [], "width_px": 1, "height_px": 2, "frame_file": "frame_003.png",
            "screen": {"app": "设置", "name": "通用", "same_as": None, "anchors": []},
            "perception": {"ocr": 0, "vision": "ok", "screen": "ok"},
-           "screen_candidates": [{"index": 1, "app_id": "she-zhi", "screen_id": "s_1", "name": "通用"}, "bad"]}
+           "screen_candidates": [{"index": 1, "app_id": "settings", "screen_id": "s_1", "name": "通用"}, "bad"]}
     s = Snapshot.from_observation(obs)
     assert s.frame_file == "frame_003.png" and s.label["name"] == "通用" and s.label_status == "ok"
-    assert s.candidates == ({"index": 1, "app_id": "she-zhi", "screen_id": "s_1", "name": "通用"},)
+    assert s.candidates == ({"index": 1, "app_id": "settings", "screen_id": "s_1", "name": "通用"},)
     old = Snapshot.from_observation({"elements": [], "width_px": 1, "height_px": 2})
     assert old.frame_file == "" and old.label is None and old.label_status == "off" and old.candidates == ()
 

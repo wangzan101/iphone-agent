@@ -17,13 +17,17 @@ from __future__ import annotations
 
 import json
 import os
-import re as _re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pypinyin import lazy_pinyin
+from iphone_agent.appids import app_id_for, slugify  # noqa: F401 —— 老调用方仍从这里 import
+
+# ⚠ 2026-09-17：`slugify` / `app_id_for` 挪到了 `iphone_agent/appids.py`。
+#   App id 从此不再是「显示名的拼音」，而是「规范 id + 别名索引」—— 中文机和英文机
+#   必须落到同一个 id 上，否则仓库里那份共享知识只对中文机有效（appids.py 的模块注释）。
+#   挪法同 `riskwords.py` / `fingerprint.py`：定义只有一份，这里 import 回来。
 
 JACCARD = 0.5          # 判「同一屏」的相似度门槛
 MIN_VISITS = 2         # 至少访问过这么多次才谈得上指纹（交集要有意义）
@@ -41,22 +45,6 @@ def label_like(t: str) -> bool:
     if any(c in t for c in ":/·•><＞＜"):
         return False
     return any("一" <= c <= "鿿" for c in t) or (t.isascii() and t[0].isalpha())
-
-
-def slugify(text: str, max_len: int = 48) -> str:
-    """任意文字 → 合法 id 片段：中文转拼音，只留 [a-z0-9-]，合并连字符。空则 'x'。"""
-    parts = lazy_pinyin(text) if not text.isascii() else [text]
-    s = "-".join(parts).lower()
-    s = _re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    s = _re.sub(r"-{2,}", "-", s)[:max_len].strip("-")
-    if not s or not s[0].isalnum():
-        s = "x" + s
-    return s
-
-
-def app_id_for(open_name: str) -> str:
-    """open_app 的参数 → App id。ASCII 直接小写；中文转拼音（与 executor._open_app 同一函数）。"""
-    return slugify(open_name)
 
 
 def _action_of(st: dict) -> tuple[str | None, dict, dict]:

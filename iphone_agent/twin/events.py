@@ -9,7 +9,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from iphone_agent.memory.screenmap import SYSTEM, UNKNOWN, _icon_tap_label, app_id_for
+from iphone_agent.appids import app_id_for
+from iphone_agent.memory.screenmap import SYSTEM, UNKNOWN, _icon_tap_label
 
 # 会改变画面、值得记转移的动作
 TRANSITION_ACTIONS = frozenset({"tap", "scroll", "scroll_until", "collect", "type", "erase", "key", "open_app"})
@@ -126,7 +127,7 @@ def read_run_events(run_dir: Path) -> list[Event]:
 
 class AppTracker:
     """当前在哪个 App。⚠ 不是 screenmap.ownership()：那个只看动作参数，会把误开当开对
-    （runs/20260910-193640-bfd7）。这里核不了身份就归 unknown —— 宁可不记，不可记错 App。"""
+    （一次真机运行）。这里核不了身份就归 unknown —— 宁可不记，不可记错 App。"""
 
     def __init__(self) -> None:
         self.owner: str = SYSTEM
@@ -166,7 +167,7 @@ class AppTracker:
             label = _icon_tap_label(st, self.owner, name, args, res)
             if label is not None:
                 # ⚠ 2026-09-11（fbc1 用户决定）：点图标进 App 这条路，跟 open_app 用同一条规则——
-                #   只信核过身份的入口（CLAUDE.md §7）。runs/20260907-142838-fbc1:2 错归：
+                #   只信核过身份的入口（CLAUDE.md §7）。一次真机运行的第 2 步 错归：
                 #   模型在主屏第 2 页的前帧上点了「设置」，点击那一刻手机其实已经翻回第 1 页，
                 #   同一位置是 Gemini，开的是 Gemini，孪生按前帧标签记成了「设置」。前帧里没有
                 #   任何结构信号能发现这件事，只有 executor 核对打开后的身份（result["identity"]）
@@ -177,7 +178,7 @@ class AppTracker:
                 else:
                     self.owner = UNKNOWN
             elif self.owner == SYSTEM and res.get("changed"):
-                # ⚠ 2026-09-11 闸门 B 错归（runs/20260908-022024-e257）：Spotlight 里点结果文字「记账本」
+                # ⚠ 2026-09-11 闸门 B 错归（一次真机运行）：Spotlight 里点结果文字「记账本」
                 #   （target=text）进了 App，这里原先「不变」，状态机仍当 system；之后在 App 里点底部 tab 图标
                 #   （icon_above，OCR 读成「G」）被当成主屏点图标，整段记到了 App「g」。
                 #   system 不是看出来的，是推出来的：系统界面上画面变了、又不是认得出的主屏点图标

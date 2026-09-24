@@ -238,7 +238,7 @@ def _rec(texts, action=None, ok=True, changed=True, extra_result=None, kind=None
 def test_ownership_walk_follows_open_app_home_spotlight_and_switcher():
     from iphone_agent.memory.screenmap import SYSTEM, UNKNOWN, ownership
     recs = [
-        _rec(["主屏"], {"name": "open_app", "args": {"name": "设置"}}),          # 观察时是 system；打开后归 she-zhi
+        _rec(["主屏"], {"name": "open_app", "args": {"name": "设置"}}),          # 观察时是 system；打开后归 settings
         _rec(["设置", "通用"], {"name": "tap", "args": {"id": 2}}),
         _rec(["通用"], {"name": "key", "args": {"name": "app_switcher"}}),
         _rec(["多任务"], {"name": "tap", "args": {"id": 1}}),
@@ -247,7 +247,7 @@ def test_ownership_walk_follows_open_app_home_spotlight_and_switcher():
         _rec(["主屏"], {"name": "open_app", "args": {"name": "微信"}}),
         _rec(["微信", "通讯录"], {"name": "done", "args": {}}),
     ]
-    assert ownership(recs) == [SYSTEM, "she-zhi", "she-zhi", UNKNOWN, UNKNOWN, SYSTEM, SYSTEM, "wei-xin"]
+    assert ownership(recs) == [SYSTEM, "settings", "settings", UNKNOWN, UNKNOWN, SYSTEM, SYSTEM, "wei-xin"]
 
 
 def test_apps_seen_maps_id_to_original_open_name():
@@ -265,7 +265,7 @@ def test_ownership_icon_tap_from_home_enters_the_app_for_the_next_record():
         _rec(["主屏", "日历"], tap(2, "icon_above")),      # id 2 -> "日历"
         _rec(["日历", "今天"]),
     ]
-    assert ownership(recs) == [SYSTEM, "ri-li"]
+    assert ownership(recs) == [SYSTEM, "calendar"]
 
 
 def test_ownership_icon_tap_that_did_not_change_the_screen_does_not_enter():
@@ -295,7 +295,7 @@ def test_ownership_icon_above_tap_inside_an_app_does_not_change_ownership():
         _rec(["设置", "通用"], tap(2, "icon_above")),      # id 2 -> "通用"，已经在设置里
         _rec(["通用", "隐私"]),
     ]
-    assert ownership(recs) == ["system", "she-zhi", "she-zhi"]
+    assert ownership(recs) == ["system", "settings", "settings"]
 
 
 def test_ownership_icon_above_tap_with_unresolvable_id_does_not_change_ownership():
@@ -310,7 +310,7 @@ def test_ownership_icon_above_tap_with_unresolvable_id_does_not_change_ownership
 def test_apps_seen_picks_up_icon_tap_label_as_display_name():
     from iphone_agent.memory.screenmap import apps_seen
     recs = [_rec(["主屏", "文件"], tap(2, "icon_above")), _rec(["文件", "最近项目"])]
-    assert apps_seen(recs) == {"wen-jian": "文件"}
+    assert apps_seen(recs) == {"files": "文件"}
 
 
 def test_apps_seen_keeps_the_open_app_name_over_a_later_icon_label():
@@ -344,13 +344,13 @@ def test_subgraph_keeps_only_that_apps_stable_nodes_and_edges_between_them():
             _rec(["通用", "关于本机", "软件更新"], {"name": "key", "args": {"name": "home"}}),
             _rec(["主屏", "设置"], {"name": "done", "args": {}}),
         ], r)
-    sub = m.subgraph("she-zhi")
+    sub = m.subgraph("settings")
     fps = [n.fingerprint for n in sub.nodes]
     assert {"设置", "通用", "隐私"} in fps and {"通用", "关于本机", "软件更新"} in fps
     assert not any("主屏" in fp for fp in fps)
     assert all(e.src in {n.key for n in sub.nodes} and e.dst in {n.key for n in sub.nodes} for e in sub.edges.values())
-    j = __import__("json").loads(appmap_json(sub, "she-zhi", ["r1", "r2"]))
-    assert j["schema_version"] == 1 and j["app"] == "she-zhi" and j["built_from"] == ["r1", "r2"]
+    j = __import__("json").loads(appmap_json(sub, "settings", ["r1", "r2"]))
+    assert j["schema_version"] == 1 and j["app"] == "settings" and j["built_from"] == ["r1", "r2"]
     tap = next(e for e in j["edges"] if e["action"] == "tap")
     assert tap["target"] == "通用" and tap["how"] == "row_right"
 
@@ -362,4 +362,4 @@ def test_node_app_is_majority_owner():
     m.ingest_run([_rec(["主屏"], {"name": "open_app", "args": {"name": "设置"}}),
                   _rec(["设置", "通用"], {"name": "done", "args": {}})], "r2")
     node = next(n for n in m.nodes if "通用" in n.fingerprint)
-    assert m.node_app(node.key) == "she-zhi" and m.app_names == {"she-zhi": "设置"} and m.runs == {"r1", "r2"}
+    assert m.node_app(node.key) == "settings" and m.app_names == {"settings": "设置"} and m.runs == {"r1", "r2"}
