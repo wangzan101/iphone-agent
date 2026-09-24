@@ -23,6 +23,13 @@ from iphone_agent.web import api, static_files
 from iphone_agent.workspace import Workspace
 
 
+def _end_message(res) -> dict | None:
+    """任务结束时那句原因的界面描述。镜像被完全挡住有专门的一句（双语），其余沿用原始诊断。"""
+    if res.end_reason == "mirror_hidden":
+        return {"code": "end.mirrorHiddenDetail", "params": {}}
+    return {"code": "event.error", "params": {"detail": res.error}} if res.error else None
+
+
 class Chat:
     """一场对话。串行执行 —— 一台手机同一时刻只能做一件事。"""
 
@@ -272,7 +279,7 @@ class Chat:
             self.history.append((text, str(answer)))
             self.emit("done", end=res.end_reason, steps=res.steps,
                       result=res.done_result, error=res.error,
-                      error_message={"code": "event.error", "params": {"detail": res.error}} if res.error else None,
+                      error_message=_end_message(res),
                       run=res.run_dir.name)
             # ⚠ 这次跑真写进去的记忆，人得能看见才谈得上撤销（也不能删）。
             #   run.json 是本次唯一权威来源——不重算，直接读 commit_memories

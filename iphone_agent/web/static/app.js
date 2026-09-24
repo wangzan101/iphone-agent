@@ -370,7 +370,8 @@ function renderRich(host, text) {
 }
 
 const END_WORD = { stopped: L("end.stopped"), max_steps: L("end.maxSteps"), timeout: L("end.timeout"),
-                   no_progress: L("end.noProgress"), interrupted: L("end.interrupted") };
+                   no_progress: L("end.noProgress"), interrupted: L("end.interrupted"),
+                   mirror_hidden: L("end.mirrorHidden") };
 
 function addAnswer(d) {
   if (!turn) return;

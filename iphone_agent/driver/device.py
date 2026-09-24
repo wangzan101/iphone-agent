@@ -125,6 +125,18 @@ class Device:
         self._content_cache = (rect, content)
         return content
 
+    def mirror_exposed(self) -> bool:
+        """镜像内容区是不是还有一处没被别的窗口盖住 —— 滚轮（含 open_app 翻主屏页）能不能落下去。
+
+        判据与滚轮挑落点是同一条（injector.exposed_anchor，经 pick_clear_anchor），不另写几何。
+        前台注入每个动作前都会抬窗口，不要求露出，直接算露着。
+        ⚠ 只给滚轮用。点击和键盘在镜像被完全盖住时照样送得到，别把它挂到 tap/press 上（779d09a）。
+        """
+        if not isinstance(self.inj, BackgroundInjector):
+            return True
+        content = self.content_rect()   # 会重新解析窗口：镜像重启过的话 self.inj 换新，所以放在取 inj 之前
+        return self.inj.pick_clear_anchor(content, None) is not None
+
     def ensure_frame_valid(self, frame: Frame) -> None:
         now = self.window_rect()
         if not now.same_as(frame.window_rect):

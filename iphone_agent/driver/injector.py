@@ -82,6 +82,54 @@ class ActivateFailed(RuntimeError):
     pass
 
 
+# ── 镜像露没露出来：唯一的判据 ──────────────────────────────────────────
+# 滚轮挑落点（BackgroundInjector.pick_clear_anchor）、任务开跑前的检查（harness/loop.run_task）、
+# doctor（health.check_mirror_exposed）都走这一条，同一组候选点、同一次窗口列表查询。
+# ⚠ 只有滚轮需要它。点击走 SkyLight 按窗口 id 投递、键盘走 CGEventPostToPid，
+#   镜像被完全盖住也照样送得到（docs/14「后台注入」）—— 别把它挂到点击或按键上（779d09a 的教训）。
+
+MIRROR_HIDDEN_HINT = (
+    "镜像窗口被别的窗口完全挡住了，一条缝都没露。露出一小条就够："
+    "点击和打字在后台照样能用，但滚动和翻页（打开 App 时要翻主屏幕）需要镜像露出一点。"
+    "把挡住它的窗口挪开一点再试。")
+
+
+def onscreen_windows() -> list[dict]:
+    """当前屏幕上的普通窗口（layer 0），按前后顺序。走 Quartz 系统调用，不会读到陈旧值。"""
+    opts = (Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements)
+    return [w for w in (Quartz.CGWindowListCopyWindowInfo(
+        opts, Quartz.kCGNullWindowID) or [])
+        if int(w.get("kCGWindowLayer", -1)) == 0]
+
+
+def topmost_at(window_id: int, x, y, windows) -> bool:
+    """(x, y) 处最上面的普通窗口是不是 window_id。
+
+    窗口列表按前后顺序排，第一个覆盖该点的 layer-0 窗口就是 hit-test 会命中的那个。
+    """
+    for w in windows:
+        b = w["kCGWindowBounds"]
+        if b["X"] <= x <= b["X"] + b["Width"] and b["Y"] <= y <= b["Y"] + b["Height"]:
+            return int(w.get("kCGWindowNumber", -1)) == window_id
+    return False
+
+
+def exposed_anchor(window_id: int, region, windows=None) -> tuple[int, int] | None:
+    """镜像内容区（region）里第一个还露着的落点，按离中心由近及远；一个都没有就 None。
+
+    None 就是「镜像被完全盖住」：滚轮没有地方可落，只能抬窗口（而抬窗口会失败，见 scroll_at）。
+    `windows` 可传入预取的列表；不传就查一次系统 —— 全部候选共用这一份快照，
+    十几个候选各查一次既慢，拿到的快照还可能互相不一致。
+    """
+    if windows is None:
+        windows = onscreen_windows()
+    for cx, cy in scroll_anchor_candidates(region):
+        if topmost_at(window_id, cx, cy, windows):
+            return (int(cx), int(cy))
+    return None
+
+
 class Injector(Protocol):
     def mouse_down(self, x: int, y: int) -> None: ...
     def mouse_up(self, x: int, y: int) -> None: ...
@@ -305,41 +353,22 @@ class BackgroundInjector:
     def scroll_lines(self, v: int = 0, h: int = 0):
         self._fb.scroll_lines(v=v, h=h)
 
-    @staticmethod
-    def _onscreen_windows():
-        opts = (Quartz.kCGWindowListOptionOnScreenOnly
-                | Quartz.kCGWindowListExcludeDesktopElements)
-        return [w for w in (Quartz.CGWindowListCopyWindowInfo(
-            opts, Quartz.kCGNullWindowID) or [])
-            if int(w.get("kCGWindowLayer", -1)) == 0]
-
     def _is_topmost_at(self, x, y, windows=None) -> bool:
-        """锚点处镜像是不是最上面的普通窗口。
-
-        窗口列表按前后顺序排，第一个覆盖该点的 layer-0 窗口就是 hit-test 会命中的那个。
-
-        `windows` 可传入预取的列表：挑落点时要试十几个候选，每个都去查一次系统
-        既慢又会拿到互相不一致的快照。
-        """
-        for w in (self._onscreen_windows() if windows is None else windows):
-            b = w["kCGWindowBounds"]
-            if b["X"] <= x <= b["X"] + b["Width"] and b["Y"] <= y <= b["Y"] + b["Height"]:
-                return int(w.get("kCGWindowNumber", -1)) == self.window_id
-        return False
+        """锚点处镜像是不是最上面的普通窗口（判据见模块级 topmost_at）。"""
+        return topmost_at(self.window_id, x, y,
+                          onscreen_windows() if windows is None else windows)
 
     def pick_clear_anchor(self, region, default):
         """在 region 里挑一个镜像没被盖住的落点；全被盖住则返回 default。
 
         中心被盖住不等于整个镜像被盖住 —— 用户的终端往往只压住一角。
         只要镜像还露出一小块，就在那一块上滚，窗口不必抬起来，屏幕上什么都不变。
+        判据是模块级的 exposed_anchor —— 开跑前检查和 doctor 用的也是它。
         """
         if region is None:
             return default
-        windows = self._onscreen_windows()
-        for cx, cy in scroll_anchor_candidates(region):
-            if self._is_topmost_at(cx, cy, windows):
-                return (int(cx), int(cy))
-        return default
+        picked = exposed_anchor(self.window_id, region)
+        return default if picked is None else picked
 
     def scroll_at(self, anchor, v: int = 0, h: int = 0, region=None):
         """滚轮不能用事件记录后台化（macOS 按真实指针位置路由，实测 PostToPid 发滚轮

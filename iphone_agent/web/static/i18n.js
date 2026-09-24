@@ -27,6 +27,8 @@ const I18n = (() => {
     "end.timeout": ["超时了","Timed out"],
     "end.noProgress": ["它绕不出来了","No further progress"],
     "end.interrupted": ["被中断了","Interrupted"],
+    "end.mirrorHidden": ["镜像被完全挡住了","Mirror is completely covered"],
+    "end.mirrorHiddenDetail": ["镜像窗口被别的窗口完全挡住了，一条缝都没露。露出一小条就够：点击和打字在后台照样能用，但滚动和翻页（打开 App 时要翻主屏幕）需要镜像露出一点。把挡住它的窗口挪开一点再试。","The iPhone Mirroring window is completely covered. A small sliver is enough: taps and typing still work in the background, but scrolling and page flips (needed to open apps) require part of the mirror to show. Move the covering window a little and try again."],
     "end.failed": ["没做成","Not completed"],
     "replay.label": ["回放","Replay"],
     "common.dismiss": ["知道了","Dismiss"],
@@ -239,6 +241,7 @@ const I18n = (() => {
     "check.perceive.ocr.title": ["文字识别","Text recognition"],
     "check.model.title": ["模型","Model"],
     "check.injector.title": ["注入路径","Input path"],
+    "check.mirror.exposed.title": ["镜像露出","Mirror visible"],
     "check.granted": ["已授权","Granted"],
     "check.denied": ["未授权","Not granted"],
     "check.accessibility.why": ["用于将点击与键盘输入发送到镜像窗口。","Needed to send pointer and keyboard input to the mirror."],
@@ -258,6 +261,11 @@ const I18n = (() => {
     "check.injector.why": ["常规后台输入尽量不占用 Mac 的光标与焦点。","Normal background input aims to leave the Mac cursor and focus available."],
     "check.injector.detail": ["输入路径：{mode} · SkyLight：{available}","Input path: {mode} · SkyLight: {available}"],
     "check.injector.fix": ["只读检查无法确认输入是否生效，需要监督式真机验证。","Read-only checks cannot verify input delivery. A supervised device check is required."],
+    "check.exposed.ok": ["露着（至少有一块没被盖住）","Visible (at least part of it is uncovered)"],
+    "check.exposed.covered": ["被别的窗口完全盖住","Completely covered by other windows"],
+    "check.exposed.foreground": ["前台注入：每个动作前都会抬起镜像，不要求露出","Foreground input raises the mirror before each action, so it need not be visible"],
+    "check.exposed.why": ["滚动和翻主屏页（打开 App 时要用）只进指针下方最上面的窗口，镜像得露出一点；点击和打字不受影响。","Scrolling and home-screen page flips (used to open apps) only reach the topmost window under the pointer, so part of the mirror must show. Taps and typing are unaffected."],
+    "check.exposed.fix": ["把挡住镜像的窗口挪开一点，露出一小条就够。点击和打字在后台照样能用，但滚动和翻页需要镜像露出一点。","Move the covering window a little; a small sliver of the mirror is enough. Taps and typing still work in the background, but scrolling and page flips need part of the mirror to show."],
     "check.failed": ["此项检查失败。原始诊断：{detail}","This check failed. Original diagnostic: {detail}"],
     "check.failedFix": ["先检查镜像连接与前面的失败项，然后重试。","Check the mirror and earlier failed checks, then retry."]
   };

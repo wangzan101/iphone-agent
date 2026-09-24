@@ -28,10 +28,10 @@ def test_guard_turns_exception_into_a_fail_check():
 def test_run_checks_never_raises_on_a_broken_machine():
     """一台什么都没配好的机器上，run_checks 仍要返回完整的一份清单。"""
     checks = health.run_checks(_Boom())
-    assert len(checks) == 7
+    assert len(checks) == 8
     ids = [c.id for c in checks]
     assert ids == ["perm.accessibility", "perm.screen_recording", "mirror.window",
-                   "mirror.capture", "perceive.ocr", "model", "injector"]
+                   "mirror.capture", "mirror.exposed", "perceive.ocr", "model", "injector"]
 
 
 def test_every_failing_check_tells_you_what_to_do():
@@ -101,3 +101,41 @@ def test_the_ocr_check_is_ocr_only_and_leaves_a_running_tasks_parse_stats_alone(
     assert per.asker.calls == 0, "文字识别自检不该调视觉"
     for k in ("mode", "observations", "parse_by", "ms", "label", "vision_failures"):
         assert after[k] == before[k], k
+
+
+class _ExposureDev:
+    def __init__(self, exposed, mode="background(SkyLight)"):
+        self.exposed, self.mode = exposed, mode
+
+    def mirror_exposed(self):
+        return self.exposed
+
+    def injector_mode(self):
+        return self.mode
+
+
+def test_exposure_check_passes_when_any_part_of_the_mirror_shows():
+    from types import SimpleNamespace
+    c = health.check_mirror_exposed(SimpleNamespace(dev=_ExposureDev(True)))
+    assert c.id == "mirror.exposed" and c.status == PASS and c.ok
+    assert c.fix == ""
+    assert c.messages["title"]["code"] == "check.mirror.exposed.title"
+
+
+def test_exposure_check_fails_and_blocks_when_fully_covered():
+    """和任务开跑前那道检查是同一条规则、同一句话：doctor 说能跑，任务就不该一开跑就被拦。"""
+    from types import SimpleNamespace
+
+    from iphone_agent.driver.injector import MIRROR_HIDDEN_HINT
+    c = health.check_mirror_exposed(SimpleNamespace(dev=_ExposureDev(False)))
+    assert c.status == FAIL and c.blocking
+    assert c.fix == MIRROR_HIDDEN_HINT
+    assert "一小条" in c.fix and c.why
+    assert not health.all_ok([c])
+    assert c.messages["fix"]["code"] == "check.exposed.fix"
+
+
+def test_exposure_check_in_foreground_mode_explains_it_is_not_needed():
+    from types import SimpleNamespace
+    c = health.check_mirror_exposed(SimpleNamespace(dev=_ExposureDev(True, "foreground(CGEvent)")))
+    assert c.status == PASS and "前台" in c.detail

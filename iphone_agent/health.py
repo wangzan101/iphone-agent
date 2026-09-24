@@ -118,6 +118,30 @@ def check_capture(session) -> Check:
                            fix_code="" if ok else "check.capture.fix"))
 
 
+EXPOSED_WHY = "滚动和翻主屏页（打开 App 时要用）只进指针下方最上面的窗口，镜像得露出一点；点击和打字不受影响。"
+
+
+def check_mirror_exposed(session) -> Check:
+    """镜像有没有露出一点 —— 和任务开跑前那道检查是同一条规则（Device.mirror_exposed）、同一句话。
+
+    拦路（blocking）：被完全盖住时点击和键盘其实还送得到，但开跑前检查会直接拒绝这次任务
+    （绝大多数任务要打开 App，翻主屏页那一下必然失败）。doctor 说「都过了」而任务一开跑就被拦，
+    就是 §3 说的静默假话，所以两边口径一致。
+    """
+    from iphone_agent.driver.injector import MIRROR_HIDDEN_HINT
+    dev = session.dev
+    ok = bool(dev.mirror_exposed())
+    foreground = str(dev.injector_mode()).startswith("foreground")
+    detail = ("前台注入：每个动作前都会抬起镜像，不要求露出" if foreground
+              else "露着（至少有一块没被盖住）" if ok else "被别的窗口完全盖住")
+    code = "check.exposed.foreground" if foreground else "check.exposed.ok" if ok else "check.exposed.covered"
+    return Check(
+        id="mirror.exposed", title="镜像露出", status=PASS if ok else FAIL,
+        detail=detail, why=EXPOSED_WHY, fix="" if ok else MIRROR_HIDDEN_HINT,
+        messages=_messages("mirror.exposed", code, "check.exposed.why",
+                           "" if ok else "check.exposed.fix"))
+
+
 def check_ocr(session) -> Check:
     # ⚠ 2026-09-15（按需看图终审发现 2）：这一项只查 OCR，走 observe_text。原来走 observe，不在任何 task_scope 里
     #   就按代码默认 always 打一次整屏解析：IPHONE_SCREEN_PARSE=off 的人跑 doctor 也会被收一次视觉调用；
@@ -174,7 +198,7 @@ def check_injector(session) -> Check:
 # ── 汇总 ────────────────────────────────────────────────────────────────
 
 def run_checks(session) -> list[Check]:
-    """按顺序跑完所有检查。顺序即依赖顺序：权限 → 窗口 → 抓帧 → 识别 → 模型。
+    """按顺序跑完所有检查。顺序即依赖顺序：权限 → 窗口 → 抓帧 → 露出 → 识别 → 模型。
 
     前面的没过，后面的多半也过不了 —— 界面应该引导用户**从上往下**修。
     """
@@ -187,6 +211,7 @@ def run_checks(session) -> list[Check]:
                "所有操作都发给这一个窗口。"),
         _guard(lambda: check_capture(session), "mirror.capture", "抓帧",
                "抓不到帧就等于瞎了。"),
+        _guard(lambda: check_mirror_exposed(session), "mirror.exposed", "镜像露出", EXPOSED_WHY),
         _guard(lambda: check_ocr(session), "perceive.ocr", "文字识别",
                "它靠读屏上的文字来认路。"),
         _guard(lambda: check_model(session), "model", "模型",
