@@ -282,7 +282,8 @@ def build_real_corpora() -> dict[str, str]:
     """
     from iphone_agent.harness.prompt import system_prompt
     out: dict[str, str] = {}
-    out["real_system_prompt"] = system_prompt(allow_coord_tap=True, has_skills=True)
+    out["real_system_prompt"] = system_prompt(allow_coord_tap=True, has_knowledge=True,
+                                              has_proc_tools=True)
     out["real_tools_json"] = json.dumps(tool_defs(True), sort_keys=True, ensure_ascii=False)
     el = _real_elements_text()
     if el:
@@ -305,6 +306,20 @@ def build_real_corpora() -> dict[str, str]:
 #: 段的短样本告警阈值（字符）。比这还短的段，±1 token 的量化误差就能把比值
 #: 挪动好几个百分点 —— 量到了也只能当参考，不该直接填进 SEGMENT_TOKENS_PER_CHAR。
 SEGMENT_MIN_CHARS_FOR_RATIO = 200
+
+#: 要标定的几版 system 段：语料标签 -> system_prompt 的三个开关。
+#:
+#: ⚠ 2026-09-17 之前这里只有一版（三个开关全开）。剧本那段拆成「知识」「剧本工具」
+#:   两半之后，**生产默认**（IPHONE_SKILL_TOOLS=off）发的是「有知识、没剧本工具」
+#:   那一版 —— 两版字节不同、hash 不同，只标全开那版的话，默认路径上最大的一段
+#:   会常年查不到常量、静静落回第 2 层估算。所以两版都标，各进 EXACT_SEGMENT_TOKENS
+#:   一条（段名都是 "system"，键靠 hash 区分）。
+#:   坐标关那一版不在这里：未标定模型是少数，且它只是抽掉两行，留给第 2 层兜底。
+SYSTEM_VARIANTS: dict[str, tuple[bool, bool, bool]] = {
+    # 标签                     (allow_coord_tap, has_knowledge, has_proc_tools)
+    "system": (True, True, False),              # 生产默认：有知识、不端剧本工具
+    "system(剧本工具开)": (True, True, True),    # IPHONE_SKILL_TOOLS=on
+}
 
 
 def _iter_step_records(limit_runs: int = 40):
@@ -482,7 +497,8 @@ def build_segment_corpora() -> tuple[dict[str, str], dict[str, str]]:
     corpora: dict[str, str] = {}
     missing = dict(SEGMENTS_WITHOUT_CORPUS_REASON)
 
-    corpora["system"] = system_prompt(allow_coord_tap=True, has_skills=True)
+    for label, flags in SYSTEM_VARIANTS.items():
+        corpora[label] = system_prompt(*flags)
 
     el = _real_elements_text()
     if el:
@@ -1770,20 +1786,22 @@ def probe_segments(runner: Runner) -> dict | None:
         print(f"  {req.label:<40} chars={len(text):<6} prompt_tokens={r['prompt_tokens']}")
 
     # ── P4-1 精确常量 ─────────────────────────────────────────────
-    sys_text = corpora.get("system", "")
-    sys_row = next((x for x in rows if x["segment"] == "system"), None)
     tools_text_row = next((x for x in rows if x["segment"] == "tools_schema(当文本)"), None)
     tools_exact = (tools_param - baseline) if _is_int(tools_param) else None
-    sys_key = _prompt_hash_of(sys_text) if sys_text else None
     tools_key = _hashlib.sha256(tools_blob.encode("utf-8")).hexdigest()
 
     print("\nP4-1 精确常量（抄进 tokens.EXACT_SEGMENT_TOKENS，键是代码现算的，别手编）：")
     print("EXACT_SEGMENT_TOKENS = {")
-    if sys_row and sys_row["measured_tokens"] is not None:
-        print(f'    ("system", "{sys_key}"): {sys_row["measured_tokens"]},'
-              f'   # {sys_row["chars"]} 字，system_prompt(True, True)')
-    else:
-        print("    # system 没量到 —— 不许填")
+    # ⚠ 每一版 system 都是 EXACT_SEGMENT_TOKENS 里**独立的一条**：段名都叫 "system"
+    #   （budget 记账时的段名只有这一个），键用各自渲染文本的 hash 区分。
+    for label, flags in SYSTEM_VARIANTS.items():
+        text = corpora.get(label, "")
+        row = next((x for x in rows if x["segment"] == label), None)
+        if text and row and row["measured_tokens"] is not None:
+            print(f'    ("system", "{_prompt_hash_of(text)}"): {row["measured_tokens"]},'
+                  f'   # {row["chars"]} 字，system_prompt{flags}')
+        else:
+            print(f"    # {label} 没量到 —— 不许填")
     if tools_exact is not None:
         print(f'    ("tools_schema",\n     "{tools_key}"): {tools_exact},'
               f'   # {len(full_tools)} 个工具，走 tools= 参数')
@@ -1822,9 +1840,12 @@ def probe_segments(runner: Runner) -> dict | None:
           "改成验收文档名 —— 在那之前它必须一直是 uninitialized。")
 
     out = {"baseline_tokens": baseline, "tools_param_tokens": tools_param,
-           "exact": {"system": {"key": sys_key,
-                                "tokens": sys_row and sys_row["measured_tokens"]},
-                     "tools_schema": {"key": tools_key, "tokens": tools_exact}},
+           "exact": {label: {"key": _prompt_hash_of(corpora[label]) if corpora.get(label) else None,
+                             "flags": list(flags),
+                             "tokens": next((x["measured_tokens"] for x in rows
+                                             if x["segment"] == label), None)}
+                     for label, flags in SYSTEM_VARIANTS.items()}
+                    | {"tools_schema": {"key": tools_key, "tokens": tools_exact}},
            "rows": rows, "missing": missing,
            "min_chars_for_ratio": SEGMENT_MIN_CHARS_FOR_RATIO}
     runner.dump("probe-segments", out)

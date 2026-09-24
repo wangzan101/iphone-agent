@@ -15,7 +15,7 @@ def test_system_prompt_states_the_trust_boundary():
 
 def test_prompt_version_bumped():
     """提示词变了就要改版本号，否则 run.json 的 prompt_hash 对不上历史运行。"""
-    assert PROMPT_VERSION == "23"
+    assert PROMPT_VERSION == "25"
 
 
 import pytest
@@ -69,6 +69,9 @@ def test_search_memory_tool_returns_ranked_hits(tmp_path, fake_env):
                      [("done", {"status": "success", "result": "x"})]],
                     tmp_path, store=store)
     tool = [x for x in m.seen[1] if x["role"] == "tool"][-1]
+    # ⚠ 2026-09-18（最终评审）：tool 消息的内容不再保证是纯 JSON（前面可能有一行结论，
+    #   见 messages.tool_result 的注释）。这里今天还能直接 loads，是因为 search_memory 是
+    #   screen_neutral —— 它压根没有结论，_verdict_line 对它返回 None。换个会改画面的动作就得先去掉首行。
     hits = _json.loads(tool["content"])["hits"]
     assert hits[0]["name"] == "wechat-groups" and "mark" in hits[0]
 

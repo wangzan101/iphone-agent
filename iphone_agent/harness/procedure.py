@@ -8,19 +8,22 @@ from __future__ import annotations
 import json
 import time
 
-from iphone_agent import config
+from iphone_agent import config, fingerprint
 from iphone_agent.harness.actions import Action, ValidationError, validate_action
 from iphone_agent.harness.executor import ToolResult
 from iphone_agent.harness.runlog import frame_stub, observation_snapshot
-from iphone_agent.memory.screenmap import COVERAGE
 from iphone_agent.perceive.change import did_change
+
+ACTUAL_WORDS = 12       # hint 里最多列这么多个「当时屏上有什么」
 
 # 只有这三种计入 fail_streak：它们说的是「剧本和界面对不上」。设备异常、模型错误、窗口移动、
 # 熔断、上限说的是别的事，记进这条剧本的账是冤枉它（spec §2.3 迁移表）。
 COUNTED_FAILURES = frozenset({"expect_mismatch", "target_not_found", "ambiguous_target"})
 
 _WHY = {
-    "expect_mismatch": "后没到该到的屏（期望有『{expected}』）",
+    # ⚠ 2026-09-16：原来只说「期望有什么」。真机 d06d 那次，光看 hint 谁也说不出剧本当时到底站在哪一屏，
+    #   得翻留档才知道 —— 失败要能被看见（CLAUDE.md §3），期望和实际必须一起摆出来。
+    "expect_mismatch": "后没到该到的屏（期望有『{expected}』，其中『{matched}』找到了；当时屏上是『{actual}』）",
     "target_not_found": "时在当前屏找不到目标",
     "ambiguous_target": "时目标命中了多个元素，不敢猜",
     "type_not_verified": "后没在输入区读到打进去的字",
@@ -99,15 +102,19 @@ class ProcedureRunner:
             # ⚠ 只 format 模板本身。fallback 里的 f.detail 是执行器的 hint，
             #   里面嵌着模型/剧本给的字符串（`打了拼音 {pinyin!r}…{text!r}`），带个花括号很正常；
             #   拿它去 .format() 会在 except 处理里再抛一次 KeyError，调用方连 ToolResult 都收不到。
+            out = f.obs if f.obs is not None else cur
+            actual = sorted(out.text_set)[:ACTUAL_WORDS] if out is not None else []
+            matched = fingerprint.matches(step.expect, out.text_set)[1] if out is not None else []
             tpl = _WHY.get(f.error)
-            why = tpl.format(expected="、".join(step.expect)) if tpl else "时出错：" + f.detail
+            why = (tpl.format(expected="、".join(step.expect), matched="、".join(matched) or "一个都没有",
+                              actual="、".join(actual) or "（没读到文字）")
+                   if tpl else "时出错：" + f.detail)
             hint = (f"剧本 {tool_name} 走到第 {done + 1} 步『{step.do} {target}』{why}。"
                     f"当前屏幕已交给你，从这儿接着手动做；这条剧本会记一次失败。")
             res = ToolResult(ok=False, error=f.error, hint=hint, extra=self._extra({
                 "procedure": tool_name, "step": done + 1, "do": step.do, "target": target,
-                "expected": list(step.expect), "steps_done": done, "actions": self._actions,
-                "moved_screens": self._moved}))
-            out = f.obs if f.obs is not None else cur
+                "expected": list(step.expect), "matched": matched, "actual": actual,
+                "steps_done": done, "actions": self._actions, "moved_screens": self._moved}))
             return res, (out if out is not start else None)
         ch = did_change(start, cur)
         res = ToolResult(ok=True, changed=ch.changed, hamming=ch.hamming, text_diff=ch.text_diff,
@@ -176,10 +183,11 @@ class ProcedureRunner:
             rec["expect_ok"] = False
             self._log(rec)
             raise _StepFailed("target_not_found", target, new)
-        ok = True
-        if step.expect:
-            ok = len(set(step.expect) & new.text_set) / len(step.expect) >= COVERAGE
+        # 到没到该到的屏：判据只有 fingerprint.matches 一个入口。盘上写着、而那条规则如今不认的词
+        # （状态栏乱码、只有整屏解析才有的图标名）在这里自动不算数 —— 老剧本因此不必重新学一遍。
+        ok, matched = fingerprint.matches(step.expect, new.text_set)
         rec["expect"] = list(step.expect)
+        rec["matched"] = matched
         rec["expect_ok"] = ok
         self._log(rec)
         if not ok:
@@ -205,7 +213,10 @@ class ProcedureRunner:
         self._actions += 1
         if res.ok and not res.changed:
             self.guard.record_executed(action, cur.state_key, cur.width_px, cur.height_px)
-        verdict = self.guard.record_result(action, res, new)
+        # ⚠ 2026-09-18（Task 7 评审发现 1、2）：剧本自己核对每一步（下面的 fingerprint.matches，
+        #   对不上就 expect_mismatch 中止），内部动作的 tap expect 恒为 None 只是结构使然 ——
+        #   不能当成「没人核实」。理由和后果见 guard.record_result 的 count_unverified 那段。
+        verdict = self.guard.record_result(action, res, new, count_unverified=False)
         if verdict is not None:
             self._verdict = verdict          # stop 盖过 warn：stop 这一步本来就要中止
         elif self.guard.no_progress == 0:

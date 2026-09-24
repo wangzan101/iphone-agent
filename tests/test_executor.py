@@ -4,6 +4,7 @@ import pytest
 
 from iphone_agent.driver.geometry import OutOfWindow
 from iphone_agent.driver.injector import ActivateFailed
+from iphone_agent.harness import verdict as V
 from iphone_agent.harness.actions import Action
 from iphone_agent.harness.executor import Executor
 
@@ -211,6 +212,7 @@ def test_scroll_until_scrolls_several_screens_within_one_call(fake_env):
     # 命中的那一屏就是交回去的新观察，模型下一步能直接 tap 它
     assert new_obs is not None and "关于本机" in new_obs.text_set
     assert new_obs.element(res.extra["matched"]["id"]).text == "关于本机"
+    assert res.extra["verdict"]["state"] == "met"
 
 
 def test_scroll_until_stops_at_the_bottom_using_the_same_criterion_as_scroll(fake_env):
@@ -226,6 +228,7 @@ def test_scroll_until_stops_at_the_bottom_using_the_same_criterion_as_scroll(fak
     assert res.ok and res.extra["found"] is False
     assert res.extra["reached_end"] is True and res.extra["screens"] == 3
     assert "滚不动了" in res.hint
+    assert res.extra["verdict"]["state"] == "not_met"
 
 
 def test_scroll_until_does_not_scroll_when_the_text_is_already_on_screen(fake_env):
@@ -470,7 +473,7 @@ def test_open_app_types_pinyin_not_chinese(fake_env):
     Executor(dev, per).run(act("open_app", name="记账本"), obs)
     typed = [c[1] for c in dev.calls if c[0] == "type"]
     assert typed == ["jizhangben"], f"没打拼音，实际打了 {typed}"
-    assert not any("一木" in t for t in typed), "把中文直接发出去了（会走粘贴，本环境不通）"
+    assert not any("记账" in t for t in typed), "把中文直接发出去了（会走粘贴，本环境不通）"
 
 
 def test_open_app_still_types_ascii_names_verbatim(fake_env):
@@ -483,7 +486,7 @@ def test_open_app_still_types_ascii_names_verbatim(fake_env):
 
 # --- 「一次都没动过」不是「滚到底了」 ---
 #
-# 2026-09-08 真机（runs/20260908-022551-5204）：在通用页 scroll_until 找「关于本机」，
+# 2026-09-08 真机（一次真机运行）：在通用页 scroll_until 找「关于本机」，
 # 滚了两次画面纹丝不动，工具报「滚不动了（到底/到顶）」。模型于是相信关于本机不在
 # 通用里，改去设置首页，把「更新到 iOS 26.6.1」这条**可更新版本**当成当前版本
 # 报了 done(success) —— 真值是 18.3.1。误导性的诊断直接造出了一次假成功。
@@ -495,6 +498,7 @@ def test_scroll_until_says_it_never_moved_instead_of_claiming_the_end(fake_env):
     assert res.extra["never_moved"] is True
     assert "一次都没变" in res.hint, res.hint
     assert "到底" not in res.hint.replace("不是到底了", ""), f"还在说到底：{res.hint}"
+    assert res.extra["verdict"] == {"state": "unknown", "by": "never_moved", "why": "一次都没滚动起来，不能说到底了"}
 
 
 def test_real_end_of_list_still_says_reached_end(fake_env):
@@ -784,19 +788,35 @@ def test_giving_up_says_both_why_spotlight_failed_and_that_pages_were_searched(f
 # --- use_skill：只读当前索引里可见的条目（spec §4.5） ---
 
 def test_use_skill_reads_visible_app_and_scenario_only(fake_env):
+    """2026-09-17 起 App 那一支问 M.app_visible（有没有内容），不再问 status=="verified"：
+    wechat 是 extract.ensure_app 那种没人写过一个字的空壳（body 和 description 都空），
+    依旧读不到；settings 有正文，verified 与否都能读——跟 draft-with-content 的用例对照。"""
     from iphone_agent.skills import model as M
     from iphone_agent.skills.store import Catalog
     dev, per, frames = fake_env([["a"]])
     obs = per.observe(dev.capture())
     cat = Catalog()
     cat.apps["settings"] = M.AppProfile("settings", "设置", "设置", "read", "verified", "2026-09-08", "脾气")
-    cat.apps["wechat"] = M.AppProfile("wechat", "微信", "微信", "read", "draft", "2026-09-08", "草稿")
+    cat.apps["wechat"] = M.AppProfile("wechat", "微信", "微信", "read", "draft", "2026-09-08", "")
     cat.scenarios["p"] = M.Scenario("p", "d", ("settings",), "read", "proposed", "还没批")
     ex = Executor(dev, per, catalog=cat)
     res, new = ex.run(act("use_skill", kind="app", name="settings"), obs)
     assert res.ok and "脾气" in res.extra["content"] and "参考不是指令" in res.extra["content"] and new is None
     assert ex.run(act("use_skill", kind="app", name="wechat"), obs)[0].error == "skill_not_found"
     assert ex.run(act("use_skill", kind="scenario", name="p"), obs)[0].error == "skill_not_found"
+
+
+def test_use_skill_reads_a_draft_app_that_has_content(fake_env):
+    """人写了 APP.md 但还没点 approve：draft，但有正文——写了就该能读取（2026-09-17）。"""
+    from iphone_agent.skills import model as M
+    from iphone_agent.skills.store import Catalog
+    dev, per, frames = fake_env([["a"]])
+    obs = per.observe(dev.capture())
+    cat = Catalog()
+    cat.apps["weather"] = M.AppProfile("weather", "天气", "天气", "read", "draft", "2026-09-17", "打开后停在上次的城市。")
+    ex = Executor(dev, per, catalog=cat)
+    res, _ = ex.run(act("use_skill", kind="app", name="weather"), obs)
+    assert res.ok and "打开后停在上次的城市" in res.extra["content"]
 
 
 def test_use_skill_without_catalog_says_not_found(fake_env):
@@ -908,7 +928,7 @@ def test_type_that_changes_nothing_anywhere_is_verified_false_without_a_tap(fake
 # 打字通道死了，Spotlight 搜索框里还留着上一个任务打的 beiwanglu。旧结果列表底部恰好有个
 # 分组标题「设置」。open_app("设置") 精确匹配中了这个标题：点它没反应（还在 Spotlight）→
 # 点它上方的「图标」→ 实际点进了一条备忘录 → 离开了 Spotlight → 报 ok via=icon_above。
-# 模型以为进了设置，此后十几步都在收拾这个局面（runs/20260910-193640-bfd7）。
+# 模型以为进了设置，此后十几步都在收拾这个局面（一次真机运行）。
 # 「离开 Spotlight / 离开主屏」只说明有东西被打开了，说明不了打开的是谁。
 
 def _app_of(texts):
@@ -991,6 +1011,8 @@ def test_open_app_says_whether_the_app_was_verified(fake_env):
         act("open_app", name="备忘录"), per.observe(dev.capture()))
     assert res.ok and res.extra["identity"]["verified"] is True, res.to_json()
     assert "wrong_app" not in res.extra
+    assert V.Verdict.from_json(res.extra["verdict"]).state == "met"
+    assert V.Verdict.from_json(res.extra["verdict"]).by == "identity"
 
     dev, per, frames = _spotlight_opens_notes_env()
     res, _ = Executor(dev, per).run(act("open_app", name="备忘录"), per.observe(dev.capture()))
@@ -1028,7 +1050,7 @@ def test_home_icon_that_opens_another_app_is_reported_honestly(fake_env):
 
 # --- 主屏 / Spotlight 上模型自己发的 tap icon_above 也要核对打开的 App 身份 ---
 #
-# runs/20260907-142838-fbc1:2（2026-09-11 用户决定）：模型在主屏第 2 页的前帧上 tap
+# 一次真机运行的第 2 步（2026-09-11 用户决定）：模型在主屏第 2 页的前帧上 tap
 # icon_above「设置」，点击那一刻手机其实已经翻回第 1 页（前帧过期），同一位置是
 # Gemini —— 打开了 Gemini，孪生按标签记成了「设置」。前帧里没有任何结构信号能发现
 # 这件事，只有核对打开后的身份才能抓到，跟 open_app 用同一条规则（CLAUDE.md §7）。
@@ -1109,3 +1131,377 @@ def test_icon_above_tap_on_home_without_an_asker_is_verified_none(action_env):
         act("tap", id=label.id, x=label.center[0], y=label.center[1], target="icon_above"), obs)
     assert res.ok and res.changed, res.to_json()
     assert res.extra["identity"] == {"verified": None, "by": "judge"}, res.to_json()
+    assert V.Verdict.from_json(res.extra["verdict"]).state == "unknown"
+
+
+# ---- 结论：一个动作成没成（spec 2026-09-18「不知道」不放行）----
+
+
+class _Judge:
+    """按问题里的关键字答。answers: {"动作生效": {...}, "预期的样子": {...}}"""
+
+    def __init__(self, **answers):
+        self.answers, self.asked = answers, []
+
+    def ask_json(self, prompt, images, max_tokens=None):
+        for key, data in self.answers.items():
+            if key in prompt:
+                self.asked.append(key)
+                return data
+        return None
+
+
+def _aligned(name, args, res):
+    """计划 R1：写进去的 verdict 和从旧字段推出来的，state 必须一样。"""
+    d = json.loads(res.to_json())
+    own = V.Verdict.from_json(d["verdict"])
+    legacy = V.of(name, args, {k: v for k, v in d.items() if k != "verdict"})
+    assert legacy.state == own.state, (own, legacy)
+    return own
+
+
+def test_tap_without_expect_is_unknown_missing(action_env):
+    dev, per, _ = action_env([["通用"], ["关于本机"]], {(0, "tap"): 1})
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per).run(act("tap", x=100, y=65), obs)
+    assert res.ok and res.changed is True
+    assert res.extra["expect_check"] == {"met": None, "by": "missing"}
+    assert _aligned("tap", {}, res) == V.Verdict("unknown", "missing")
+
+
+def test_tap_with_expect_confirmed_by_text(action_env):
+    dev, per, _ = action_env([["通用"], ["关于本机"]], {(0, "tap"): 1})
+    obs = per.observe(dev.capture())
+    a = Action("tap", {"x": 100, "y": 65}, "r", "进入通用，出现「关于本机」", "c1")
+    res, _ = Executor(dev, per).run(a, obs)
+    assert _aligned("tap", {}, res) == V.Verdict("met", "text", seen="关于本机")
+
+
+def test_tap_wrong_page_is_not_met(action_env):
+    dev, per, _ = action_env([["通用"], ["登录/注册"]], {(0, "tap"): 1})
+    obs = per.observe(dev.capture())
+    a = Action("tap", {"x": 100, "y": 65}, "r", "关掉面板，回到「搜索结果」", "c1")
+    asker = _Judge(**{"预期的样子": {"met": False, "confidence": 0.9, "why": "进了登录页"}})
+    res, _ = Executor(dev, per, asker=asker).run(a, obs)
+    v = _aligned("tap", {}, res)
+    assert (v.state, v.by, v.why) == ("not_met", "vision", "进了登录页")
+
+
+def test_tap_expect_but_judge_unavailable_is_unknown_unverified(action_env):
+    dev, per, _ = action_env([["通用"], ["别的页"]], {(0, "tap"): 1})
+    obs = per.observe(dev.capture())
+    a = Action("tap", {"x": 100, "y": 65}, "r", "出现「关于本机」", "c1")
+    res, _ = Executor(dev, per).run(a, obs)          # asker=None
+    assert res.extra["expect_check"] == {"met": None, "by": "unverified"}
+    assert _aligned("tap", {}, res) == V.Verdict("unknown", "unverified", why="看图核对没问成")
+
+
+def test_unchanged_tap_no_longer_writes_effect_into_expect_check(fake_env):
+    # spec B5：「动作生效了吗」的答案只进 judged，不冒充「达到预期了吗」
+    dev, per, _ = fake_env([["通用"], ["通用"], ["通用"], ["通用"]])
+    obs = per.observe(dev.capture())
+    a = Action("tap", {"x": 10, "y": 10}, "r", "出现「关于本机」", "c1")
+    asker = _Judge(**{"动作生效": {"worked": False, "confidence": 0.8, "why": "没动"}})
+    res, _ = Executor(dev, per, asker=asker).run(a, obs)
+    assert res.changed is False
+    assert res.extra["expect_check"] == {"met": None, "by": "not_asked"}
+    assert res.extra["judged"]["worked"] is False
+    v = V.Verdict.from_json(res.extra["verdict"])
+    assert (v.state, v.by) == ("not_met", "vision")
+
+
+def test_unchanged_tap_without_a_judge_is_not_met_by_pixels(fake_env):
+    dev, per, _ = fake_env([["通用"], ["通用"], ["通用"], ["通用"]])
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per).run(act("tap", x=10, y=10), obs)
+    v = V.Verdict.from_json(res.extra["verdict"])
+    assert (v.state, v.by) == ("not_met", "pixels")          # 计划 R7
+
+
+def test_below_resolution_change_then_checks_the_expectation(fake_env):
+    # 开关翻转：像素说没变、看图说生效了 → 还要再问一次「是不是预期的样子」
+    dev, per, _ = fake_env([["蓝牙"], ["蓝牙"], ["蓝牙"], ["蓝牙"]])
+    obs = per.observe(dev.capture())
+    a = Action("tap", {"x": 10, "y": 10}, "r", "蓝牙开关变成打开", "c1")
+    asker = _Judge(**{"动作生效": {"worked": True, "confidence": 0.9, "why": "开关翻了"},
+                      "预期的样子": {"met": True, "confidence": 0.9, "why": "开关是绿的"}})
+    res, _ = Executor(dev, per, asker=asker).run(a, obs)
+    assert res.changed is True and asker.asked == ["动作生效", "预期的样子"]
+    # 守卫靠它认「低于指纹分辨率」，不许带 on_change
+    assert res.extra["judged"] == {"worked": True, "confidence": 0.9, "why": "开关翻了"}
+    assert res.extra["expect_check"] == {"met": True, "by": "vision"}
+    assert V.Verdict.from_json(res.extra["verdict"]).state == "met"
+
+
+def test_scroll_and_key_conclude_from_pixels_when_no_expect(action_env):
+    dev, per, _ = action_env([["a"], ["b"]], {(0, "scroll"): 1})
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per).run(act("scroll", direction="down", amount="page"), obs)
+    assert _aligned("scroll", {"direction": "down"}, res) == V.Verdict("met", "pixels")
+
+
+def test_an_exit_that_forgets_to_conclude_is_flagged_not_passed(action_env, monkeypatch):
+    dev, per, _ = action_env([["a"], ["b"]], {(0, "scroll"): 1})
+    obs = per.observe(dev.capture())
+    ex = Executor(dev, per)
+    monkeypatch.setattr(ex, "_conclude", lambda *a, **k: None)      # 模拟一个忘了下结论的出口
+    res, _ = ex.run(act("scroll", direction="down", amount="page"), obs)
+    assert res.extra["verdict"] == {"state": "unknown", "by": "unconcluded",
+                                    "why": "执行层没有给这个动作下结论"}
+
+
+def test_neutral_and_failed_actions_carry_no_verdict(fake_env):
+    dev, per, _ = fake_env([["a"], ["a"]])
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per).run(act("wait", seconds=0), obs)
+    assert "verdict" not in res.extra
+
+
+# ---- switch_ime：切完问一次现在是什么，信念换成事实（spec B6）----
+
+
+class _Ime:
+    def __init__(self, mode):
+        self.mode = mode
+
+    def ask_json(self, prompt, images, max_tokens=None):
+        return {"mode": self.mode} if "哪种输入法" in prompt else None
+
+
+def test_switch_ime_reports_the_mode_it_landed_in(action_env):
+    dev, per, _ = action_env([["space"], ["空格"]], {(0, "toggle_ime"): 1})
+    obs = per.observe(dev.capture())
+    ex = Executor(dev, per, asker=_Ime("chinese"))
+    res, _ = ex.run(act("switch_ime"), obs)
+    v = V.Verdict.from_json(res.extra["verdict"])
+    assert (v.state, v.by, v.seen) == ("met", "vision", "chinese")
+    assert ex._ime_chinese is True
+
+
+def test_switch_ime_that_did_not_switch_is_not_met(action_env):
+    dev, per, _ = action_env([["空格"], ["空格"]], {})
+    obs = per.observe(dev.capture())
+    ex = Executor(dev, per, asker=_Ime("chinese"))
+    ex._ime_chinese = True
+    res, _ = ex.run(act("switch_ime"), obs)
+    v = V.Verdict.from_json(res.extra["verdict"])
+    assert (v.state, v.by) == ("not_met", "vision")
+    assert ex._ime_chinese is True
+
+
+def test_switch_ime_without_a_judge_is_unknown(action_env):
+    dev, per, _ = action_env([["space"], ["空格"]], {(0, "toggle_ime"): 1})
+    obs = per.observe(dev.capture())
+    ex = Executor(dev, per)
+    res, _ = ex.run(act("switch_ime"), obs)
+    assert V.Verdict.from_json(res.extra["verdict"]) == V.Verdict("unknown", "unverified", why="切完是什么输入法，没核成")
+    assert ex._ime_chinese is None
+
+
+# ---- 全量不变式：会改画面的动作，ok 了就必须带结论（spec §6.1）----
+
+
+# ⚠ 2026-09-18（最终评审 M1）：在这张假环境里**注定 ok=False** 的动作，只能进这份显式名单。
+#   原来写的是 `if res.ok:` —— 新动作在假环境里意外 ok=False 就被静默放过，不变式等于没有
+#   （CLAUDE.md §3：失败必须能被看见）。名单里每一条都要写明它的结论由哪条用例钉着。
+CANNOT_SUCCEED_HERE = {
+    # 假环境里没有 Spotlight、没有主屏图标，三条路都开不成 App，_open_app 报 ok=False。
+    # 它 ok 时的结论由 test_open_app_says_whether_the_app_was_verified 钉（met/identity、unknown/unverified）。
+    "open_app",
+}
+
+
+def test_every_screen_changing_action_concludes(action_env):
+    """以后加动作忘了下结论，这条先红。"""
+    from iphone_agent.harness.actions import BUILTIN_ACTION_NAMES, screen_neutral
+
+    samples = {
+        "tap": {"x": 100, "y": 65}, "scroll": {"direction": "down", "amount": "page"},
+        "scroll_until": {"direction": "down", "text": "不存在的字"},
+        "collect": {"direction": "down"}, "type": {"text": "ab"}, "erase": {"count": 1},
+        "key": {"name": "return"}, "switch_ime": {}, "open_app": {"name": "设置"},
+    }
+    covered = set()
+    for name in BUILTIN_ACTION_NAMES:
+        a = act(name, **samples.get(name, {}))
+        if name in ("done", "handover") or screen_neutral(a) or name in (
+                "recall", "recall_runs", "search_memory", "use_skill"):
+            continue
+        assert name in samples, f"新动作 {name} 没有进不变式测试的样本表"
+        dev, per, _ = action_env([["搜索", "a"], ["搜索", "b"]],
+                                 {(0, n): 1 for n in ("tap", "scroll", "type", "backspace", "key", "toggle_ime")})
+        obs = per.observe(dev.capture())
+        ex = Executor(dev, per)
+        ex._last_tap_px = (100, 65)
+        res, _ = ex.run(a, obs)
+        if name in CANNOT_SUCCEED_HERE:
+            continue
+        assert res.ok, f"{name} 在这张假环境里本该跑得通；跑不通就得进 CANNOT_SUCCEED_HERE 并写明理由"
+        assert res.extra.get("verdict", {}).get("by") not in (None, "unconcluded"), name
+        covered.add(name)
+    assert covered == set(samples) - CANNOT_SUCCEED_HERE
+
+
+# ---- 非 tap 动作带 expect：同一个问题不问两遍，结论要和旧字段推导对得上（2026-09-18 评审）----
+
+
+def test_non_tap_with_expect_but_no_judge_is_met_by_pixels(action_env):
+    """像素说变了、没有看图的一方：非 tap 的「成了」= 动作生效了，按像素的肯定结论算（CLAUDE.md §2）。
+    写成 unknown 会和 of() 从旧字段推出来的 met/pixels 打架（计划 R1）。"""
+    dev, per, _ = action_env([["a"], ["b"]], {(0, "scroll"): 1})
+    obs = per.observe(dev.capture())
+    a = Action("scroll", {"direction": "down", "amount": "page"}, "r", "滚到下一屏", "c1")
+    res, _ = Executor(dev, per).run(a, obs)          # asker=None
+    assert _aligned("scroll", {"direction": "down"}, res) == V.Verdict("met", "pixels")
+    assert "judged" not in res.extra and "expect_check" not in res.extra
+
+
+def test_non_tap_below_resolution_is_not_asked_twice(fake_env):
+    """像素说没变、看图说生效了：这一问已经问过了，不许拿同样的提示词再问一遍。"""
+    dev, per, _ = fake_env([["a"], ["a"], ["a"], ["a"]])
+    obs = per.observe(dev.capture())
+    a = Action("scroll", {"direction": "down", "amount": "page"}, "r", "滚到下一屏", "c1")
+    asker = _Judge(**{"动作生效": {"worked": True, "confidence": 0.9, "why": "列表挪了一点"}})
+    res, _ = Executor(dev, per, asker=asker).run(a, obs)
+    assert asker.asked == ["动作生效"]
+    assert res.changed is True
+    assert "on_change" not in res.extra["judged"]
+    v = _aligned("scroll", {"direction": "down"}, res)
+    assert (v.state, v.by) == ("met", "vision")
+
+
+def test_non_tap_with_expect_judged_off_track(action_env):
+    """像素说变了、看图说没生效：not_met，judged 带 on_change（守卫的 off_track 读它）。"""
+    dev, per, _ = action_env([["a"], ["b"]], {(0, "scroll"): 1})
+    obs = per.observe(dev.capture())
+    a = Action("scroll", {"direction": "down", "amount": "page"}, "r", "滚到下一屏", "c1")
+    asker = _Judge(**{"动作生效": {"worked": False, "confidence": 0.9, "why": "弹了个通知而已"}})
+    res, _ = Executor(dev, per, asker=asker).run(a, obs)
+    assert _aligned("scroll", {"direction": "down"}, res).state == "not_met"
+    assert res.extra["judged"]["on_change"] is True
+    assert "没达到预期" in res.hint
+
+
+# ---- 打字的结论：文字判据答不出就读回（spec 2026-09-18 B2、一次真机运行的第 16 步）----
+
+
+class _Reads:
+    """typed_landed 的假看图方。"""
+
+    def __init__(self, data):
+        self.data, self.calls = data, 0
+
+    def ask_json(self, prompt, images, max_tokens=None):
+        if "打字**之前**" in prompt:
+            self.calls += 1
+            return self.data
+        return None
+
+
+def _typed(action_env, before, after, asker=None, via=None):
+    dev, per, _ = action_env([before, after], {(0, "type"): 1})
+    if via:
+        dev.type_via = via
+    obs = per.observe(dev.capture())
+    ex = Executor(dev, per, asker=asker)
+    ex._last_tap_px = (100, 65)
+    return ex.run(act("type", text="18"), obs)[0]
+
+
+def test_type_confirmed_by_text_asks_nobody(action_env):
+    asker = _Reads({"landed": False})
+    res = _typed(action_env, ["搜索"], ["搜索", "18"], asker)
+    assert res.extra["verified"] == "true" and asker.calls == 0
+    assert _aligned("type", {"text": "18"}, res) == V.Verdict("met", "text")
+
+
+def test_scene_safari_target_already_on_screen_goes_to_readback(action_env):
+    # 一次真机运行的第 16 步 —— 打「18」，屏上本来就有一条「Q ios18」，文字判据答 unknown
+    asker = _Reads({"landed": False, "field_changed": True, "seen": "iOS8"})
+    res = _typed(action_env, ["iOS", "Q ios18"], ["iOS8", "Q ios8.4.1"], asker)
+    assert asker.calls == 1
+    assert res.extra["verified"] == "wrong" and res.extra["typed_via"] == "keystrokes"
+    v = _aligned("type", {"text": "18"}, res)
+    assert (v.state, v.by, v.seen) == ("not_met", "readback", "iOS8")
+    assert Executor._channel_failure(act("type", text="18"), res) is None      # 落错了不是通道死了
+
+
+def test_readback_says_nothing_landed_goes_to_the_keyboard_ladder(action_env):
+    asker = _Reads({"landed": False, "field_changed": False, "seen": "iOS"})
+    res = _typed(action_env, ["iOS", "Q ios18"], ["iOS", "Q ios18", "广告"], asker)
+    assert res.extra["verified"] == "false"
+    assert Executor._channel_failure(act("type", text="18"), res) == "keyboard"
+
+
+def test_readback_confirms(action_env):
+    res = _typed(action_env, ["iOS", "Q ios18"], ["iOS18", "Q ios18"],
+                 _Reads({"landed": True, "field_changed": True, "seen": "iOS18"}))
+    assert res.extra["verified"] == "true"
+    assert _aligned("type", {"text": "18"}, res).by == "readback"
+
+
+def test_readback_unavailable_stays_unknown(action_env):
+    res = _typed(action_env, ["iOS", "Q ios18"], ["iOS8", "Q ios8.4.1"], asker=None)
+    assert res.extra["verified"] == "unknown"
+    assert _aligned("type", {"text": "18"}, res) == V.Verdict("unknown", "unverified", why="打进去没有，没核成")
+
+
+def test_shifted_path_does_not_trust_the_text_check(action_env):
+    # device.py:266：需要 Shift 的字符成对发送，受大小写交替影响，驱动自己说结果可能不可靠
+    asker = _Reads({"landed": False, "field_changed": True, "seen": "aBc"})
+    res = _typed(action_env, ["搜索"], ["搜索", "18"], asker, via="shifted")
+    assert asker.calls == 1 and res.extra["typed_via"] == "shifted" and res.extra["verified"] == "wrong"
+
+
+def test_picking_a_candidate_is_verified_like_any_typing(fake_env):
+    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制")           # 选完之后的画面是 ["设置", "飞行模式"]
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per, asker=_Reads({"landed": True, "field_changed": True, "seen": "设置"})).run(
+        act("type", text="设置"), obs)
+    assert res.ok and res.extra["picked"] == "1设置"
+    v = V.Verdict.from_json(res.extra["verdict"])
+    assert v.state == "met" and v.by in ("text", "readback")
+    assert res.extra["verified"] == "true" and res.changed is True
+    _aligned("type", {"text": "设置"}, res)
+
+
+def test_a_candidate_that_did_not_land_is_not_a_dead_keyboard(fake_env):
+    # 点候选走的是 tap 通道。读回说「框里没变」也不许写成 verified="false" —— 那会去爬键盘恢复阶梯。
+    # 这一帧是「候选栏没了、拼音还留在输入框里」：文字判据看得见画面动过，但答不出字上屏没有。
+    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制", after_pick=_PAD + ["Q shezhi"])
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per, asker=_Reads({"landed": False, "field_changed": False, "seen": ""})).run(
+        act("type", text="设置"), obs)
+    assert res.extra["verified"] == "wrong"
+    assert Executor._channel_failure(act("type", text="设置"), res) is None
+    v = V.Verdict.from_json(res.extra["verdict"])
+    assert v.state == "not_met" and "按键" not in v.why, "点击没生效，不许说成键盘没落字"
+
+
+def test_a_candidate_bar_still_on_screen_means_the_tap_did_nothing(fake_env):
+    """点完候选，候选栏还在原处 —— 真机上「点了候选却什么都没发生」最常见的样子。
+
+    ⚠ 2026-09-18（Task 4 评审实测）：这一帧曾经被报成 met/text、changed 抬成 True、读回一次都不问。
+      根子是拿「打拼音之前」那一帧当基线：我们只点「剥掉编号正好等于目标」的候选，候选栏自己就带着
+      目标词（"设置" in "1设置"），点击没生效时它反而算「新出现的文字」，文字判据恒答 true。
+      基线必须是**点候选之前那一帧**（带候选栏的那一帧）。
+    """
+    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制", after_pick=_PAD + ["1设置", "2 摄制", "Q 搜索"])
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per, asker=_Reads({"landed": False, "field_changed": False, "seen": ""})).run(
+        act("type", text="设置"), obs)
+    assert res.extra["verified"] == "wrong"
+    assert Executor._channel_failure(act("type", text="设置"), res) is None
+    v = V.Verdict.from_json(res.extra["verdict"])
+    assert v.state == "not_met" and "按键" not in v.why, "点击没生效，不许说成键盘没落字"
+    _aligned("type", {"text": "设置"}, res)
+
+
+def test_a_candidate_bar_still_on_screen_needs_no_asker(fake_env):
+    """一字不差 = 点击没生效，这是文字判据自己答得出的否定结论，不用看图的一方也不会报假成功。"""
+    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制", after_pick=_PAD + ["1设置", "2 摄制", "Q 搜索"])
+    obs = per.observe(dev.capture())
+    res, _ = Executor(dev, per).run(act("type", text="设置"), obs)          # asker=None
+    assert res.extra["verified"] == "wrong"
+    assert V.Verdict.from_json(res.extra["verdict"]).state == "not_met"
+    _aligned("type", {"text": "设置"}, res)

@@ -1,0 +1,49 @@
+{
+ "action": {
+  "name": "type",
+  "args_raw": {
+   "text": "18"
+  },
+  "args": {
+   "text": "18"
+  }
+ },
+ "result": {
+  "ok": true,
+  "changed": true,
+  "hamming": 3,
+  "text_diff": 26,
+  "settled": true,
+  "verified": "unknown",
+  "appeared": [
+   "iOS8",
+   "ios8原生壁纸",
+   "Q ios8.4.1",
+   "Q ios8备忘录",
+   "Q ios8屏幕录制",
+   "Q ios8备忘录安卓版下载",
+   "Q ios8.0下载并安装",
+   "ios88",
+   "Q ios8怎么样",
+   "Q ios8发布会",
+   "ios8 4s",
+   "+ ios8原生壁纸"
+  ],
+  "disappeared": [
+   "iOS",
+   "1iOS",
+   "2",
+   "ios27.2",
+   "Q i0s27",
+   "Q ios27新功能",
+   "Q ios27值得更新吗",
+   "Q ios是什么意思",
+   "ios官网",
+   "Q ios下载",
+   "Q ios18",
+   "Q ios应用商店",
+   "ios助手",
+   ">"
+  ]
+ }
+}

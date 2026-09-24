@@ -1,12 +1,17 @@
-"""点击的结果统计：点完没变、没变后原样重点、变了之后按返回、带预期的比例、预期核对的分布。
+"""动作结论统计：点击的结果统计（点完没变、没变后原样重点、变了之后按返回、带预期的比例、
+预期核对的分布）之外，再按结论（成了 / 没成 / 没核实）统计全部动作，剧本步单列。
 
-只读 runs/ 留档，不碰设备、不调模型。口径与 docs/superpowers/specs/2026-09-11-点击预期核对-design.md §0 一致；
-以后改点击相关的东西都用它前后对比：
+只读 runs/ 留档，不碰设备、不调模型。点击口径与 docs/superpowers/specs/2026-09-11-点击预期核对-design.md
+§0 一致；结论口径见 docs/superpowers/specs/2026-09-18-不知道不放行-design.md §6.2。以后改这类东西都用它前后对比：
 
     python -m iphone_agent.eval.taps <runs 目录> [--since 20260911]
 
 ⚠ expect 在留档里记在每步的 model.expect 下，不在 action 里。2026-09-11 第一次数的时候查错了位置，
   得出「一次都没写过」，实际是 525 次点击里 51 次（9.7%）。
+
+⚠ 2026-09-18：「一次运行」原来是「有 run.json」；改成「有 steps.jsonl 且至少一条 result.ok 为真的
+  动作记录（含剧本步）」（spec C3）—— 否则一次开局就失败、一步都没执行成的目录也算一次运行，
+  把「运行」和「模型确实做了点什么」混成一件事。
 """
 from __future__ import annotations
 
@@ -73,15 +78,22 @@ def _is_back(s: dict) -> bool:
 
 
 def tap_outcomes(runs_root: Path, since: str | None = None) -> dict:
+    from iphone_agent.harness import verdict as V
+
     c: Counter = Counter()
     checks: Counter = Counter()
+    verdicts: dict[str, Counter] = {}
     for d in sorted(Path(runs_root).iterdir()):
         if not d.is_dir() or not (d / "run.json").exists():
             continue
         if since and d.name[:len(since)] < since:
             continue
-        c["runs"] += 1
         records = _steps(d)
+        # ⚠ 2026-09-18（spec C3）：「一次运行」= 至少一条 result.ok 为真的动作记录（含剧本步）。
+        #   一步都没执行成的目录不算一次运行，否则「运行数」和「模型确实做了点什么」是两件事。
+        if not any((s.get("result") or {}).get("ok") for s in records):
+            continue
+        c["runs"] += 1
         # ⚠ 剧本子步骤（kind=procedure_step）不是模型的点击：没有 model 键、expect 为 None，执行层给它们
         #   写 expect_check.by=missing。算进来会拉低「带预期」、抬高 missing（终审 2026-09-11）。
         #   单独计数，也不进「2 步内」窗口 —— 窗口看的是模型下一步做了什么。
@@ -108,7 +120,22 @@ def tap_outcomes(runs_root: Path, since: str | None = None) -> dict:
                 c["unchanged"] += 1
                 if any(_same_target(s, n) for n in nxt):
                     c["repeat_after_unchanged_2"] += 1
-    return {"counts": dict(c), "expect_check": dict(checks)}
+        # ⚠ 2026-09-18：结论统计覆盖全部动作（不只是点击），经 verdict.of() 读 —— 它对新旧留档是
+        #   同一个函数（verdict.py 模块文档）。n/a（没执行成 / 不改画面的动作 / 剧本工具名）不计入。
+        had_unknown = False
+        for s in records:
+            a, res = s.get("action") or {}, s.get("result") or {}
+            if not a.get("name"):
+                continue
+            v = V.of(a["name"], a.get("args") or {}, res)
+            if v.state == "n/a":
+                continue
+            key = ("procedure:" if s.get("kind") == "procedure_step" else "") + a["name"]
+            verdicts.setdefault(key, Counter())[v.state] += 1
+            had_unknown = had_unknown or (v.state == "unknown" and s.get("kind") != "procedure_step")
+        c["runs_with_unknown"] += had_unknown
+    return {"counts": dict(c), "expect_check": dict(checks),
+            "verdicts": {k: dict(v) for k, v in verdicts.items()}}
 
 
 def _rate(n: int, d: int) -> str:
@@ -128,6 +155,11 @@ def render(stats: dict) -> list[str]:
         lines.append(f"  剧本内点击（未计入上面） {c['procedure_taps']}")
     if stats["expect_check"]:
         lines.append("  预期核对：" + "，".join(f"{k} {v}" for k, v in sorted(stats["expect_check"].items())))
+    if stats.get("verdicts"):
+        lines.append(f"  至少一步没核实的运行  {_rate(c.get('runs_with_unknown', 0), c.get('runs', 0))}")
+        for k, d in sorted(stats["verdicts"].items()):
+            n = sum(d.values())
+            lines.append(f"  {k:<22} 成了 {d.get('met', 0)} · 没成 {d.get('not_met', 0)} · 没核实 {_rate(d.get('unknown', 0), n)}")
     return lines
 
 

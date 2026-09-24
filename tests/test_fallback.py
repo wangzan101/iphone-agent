@@ -29,7 +29,7 @@ def test_first_done_failed_buys_one_full_screen_look_and_the_task_goes_on(fake_e
     assert first["result"]["error"] == "fallback_observe" and first["fallback"] == {"reason": "done_failed"}
     assert first["after_observation"]["perception"]["parse"] == "fallback"
     assert "补看了一次全屏，元素表已更新" in first["result"]["hint"]
-    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0}
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0, "unverified": 0}
 
 
 def test_a_failed_fallback_look_says_so(fake_env, tmp_path):
@@ -47,8 +47,13 @@ class WrongPageJudge(CountingAsker):
 
 
 class FirstTapExpectsModel(ScriptedModel):
-    """ScriptedModel 构造 Action 时 expect 一律是 None；这里只给第一步的 tap 补一句对不上的预期，
-    后面的 tap 不带预期 —— 不问判官，guard 只按「见没见过」记 revisited。"""
+    """只给第一步的 tap 一句明确对不上的预期。
+
+    ⚠ 2026-09-18（Task 6 R12）：原来这里写的是「后面的 tap 不带预期 —— 不问判官，guard 只按
+      「见没见过」记 revisited」。现在 ScriptedModel 的 tap 默认带 expect="预期"（tools.py 里它是必填，
+      loop 有一道必填闸），后面那几步也会去问 WrongPageJudge，于是同样判 off_track 而不是 revisited。
+      两者都算「这一步没进展」，下面那段编排（每步 dead_taps 清零、第 6 步判 stop）因此不变。
+      **不能改回显式 expect=None**：那会被必填闸每隔一步拒一次，脚本消耗速度翻倍，任务变成 done_failed。"""
 
     def decide(self, messages, image_size, tools=None, max_tokens=None):
         reply = super().decide(messages, image_size, tools, max_tokens)
@@ -63,7 +68,11 @@ class FirstTapExpectsModel(ScriptedModel):
 #   第二次熔断没机会判。这个用例考的是「兜底之后熔断还在」，不是恢复阶梯。
 # 第 1 步离开起始屏时落到的 B 屏是没见过的，按 guard 的判据本该算进展（第 7 步才熔断）；
 #   所以第 1 步让看图复核说「没达到预期」（off_track，guard 记 wrong_page），B 记成见过但不算进展。
-#   此后每一步都是回到见过的画面（revisited），dead_taps 每步清零，恢复阶梯不会被碰到。
+# ⚠ 2026-09-18（最终评审 M3）：这里原来写的是「此后每一步都是回到见过的画面（revisited）」，
+#   和下面 FirstTapExpectsModel 的 docstring 自相矛盾。ScriptedModel 的 tap 默认带 expect="预期"
+#   （tools.py 里它是必填），后面那几步也会去问 WrongPageJudge，于是**每一步都判 off_track**、
+#   guard 记 wrong_page，不是 revisited。两者都算「这一步没进展」，dead_taps 每步清零，
+#   恢复阶梯不会被碰到，下面那段编排（第 6 步判 stop）因此不变。
 LOOP = [["通用", "关于本机", "软件更新"], ["隐私与安全性", "定位服务", "跟踪"]]
 LOOP_MOVES = {(0, "tap"): INITIAL_SETTLE_FRAMES + 1, (INITIAL_SETTLE_FRAMES + 1, "tap"): 0}
 
@@ -80,13 +89,13 @@ def test_first_stop_buys_one_look_then_three_more_unproductive_steps_end_the_tas
     assert prog[0]["fallback"] == {"reason": "no_progress"}
     assert prog[0]["after_observation"]["perception"]["parse"] == "fallback"
     assert "程序补看了一次全屏" in json.dumps(m.seen[6], ensure_ascii=False)
-    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 1}
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 1, "unverified": 0}
 
 
 def test_both_triggers_share_one_quota(fake_env, tmp_path):
     r, *_ = run_with(fake_env, [["a"]] * 80, [FAILED] + TAPS, tmp_path, asker=CountingAsker())
     assert r.end_reason == "no_progress" and r.steps == 7
-    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0}
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0, "unverified": 0}
 
 
 def test_off_mode_never_falls_back(fake_env, tmp_path):
@@ -168,19 +177,19 @@ OBSERVE = [("observe", {})]
 def test_always_does_not_fall_back_on_a_zoom_of_a_parsed_frame(fake_env, tmp_path):
     r, *_ = run_with(fake_env, [["通用"]] * 6, [ZOOM, FAILED, FAILED], tmp_path, mode="always", asker=Labeler())
     assert r.end_reason == "done_failed" and r.steps == 2
-    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0}
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0, "unverified": 0}
 
 
 def test_on_demand_zoom_after_a_full_screen_look_does_not_fall_back(fake_env, tmp_path):
     r, *_ = run_with(fake_env, [["通用"]] * 8, [OBSERVE, ZOOM, FAILED, FAILED], tmp_path, asker=Labeler())
     assert r.end_reason == "done_failed" and r.steps == 3
-    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0}
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0, "unverified": 0}
 
 
 def test_on_demand_zoom_of_an_ocr_only_frame_still_falls_back(fake_env, tmp_path):
     r, *_ = run_with(fake_env, [["通用"]] * 8, [ZOOM, FAILED, FAILED], tmp_path, asker=Labeler())
     assert r.end_reason == "done_failed" and r.steps == 3
-    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0}
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0, "unverified": 0}
 
 
 def test_a_zoom_frame_carries_its_base_frames_outcome_but_is_never_labelled(fake_env):
@@ -211,8 +220,56 @@ def test_after_the_no_progress_fallback_the_state_view_drops_the_old_transition(
     m = FirstTapExpectsModel(TAPS)
     r = run_task("t", dev, per, m, tmp_path, run_config=RunConfig(screen_parse="on_demand", context_mode="state"),
                  store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
-    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 1}
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 1, "unverified": 0}
     # 系统提示词里也提到【上一步之后】，所以认的是 transition.render 那一行「整屏：有变化 / 无变化」。
     assert "整屏：" in json.dumps(m.seen[5], ensure_ascii=False), "对照：平时这一段是在的"
     after_fb = json.dumps(m.seen[6], ensure_ascii=False)
     assert "程序补看了一次全屏" in after_fb and "整屏：" not in after_fb
+
+
+# ---------- 连续没核实也是一个「程序自己知道的时刻」（spec 2026-09-18 C2，计划 R6）----------
+# ⚠ 2026-09-18 现场 一次真机运行的第 12 步：点歪进了微博登录页，没写 expect → 没人核对 →
+#   「变了且是新画面」→ 计数清零。连续几步都这样，程序补看一次全屏并明说给模型。
+#   这份额度和另两种触发共用「每任务至多一次」。
+UNVERIFIED_SPECS = [["a"]] * 3 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6
+UNVERIFIED_TAPS = [[("tap", {"x": 100 + i, "y": 65})] for i in range(3)]
+
+
+def test_three_unverified_steps_buy_one_full_screen_look(fake_env, tmp_path):
+    """有看图的一方、但它一句都没问成（CountingAsker）→ 每步 unknown/unverified，第三步兜底补看。"""
+    r, dev, per, m = run_with(fake_env, UNVERIFIED_SPECS, UNVERIFIED_TAPS + [FAILED], tmp_path,
+                              asker=CountingAsker())
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0, "unverified": 1}
+    prog = [x for x in _recs(r) if x.get("by") == "program"]
+    assert len(prog) == 1 and prog[0]["fallback"] == {"reason": "unverified"}
+    assert prog[0]["action"]["name"] == "observe"
+    said = json.dumps(m.seen[3], ensure_ascii=False)
+    assert "连续 3 步没有核实" in said and "补看了一次全屏" in said
+
+
+def test_unverified_takes_the_quota_first_and_no_progress_gets_none(fake_env, tmp_path):
+    """⚠ 2026-09-18（最终评审 I4）：三种触发共用「每任务至多一次」那一份额度，**先到先得**。
+
+    「连续没核实」发生在熔断之前，于是它先把额度花掉；之后真的 no_progress → stop 时就没得补看了，
+    任务直接以 no_progress 结束。这是**已知取舍**（计划 R6），不是缺陷：没核实那几步正是最需要
+    一张完整元素表的时候，而熔断那一刻程序至少还能把「连续几步无进展」的说法交回模型。
+    这条用例把这个先后顺序钉死，免得以后有人「顺手」把熔断排到前面而没人发现。"""
+    specs = [["a"]] * 3 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6 + [["e"]] * 80
+    r, dev, per, m = run_with(fake_env, specs, UNVERIFIED_TAPS + TAPS, tmp_path, asker=CountingAsker())
+    assert r.end_reason == "no_progress", r.error
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0, "unverified": 1}
+    prog = [x for x in _recs(r) if x.get("by") == "program"]
+    assert len(prog) == 1 and prog[0]["fallback"] == {"reason": "unverified"}, "熔断那次没有再补看"
+
+
+def test_a_used_up_quota_leaves_only_the_sentence(fake_env, tmp_path):
+    """额度被 done(failed) 先用掉了：只把那句话告诉模型，不再补看（计划 R6）。"""
+    # 头两帧留给 done(failed) 那次兜底（它也要截一帧），后面每一下点击才落到新画面上。
+    specs = [["a"]] * 2 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6 + [["e"]] * 6
+    r, dev, per, m = run_with(fake_env, specs, [FAILED] + UNVERIFIED_TAPS + [FAILED],
+                              tmp_path, asker=CountingAsker())
+    assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0, "unverified": 0}
+    # done(failed) 那次兜底是就地改写那条动作记录（不是 by=program 的补看），所以这里一条程序记录都不该有
+    assert not [x for x in _recs(r) if x.get("by") == "program"]
+    said = json.dumps(m.seen[4], ensure_ascii=False)
+    assert "连续 3 步没有核实" in said and "先 observe" in said

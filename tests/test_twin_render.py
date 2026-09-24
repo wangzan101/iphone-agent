@@ -184,7 +184,7 @@ def fake_twin(spec, app="settings"):
     return st, made
 
 
-#: 真机 一次真机运行 的形状：设置首页 / 通用 / 关于本机 都认得出，
+#: 真机 一次真机运行里的形状：设置首页 / 通用 / 关于本机 都认得出，
 #: 任务文本里却只有「iOS 版本」，【路线】一个字也给不出（见 test_visited_is_the_fallback…）。
 REAL = {
     "设置首页": (6, "confirmed", [("通用", "通用", 4), ("电池", "电池", 2),

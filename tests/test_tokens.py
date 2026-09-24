@@ -265,7 +265,7 @@ def test_every_production_segment_name_is_accounted_for():
 
 
 def test_real_device_screenshot_624x1388_is_862_tokens():
-    """真机截图尺寸（624x1388）按官方 smart_resize 手算：
+    """真机截图尺寸（iPhone，624x1388）按官方 smart_resize 手算：
 
         round(624/32) = round(19.5) = 20 -> w_bar = 640
         round(1388/32) = round(43.375) = 43 -> h_bar = 1376
@@ -404,25 +404,46 @@ def test_rounding_can_push_area_above_min_pixels_by_design():
 def test_exact_constants_are_keyed_by_hashes_the_code_actually_produces():
     """常量表的键必须是**当前代码算出来的** hash，不能是人手编的字符串。
 
-    这条测试就是那个「别自己编一个键」的执行版：system 的键由
-    prompt.prompt_hash 现算，tools_schema 的键由 budget 里那套序列化现算。
-    提示词、PROMPT_VERSION、工具表任何一处一改，这条测试就红 —— 那正是提醒
+    这条测试就是那个「别自己编一个键」的执行版：system 的键由 prompt.prompt_hash 现算。
+    提示词或 PROMPT_VERSION 一改，这条测试就红 —— 那正是提醒
     「实测值失效了，要么重标，要么把这条常量删掉」。
+
+    ⚠ 2026-09-18（Task 6 评审发现 1）：tools_schema 那半边**搬到了下面那条独立用例**里。
+      原来两半写在一起，这条整体 xfail(strict) 之后 tools_schema 那行永远跑不到 ——
+      全仓只有这一处钉它，等于重标之前误改 tools.py 一个字都不会被任何测试发现。
+      xfail 只该盖住真正欠着的那一半。
+    """
+    from iphone_agent.harness.prompt import prompt_hash
+
+    # 2026-09-17：剧本段拆成两半之后，**在跑的**是两种组合 —— 剧本工具关（生产默认，
+    # IPHONE_SKILL_TOOLS=off）和开。两条都必须有自己的实测常量，少一条就意味着
+    # 那条路径上最大的一段在静静走估算。
+    for has_proc_tools in (False, True):
+        sys_key = prompt_hash(allow_coord_tap=True, has_knowledge=True,
+                              has_proc_tools=has_proc_tools)
+        assert ("system", sys_key) in tokens.EXACT_SEGMENT_TOKENS, (
+            f"has_proc_tools={has_proc_tools} 这版 system 的实测常量对不上当前提示词的 hash。"
+            "要么提示词改了（重跑 --probe segments 重标），要么这个键是手编的。")
+    # 两版是两条不同的常量，不是同一条被写了两遍。
+    assert len({k for k in tokens.EXACT_SEGMENT_TOKENS if k[0] == "system"}) == 2
+
+
+def test_tools_schema_exact_constant_is_still_pinned():
+    """工具表那一段的实测常量：键由 budget 里那套序列化现算，改 tools.py 任何一个字都会红。
+
+    ⚠ 2026-09-18（Task 6 评审发现 1）：从上面那条里拆出来，**绝不能跟着 system 一起 xfail** ——
+      这是全仓唯一钉住「tools.py 没被误改」的地方，它一哑，误改就要等到真机上才发现。
     """
     import hashlib
     import json
 
-    from iphone_agent.harness.prompt import prompt_hash
     from iphone_agent.harness.tools import tool_defs
-
-    sys_key = prompt_hash(allow_coord_tap=True, has_skills=True)
-    assert ("system", sys_key) in tokens.EXACT_SEGMENT_TOKENS, (
-        "system 的实测常量对不上当前提示词的 hash。要么提示词改了（重跑 "
-        "--probe segments 重标），要么这个键是手编的。")
 
     blob = json.dumps(tool_defs(True), sort_keys=True, ensure_ascii=False)
     tools_key = hashlib.sha256(blob.encode("utf-8")).hexdigest()
-    assert ("tools_schema", tools_key) in tokens.EXACT_SEGMENT_TOKENS
+    assert ("tools_schema", tools_key) in tokens.EXACT_SEGMENT_TOKENS, (
+        "工具表的实测常量对不上当前 tool_defs 的 hash：要么 tools.py 改了（重跑 "
+        "--probe segments 重标），要么这个键是手编的。")
 
 
 def test_exact_layer_wins_and_reports_itself():

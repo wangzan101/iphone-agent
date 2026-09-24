@@ -14,9 +14,15 @@ from collections import Counter
 from dataclasses import dataclass
 
 from iphone_agent import config
+from iphone_agent.harness import verdict as verdict_mod
 
 NOTE_MAX = 60
 NO_CHANGE_SEMANTICS = {"recall", "recall_runs", "observe", "wait", "done", "handover"}
+# ⚠ 2026-09-18（最终评审 M10）：滚着找东西的两个动作，「滚到底了没有这一项」是**正当答案**不是失败。
+#   verdict.of() 给它 not_met/text（守卫要靠这个否定判无进展），expected 列照读的话，这一行会以
+#   「no(文字)」进【更早】的「没达到预期的」一节 —— 模型读到的是「这一步错了」，而它其实办完了事。
+#   这一列对它们保持 unknown、不填，和 by=="pixels" 不填同理（下面那段注释）。
+FOUND_OR_NOT = {"scroll_until", "collect"}
 
 
 @dataclass(frozen=True)
@@ -92,18 +98,28 @@ def row_from_record(record: dict, elements_by_id: dict[int, str] | None = None) 
     note = ev.get("note")
     # 模型的自评字段从来没人填（2026-09-09 统计 103 次运行一次没有），这一列永远 unknown。
     # 判官看图判了「变了但没达到预期」时用它补上，并标明是看图判的 —— 模型自己答了以它为准。
-    judged = result.get("judged") or {}
-    ec = result.get("expect_check") or {}
-    if expected == "unknown" and ec.get("met") is not None:
-        # 2026-09-11：点击的预期由程序核对（executor 的 expect_check），这一列按它填、标明怎么核的。
-        # 模型自己答了 eval 仍以它为准（上面的 expected 已经不是 unknown）。
-        expected = ("yes" if ec["met"] else "no") + ("(文字)" if ec.get("by") == "text" else "(看图)")
-        if not ec["met"]:
-            note = note or judged.get("why")
-    elif expected == "unknown" and result.get("changed") and judged.get("worked") is False:
-        # 老留档没有 expect_check：判官看图判了「变了但没达到预期」时照旧补上。
-        expected = "no(看图)"
-        note = note or judged.get("why")
+    # ⚠ 2026-09-18：这里原来直接读 expect_check / judged 两个旧字段，各读各的含义。Task 3 把
+    #   「画面没变的 tap」的 expect_check 改成 {met: None, by: not_asked}（不再拿「生效了吗」的
+    #   答案冒充「达到预期了吗」）之后，这条读法看不到判官的结论了，「没变 + 看图说没生效」的 tap
+    #   从 no(看图) 静默退成了 unknown。结论其实在 verdict 里（verdict.of() 对新旧留档是同一个
+    #   函数，见 verdict.py 模块文档），改读它：旧留档没有 verdict 键，of() 会从旧字段推导，
+    #   与这里原来的两段分支逐字节对齐（除一种极少见的旧形状，见下）。
+    if expected == "unknown" and name not in FOUND_OR_NOT:
+        v = verdict_mod.of(name, args, result)
+        if v.state == "met" or v.state == "not_met":
+            if v.by == "text":
+                label = "(文字)"
+            elif v.by in ("vision", "readback", "identity"):
+                label = "(看图)"
+            else:
+                # by == "pixels"（或其它未知来源）：像素判据的成/没成已经在同一行的 changed 列里说过，
+                # 不在这一列里再说一遍；而且 changed=no 不等于失败（滚到底就是这样，见 prompt.py 对
+                # 这张表的说明）。保持 unknown、不填。
+                label = None
+            if label:
+                expected = ("yes" if v.state == "met" else "no") + label
+                if v.state == "not_met":
+                    note = note or v.why
     if not note:
         if executed == "error":
             note = result.get("hint") or result.get("error") or ""

@@ -102,7 +102,12 @@ def test_unchanged_tap_with_expectation_uses_the_existing_negative_side_check(fa
     judge = _Judge({"worked": False, "confidence": 0.9, "why": "两张图一样"})
     res, _ = _tap(fake_env, judge, "出现「关于本机」", ["通用"], ["通用"])
     assert res.changed is False
-    assert res.extra["expect_check"] == {"met": False, "by": "vision"}
+    # ⚠ 2026-09-18（spec B5）：这里问的是「动作生效了吗」，从来没问过「是不是预期的样子」——
+    #   原来把前者的答案写成 expect_check.met=False，两个问题混了。答案只进 judged，
+    #   expect_check 如实写 not_asked；结论在 verdict 里。
+    assert res.extra["expect_check"] == {"met": None, "by": "not_asked"}
+    assert res.extra["judged"] == {"worked": False, "confidence": 0.9, "why": "两张图一样"}
+    assert res.extra["verdict"] == {"state": "not_met", "by": "vision", "why": "两张图一样"}
     assert "看图复核也说没生效" in res.hint
 
 

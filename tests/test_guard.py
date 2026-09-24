@@ -128,7 +128,7 @@ def test_other_actions_still_count():
 
 # --- 两种「无进展」必须分开说 ---
 #
-# 2026-09-08 真机踩到（runs/20260908-022024-e257）：模型在底部 tab 之间来回点，
+# 2026-09-08 真机踩到（一次真机运行）：模型在底部 tab 之间来回点，
 # 每一步 changed=True，画面真的变了，熔断判「无进展」判**对**了 —— 回到见过的
 # 画面就是原地打转。但给它的说法是「连续 6 步没有检测到画面变化」。
 # 于是模型以为自己**没点中**，换了三个不同的图标继续试，在错误的假设上白烧六步。
@@ -240,3 +240,114 @@ def test_grant_fallback_rewinds_to_warn_so_the_breaker_fires_again():
     verdicts = [g.record_outcome(Action("tap", {"x": i, "y": 1}, "r", None, "c"), changed=False)
                 for i in range(config.NO_PROGRESS_STOP - config.NO_PROGRESS_WARN)]
     assert verdicts[-1] == "stop" and verdicts[:-1] == [None] * (len(verdicts) - 1)
+
+
+# --- 没核实的一步不算进展（spec 2026-09-18 C2）---
+#
+# ⚠ 2026-09-18 现场 一次真机运行的第 12 步：点歪进了微博登录页，没写 expect →
+#   没人核对 →「变了且是新画面」→ 无进展计数清零。错页面被记成了进展，同一个坐标后面又点了两轮。
+
+def _res(changed, **extra):
+    from iphone_agent.harness.executor import ToolResult
+    return ToolResult(ok=True, changed=changed, extra=extra)
+
+
+def _obs(key):
+    from types import SimpleNamespace
+    return SimpleNamespace(state_key=key)
+
+
+UNKNOWN = {"verdict": {"state": "unknown", "by": "missing"}}
+MET = {"verdict": {"state": "met", "by": "text"}}
+
+
+def test_unverified_step_does_not_reset_no_progress():
+    g = ActionGuard()
+    g.no_progress, g.last_reason = 2, "revisited"
+    assert g.record_result(act("tap", x=1, y=1), _res(True, **UNKNOWN), _obs(11)) is None
+    assert g.no_progress == 2 and g.last_reason == "revisited"     # 到了新画面也不清零：没核实的一步不是进展
+    assert g.unverified_streak == 1
+
+
+def test_unverified_step_still_clears_dead_taps_and_remembers_the_screen():
+    # ⚠ record_outcome 里那两处是 dead_taps 唯二的清零点。漏了它，画面明明变了的点击也会攒到 3 去爬 tap 恢复阶梯。
+    g = ActionGuard()
+    g.dead_taps = 2
+    g.record_result(act("tap", x=1, y=1), _res(True, **UNKNOWN), _obs(11))
+    assert g.dead_taps == 0
+    assert 11 in g._seen_screens
+
+
+def test_unverified_never_makes_the_guard_more_lenient():
+    # 计划 R10：没有看图的一方时每个「变了」的点击都是 unknown。回到见过的画面、画面没变，照旧加一。
+    g = ActionGuard()
+    g.record_screen(7)
+    g.record_result(act("tap", x=1, y=1), _res(True, **UNKNOWN), _obs(7))       # revisited
+    assert g.no_progress == 1 and g.last_reason == "revisited"
+    g.record_result(act("tap", x=2, y=1), _res(False, **UNKNOWN), _obs(7))      # unchanged
+    assert g.no_progress == 2 and g.dead_taps == 1
+    assert g.unverified_streak == 0                  # 连续计数只数「本来会被当成进展」的那种
+
+
+def test_three_unverified_in_a_row_asks_for_a_full_look_once():
+    g = ActionGuard()
+    out = [g.record_result(act("tap", x=i, y=1), _res(True, **UNKNOWN), _obs(20 + i)) for i in range(4)]
+    assert out == [None, None, "unverified", None]           # 只在正好等于阈值时报一次
+    assert g.unverified_streak == 4
+
+
+def test_a_checked_step_ends_the_streak_even_when_it_made_no_progress():
+    """⚠ 2026-09-18（最终评审 I2）：streak 要的是**严格连续**。spec C2 原文是「任何 met/not_met 清零」，
+    而原来只有「变了、是新画面、没核实」那一支才碰它 —— 走到「没变 / 回到见过的画面 / 偏航」那一段
+    的核实过的一步既不清零也不加一，于是「没核实 → 核实过的 revisited → 没核实 → 没核实」被当成连续三步，
+    白白报一次「连续没核实」、还花掉任务唯一那份兜底额度。
+    没核实的非进展步照旧不清零（下面 test_unverified_never_makes_the_guard_more_lenient 钉着）。"""
+    g = ActionGuard()
+    g.record_screen(41)
+    out = [g.record_result(act("tap", x=1, y=1), _res(True, **UNKNOWN), _obs(40)),   # 没核实的进展
+           g.record_result(act("tap", x=2, y=1), _res(True, **MET), _obs(41)),       # 核实过，但是 revisited
+           g.record_result(act("tap", x=3, y=1), _res(True, **UNKNOWN), _obs(42)),
+           g.record_result(act("tap", x=4, y=1), _res(True, **UNKNOWN), _obs(43))]
+    assert out[3] != "unverified", "中间那一步有人核实过，连续就断了"
+    assert g.unverified_streak == 2
+
+
+def test_a_verified_step_ends_the_streak():
+    g = ActionGuard()
+    for i in range(2):
+        g.record_result(act("tap", x=i, y=1), _res(True, **UNKNOWN), _obs(30 + i))
+    g.record_result(act("tap", x=9, y=1), _res(True, **MET), _obs(39))
+    assert g.unverified_streak == 0 and g.no_progress == 0
+
+
+def test_exempt_actions_do_not_touch_the_streak():
+    g = ActionGuard()
+    g.unverified_streak = 2
+    g.record_result(act("type", text="a"), _res(True, verdict={"state": "unknown", "by": "unverified"}), _obs(1))
+    assert g.unverified_streak == 2                # type 在 NO_PROGRESS_EXEMPT 里，这一道整个不管它
+
+
+def test_off_track_also_reads_expect_check_when_judged_has_no_on_change():
+    """⚠ 2026-09-18（最终评审 I3）：「低于指纹分辨率 + 写了 expect」那条路（executor._after 的
+    `不写 hint` 那一支）第二问答「没达到预期」时，judged 按设计留的是**第一问**（生效了吗）的答案、
+    不带 on_change —— 守卫旧判据 `on_change and judged.worked is False` 读不到，这一步于是被记成
+    进展并把无进展计数清零。结论其实写在 expect_check.met 里，一起认。"""
+    g = ActionGuard()
+    g.no_progress, g.last_reason = 1, "unchanged"
+    res = _res(True, judged={"worked": True, "confidence": 0.9, "why": "开关翻了"},
+               expect_check={"met": False, "by": "vision"},
+               verdict={"state": "not_met", "by": "vision", "why": "进的是别的页"})
+    g.record_result(act("tap", x=1, y=1), res, _obs(61))
+    assert g.no_progress == 2 and g.last_reason == "wrong_page"
+
+
+def test_a_caller_that_checks_for_itself_is_not_counted_as_unverified():
+    """⚠ 2026-09-18（Task 7 评审发现 2）：剧本每一步用指纹自己核对过（procedure.py 的 fingerprint.matches，
+    对不上就 expect_mismatch 中止），它的 tap 结论恒是 unknown/missing 只是因为内部动作从不写 expect。
+    这种调用方传 count_unverified=False，这一道整个不管它 —— 行为与改动前逐字相同。"""
+    g = ActionGuard()
+    g.no_progress, g.last_reason = 2, "revisited"
+    assert g.record_result(act("tap", x=1, y=1), _res(True, **UNKNOWN), _obs(11),
+                           count_unverified=False) is None
+    assert g.no_progress == 0 and g.last_reason is None      # 到了新画面就是进展，照旧清零
+    assert g.unverified_streak == 0

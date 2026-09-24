@@ -121,6 +121,37 @@ def test_expect_mismatch_hands_back_current_screen(harness):
     assert "从这儿接着手动做" in res.hint and new is not None and "别的屏" in new.text_set
 
 
+# 2026-09-07 提取、2026-09-16 真机上一跑就废的那条指纹（一次真机运行的第 1 步）：
+# 4 个真锚点 + 状态栏时钟 + 3 个只有整屏解析才有的图标名。
+LEGACY = ("今 ④5", "设置", "蜂窝网络", "向右箭头", "个人热点",
+          "电池图标（绿色电池）", "电池", "VPN图标（蓝色地球仪）")
+
+
+def test_legacy_fingerprint_ignores_status_bar_and_vision_only_junk(harness):
+    """老剧本里那些永远对不上的词不该再让整条剧本中止：真锚点还在，就算到了该到的屏。"""
+    sim, runner, obs, log = harness([["设置", "通用"], ["设置|蜂窝网络", "个人热点|电池"]])
+    res, _ = runner.run(proc([M.Step(do="tap", target="通用", expect=LEGACY)]), {}, obs, "c1", "settings__p")
+    assert res.ok and res.extra["steps_done"] == 1
+
+
+def test_a_really_different_screen_still_fails(harness):
+    """过滤掉对不上的词不等于不再核对：真锚点一个都不在，照旧 expect_mismatch。"""
+    sim, runner, obs, log = harness([["设置", "通用"], ["微信|通讯录", "发现|我"]])
+    res, _ = runner.run(proc([M.Step(do="tap", target="通用", expect=LEGACY)]), {}, obs, "c1", "settings__p")
+    assert not res.ok and res.error == "expect_mismatch"
+
+
+def test_mismatch_hint_shows_expected_and_actual(harness):
+    """失败要能被看见（CLAUDE.md §3）：只说「期望什么」，下一个人还得自己去翻留档才知道当时在哪。"""
+    sim, runner, obs, log = harness([["设置", "通用"], ["微信|通讯录", "发现|我"]])
+    res, _ = runner.run(proc([M.Step(do="tap", target="通用", expect=("关于本机", "软件更新"))]),
+                        {}, obs, "c1", "settings__p")
+    assert "关于本机" in res.hint and "软件更新" in res.hint
+    assert "微信" in res.hint and "通讯录" in res.hint
+    assert res.extra["expected"] == ["关于本机", "软件更新"] and res.extra["matched"] == []
+    assert "微信" in res.extra["actual"]
+
+
 def test_target_not_found_without_find_does_not_scroll(harness):
     sim, runner, obs, log = harness([["设置"]])
     res, new = runner.run(proc([M.Step(do="tap", target="通用", expect=())]), {}, obs, "c1", "settings__p")
@@ -239,3 +270,44 @@ def test_read_step_also_checks_the_deadline(harness):
     p = proc([M.Step(do="read", row="iOS版本", as_="version")], returns=["version"])
     res, _ = runner.run(p, {}, obs, "c1", "settings__p")
     assert res.error == "procedure_limit" and res.extra["step"] == 1
+
+
+# ⚠ 2026-09-18（Task 7 评审发现 1、2）：剧本内部动作的 tap expect 恒为 None（procedure.py 造 Action 那处），
+#   结论于是恒是 unknown —— 但剧本每一步都用指纹自己核对过，说它「没人核实」是错的。
+#   不排除的话：进剧本时的 no_progress 会原样带着走完整条剧本（本来第一个到新画面的动作就该清零），
+#   而且新的 "unverified" 会盖掉 guard_verdict 里的 warn（那几行是按 warn → stop 单调升级写的）。
+
+def test_a_replay_that_reaches_new_screens_clears_the_no_progress_count(harness):
+    sim, runner, obs, log = harness([["设置", "通用"], ["关于本机", "软件更新"], ["iOS版本|18.3.1", "型号名称"]])
+    runner.guard.no_progress = 2
+    p = proc([M.Step(do="tap", target="通用", expect=("关于本机",)),
+              M.Step(do="tap", target="关于本机", expect=("iOS版本",))])
+    res, _ = runner.run(p, {}, obs, "c1", "settings__p")
+    assert res.ok and res.extra["steps_done"] == 2
+    assert runner.guard.no_progress == 0 and runner.guard.unverified_streak == 0
+
+
+def test_a_replay_never_hands_back_an_unverified_verdict(harness):
+    sim, runner, obs, log = harness([["设置", "通用"], ["关于本机", "软件更新"],
+                                     ["iOS版本|18.3.1", "型号名称"], ["电池|健康", "充电"]])
+    p = proc([M.Step(do="tap", target="通用", expect=("关于本机",)),
+              M.Step(do="tap", target="关于本机", expect=("iOS版本",)),
+              M.Step(do="tap", target="型号名称", expect=("电池",))])
+    res, _ = runner.run(p, {}, obs, "c1", "settings__p")
+    assert res.ok and res.extra.get("guard_verdict") is None
+
+
+def test_a_warn_inside_a_replay_survives_the_steps_that_follow(harness):
+    """warn 之后又走了几步到新画面：那几步不该把 warn 顶掉（它们是「自己核对过」的，不是 unknown）。
+    ⚠ 单调升级那几行（procedure.py:217-220）的前提就是判决只有 warn / stop 两级。"""
+    same = ["设置", "通用|关于本机"]
+    sim, runner, obs, log = harness([same, same, ["一", "二"], ["三", "四"], ["五", "六"]])
+    runner.guard.no_progress = config.NO_PROGRESS_WARN - 1
+    p = proc([M.Step(do="tap", target="通用", expect=("设置",)),        # 画面没变 → 第 3 次无进展 → warn
+              # 后面三步都到新画面（换目标绕开同屏去重）。排除之前，第三步会报 "unverified" 把 warn 顶掉。
+              M.Step(do="tap", target="关于本机", expect=("一",)),
+              M.Step(do="tap", target="一", expect=("三",)),
+              M.Step(do="tap", target="三", expect=("五",))])
+    res, _ = runner.run(p, {}, obs, "c1", "settings__p")
+    assert res.ok and res.extra["steps_done"] == 4
+    assert res.extra.get("guard_verdict") in (None, "warn"), "不能是 unverified"

@@ -206,6 +206,61 @@ def test_unchanged_tap_that_vision_says_did_not_work_is_no_by_vision():
     assert "两张图一样" in row.note
 
 
+def test_expected_reads_the_verdict_when_still_unknown():
+    """⚠ 2026-09-18：Task 3 把「画面没变的 tap」的 expect_check 改成 {met: None, by: not_asked} 之后，
+    这一列原来读 expect_check 的写法就静默退化成了 unknown —— 结论其实在 verdict 里（新留档自带），改读它。
+    这条修之前是红的（旧写法只认 expect_check / judged.worked，看不见 verdict）。"""
+    row = row_from_record(rec(10, "tap", {"id": 1},
+                              {"ok": True, "changed": False,
+                               "judged": {"worked": False, "why": "两张图一样"},
+                               "expect_check": {"met": None, "by": "not_asked"},
+                               "verdict": {"state": "not_met", "by": "vision", "why": "没动"}}))
+    assert row.expected == "no(看图)" and "没动" in row.note
+
+
+def test_expected_reads_verdict_met_text():
+    row = row_from_record(rec(11, "tap", {"id": 1},
+                              {"ok": True, "changed": True, "verdict": {"state": "met", "by": "text"}}))
+    assert row.expected == "yes(文字)"
+
+
+def test_expected_reads_verdict_unknown_stays_unknown():
+    row = row_from_record(rec(12, "tap", {"id": 1},
+                              {"ok": True, "changed": True, "verdict": {"state": "unknown", "by": "missing"}}))
+    assert row.expected == "unknown"
+
+
+def test_expected_eval_still_beats_the_verdict():
+    row = row_from_record(rec(13, "tap", {"id": 1},
+                              {"ok": True, "changed": True, "verdict": {"state": "not_met", "by": "vision"}},
+                              eval={"expected": "yes", "note": "其实到了"}))
+    assert row.expected == "yes" and row.note == "其实到了"
+
+
+def test_expected_ignores_pixels_because_changed_column_already_says_it():
+    """像素判据的成 / 没成同一行的 changed 列已经说过；changed=no 不等于失败（滚到底就是这样，
+    见 prompt.py 对这张表的说明），expected 列不重复这件事，保持 unknown、不填。"""
+    row = row_from_record(rec(14, "tap", {"id": 1},
+                              {"ok": True, "changed": True, "verdict": {"state": "met", "by": "pixels"}}))
+    assert row.expected == "unknown"
+
+
+def test_scroll_until_that_found_nothing_is_not_a_missed_expectation():
+    """⚠ 2026-09-18（最终评审 M10）：「滚到底了没有这一项」是一个**正当答案**，不是没达到预期。
+
+    verdict.of() 给它 not_met/text（守卫要靠它判无进展），expected 列照读的话，这一行会以
+    「no(文字)」进【更早】的「没达到预期的」一节，模型读到的是「这一步错了」——
+    而它其实办完了模型交代的事。和 by=="pixels" 不填同理：结论已经在动作自己的结果里说清楚了。"""
+    row = row_from_record(rec(15, "scroll_until", {"direction": "down", "text": "关于本机"},
+                              {"ok": True, "found": False, "screens": 3, "reached_end": True,
+                               "verdict": {"state": "not_met", "by": "text"}}))
+    assert row.expected == "unknown"
+    row = row_from_record(rec(16, "collect", {"direction": "down"},
+                              {"ok": True, "count": 12, "screens": 3,
+                               "verdict": {"state": "met", "by": "text"}}))
+    assert row.expected == "unknown"
+
+
 def test_earlier_block_lists_steps_the_check_said_missed():
     """expected 实际写的是「no(看图)」，不是裸「no」。只认 == "no" 时【更早】的「没达到预期的」一节
     从来没命中过，长任务会把走错页的步静默压掉（终审 2026-09-11 T5-b）。"""

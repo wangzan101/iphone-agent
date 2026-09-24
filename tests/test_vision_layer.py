@@ -344,23 +344,35 @@ def test_a_committed_chinese_word_is_not_reported_as_no_change(fake_env):
     'nihao' 变成 '你好' 只贡献 hamming=1、text_diff=6，两个都低于阈值（2 / 8）。
     当时模型据此以为没输入成功，去点了撤销、又重打一遍，白花两步。
     这条路不走 _after，所以复核必须在 _commit_candidate 里自己做。
+
+    ⚠ 2026-09-18（Task 4）：复核换成了和 ASCII 打字同一条（_conclude_type）。这里「你好」是
+      点完才出现在屏上的新文字，文字判据自己就给得出肯定结论 —— 结论是 met 就按落了报 changed，
+      一次看图都不用花。原来那个自问 did_action_work、自拼 judged 的分支整段没了，
+      所以断言从 judged 换成了 verdict / verified；「不能报没变化」这条事故本身没改。
     """
     dev, per, _ = _committed_env(fake_env)
     obs = per.observe(dev.capture())
-    asker = FakeAsker({"worked": True, "confidence": 0.95, "why": "输入框里出现了「你好」"})
+    asker = FakeAsker({"landed": True, "field_changed": True, "seen": "你好"})
     res, _new = Executor(dev, per, asker=asker).run(act("type", text="你好"), obs)
     assert res.ok and res.extra["picked"] == "1你好"
     assert res.changed is True, "字都上屏了还报没变化，模型会以为白打了"
-    assert res.extra["judged"]["why"] == "输入框里出现了「你好」"
+    assert res.extra["verified"] == "true"
+    assert res.extra["verdict"] == {"state": "met", "by": "text"}
+    assert asker.prompts == [], "文字判据已经给出肯定结论了，不该再花一次看图"
 
 
-def test_a_committed_word_without_an_asker_keeps_the_old_verdict(fake_env):
-    """降级路：没有 asker 时照旧按像素判据报，不假装。"""
+def test_a_committed_word_without_an_asker_still_lands_by_text(fake_env):
+    """降级路：没有 asker 也不靠像素下结论 —— 「你好」是点完才出现的新文字，文字判据说了算。
+
+    ⚠ 2026-09-18（Task 4）：这条原来叫 ..._keeps_the_old_verdict，断言 changed is False
+      （没有看图的一方就退回像素判据）。现在像素判据不再是最后一句话：同一条核对里，
+      文字判据的肯定结论（CLAUDE.md §2）先于像素，所以没有 asker 也报 changed=True。
+    """
     dev, per, _ = _committed_env(fake_env)
     obs = per.observe(dev.capture())
     res, _new = Executor(dev, per).run(act("type", text="你好"), obs)
     assert res.ok and "judged" not in res.extra
-    assert res.changed is False
+    assert res.changed is True and res.extra["verified"] == "true"
 
 
 # ---------- 手：回车与退格。driver 早就能做，工具面一直没接 ----------

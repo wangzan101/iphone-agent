@@ -96,6 +96,18 @@ class RunLog:
         """剧本内部动作的子记录。kind 字段让屏幕图和提取器能区分它，旧日志没有 kind 就是普通 step。"""
         self.step({"kind": "procedure_step", **record})
 
+    def set_prompt_hash(self, value: str) -> None:
+        """把 prompt_hash 校正成**真正发出去的那段系统提示词**的 hash。
+
+        ⚠ 2026-09-17：构造 RunLog 时还不知道这次到底会不会带剧本工具 —— 那要等路由
+          跑完、select_procedures 选完才定（loop.py）。而运行目录必须开跑时就交出去
+          （on_start），不能为了这一个字段把 RunLog 推到一次网络调用之后。所以构造时
+          先写「按开关推算的那一版」，装配系统提示词时用真正的字节覆盖它。
+          留档以**发出去的字节**为准，不以开关为准。
+        """
+        self._run["prompt_hash"] = value
+        self._write_run()
+
     def set_knowledge(self, knowledge: dict) -> None:
         """路由结果、注入原文、工具列表、剧本执行情况、提取结果。与 memory 并列，写在 finish 之后。"""
         self._run["knowledge"] = knowledge

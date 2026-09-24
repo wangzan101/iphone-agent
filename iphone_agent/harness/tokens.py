@@ -330,8 +330,9 @@ LAYER_CHAR_CLASS = "char_class"         # 8 桶字符类兜底，真实语料上
 #:          **这里必须用 tools= 参数量出来的值（5300）**——budget 记的是这次请求真正
 #:          花掉的 token，我们的调用方式就是传 tools=。
 #:
-#: ⚠ 只有 (True, True) 这一组的 system 有实测值。别的开关组合（无坐标 / 无剧本）
-#:   hash 不同、查不到，会**自动**落到第 2 层，不会拿这个值顶替。这是设计，不是遗漏。
+#: ⚠ 2026-09-17 起 system 有**两条**实测常量：剧本工具开 / 关各一条（见下面那段注）。
+#:   其余开关组合（无坐标、无知识）hash 不同、查不到，会**自动**落到第 2 层，
+#:   不会拿这两个值顶替。这是设计，不是遗漏。
 EXACT_SEGMENT_TOKENS: dict[tuple[str, str], int] = {
     # 2026-09-09 晚：提示词版本 21（七节：你是谁 / 世界怎么运作 / iOS 惯例 / 镜像差别 /
     # 你的手 / 怎么做事 / 每轮看到什么），calibrate_tokens.py --probe segments 重标。4463 字 → 2485 token。
@@ -350,11 +351,33 @@ EXACT_SEGMENT_TOKENS: dict[tuple[str, str], int] = {
     # 2026-09-1x：按需看图 —— 提示词版本 23（感知一节改为「默认只有 OCR」）、observe 描述改为看全屏，重标。
     #   system 4967→5446 字（2763→3051 token）；工具表仍 18 个（observe 描述改字），6265→6308（走 tools= 参数）。
     #   出处 docs/superpowers/acceptance/2026-09-15-token标定/probe-segments-20260915-115841.json。
-    # ⚠ 2026-09-16 公开导出：method 节里的账户示例名改成了通用占位（公开仓库不带个人内容），
-    #   prompt_hash 因此从 e9b0ed49927c 变成 42680c245e3a。**3051 这个值没有重测**：改动只是把
-    #   一个 4 字的中文示例词换成另一个 4 字的中文示例词，system 段字数不变（仍是 5446 字），
-    #   所以沿用了上一次实测值。要拿它当精确值用之前，重跑 --probe segments 重标一次。
-    ("system", "42680c245e3a"): 3051,
+    # 2026-09-17：提示词版本 24 —— 剧本那一段拆成「知识」「剧本工具」两半（剧本工具默认不端，
+    #   端不上桌的工具就不许在提示词里描述，CLAUDE.md §3），iOS 一节把「离开不等于关掉」
+    #   写成平台事实（含「少数联网 App 刷新回首页」那一半）。**两版 system 都标**：
+    #     ("system", "6a31f5aa4dc8") 5384 字 3018 —— system_prompt(True, True, False)，
+    #                                即 IPHONE_SKILL_TOOLS=off 的**生产默认**路径；
+    #     ("system", "21b7e310091c") 5509 字 3087 —— system_prompt(True, True, True)，
+    #                                即 IPHONE_SKILL_TOOLS=on。
+    #   只标一版的话，另一版会静静落回第 2 层估算 —— 那正是本表存在的理由。
+    #   工具表这次一个字没动，hash 和 6308 原样保留（同一次探针复测确认）。
+    #   出处 docs/superpowers/acceptance/2026-09-17-token标定/probe-segments-20260917-112008.json。
+    #   （上一版：版本 23，5446 字 3051）
+    # 2026-09-20：提示词版本 25 —— 世界一节加一条元原则「结果前面那句话是系统核对的结论，先按它办」
+    #   （spec 2026-09-18「不知道」不放行 C1），「三条元原则」改成「几条元原则」。两版 system 都重标：
+    #     ("system", "a10d3532746e") 5454 字 3061 —— system_prompt(True, True, False)，生产默认；
+    #     ("system", "0a914cb99d5c") 5579 字 3130 —— system_prompt(True, True, True)，IPHONE_SKILL_TOOLS=on。
+    #   工具表一个字没动，hash 和 6308 原样保留（同一次探针复测确认：tools= 参数 6308）。
+    #   出处 docs/superpowers/acceptance/2026-09-20-token标定/probe-segments-20260920-154027.json。
+    #   （上一版：版本 24，5384 字 3018 / 5509 字 3087）
+    # ⚠ 公开导出：method 节里的账户示例名是通用占位（公开仓库不带个人内容），提示词文本因此
+    #   与上面那段注释记的测量版本差一个 4 字的中文示例词，两个 prompt_hash 跟着变：
+    #     a10d3532746e → 1ab31c31d48e（system_prompt(True, True, False)，生产默认）
+    #     0a914cb99d5c → 09e7210e56bf（system_prompt(True, True, True)）
+    #   **3061 / 3130 这两个值没有在这份文本上重测**：换的是等长的中文示例词，两版 system 的
+    #   字数仍分别是 5454 / 5579，所以沿用上面那次实测值。要拿它们当精确值用之前，
+    #   重跑 scripts/calibrate_tokens.py --probe segments 重标一次。
+    ("system", "1ab31c31d48e"): 3061,
+    ("system", "09e7210e56bf"): 3130,
     ("tools_schema",
      "e13f9bd621eb74014f56a6421041af54766fd9d2ccfd6b15c209b03ed376bcc9"): 6308,
 }
@@ -410,6 +433,11 @@ SEGMENT_TOKENS_PER_CHAR: dict[str, float] = {
     "memory_index": 0.608,
     "recent_runs": 0.608,
     "state_history": 0.503,
+    # ⚠ 2026-09-17 的 --probe segments 顺手复测了 system 这一段：两版分别是 0.561 / 0.560，
+    #   比这里的 0.551 高 1.8%。**没有改**这个数：本表是 2026-09-09 一次探针的整批产物，
+    #   只挑一条替换会让表变成来源混杂、谁也说不清哪条是哪天的。而且 system 的两种在跑
+    #   组合现在都有第 1 层精确常量，这条比值只在「提示词又改了、还没重标」的那一小段
+    #   时间里当后备 —— 那时候它偏低 1.8%，知道就行。
     "system": 0.551,
     "tools_schema": 0.391,
 }
@@ -427,7 +455,7 @@ SEGMENTS_PENDING_CALIBRATION: frozenset[str] = frozenset({
     # ── 完全没有语料（10 个）：探针里从没造过这些段的真实文本，无从测起 ──
     "chat_history", "skill_index", "scenario", "app_note",
     "state_memo", "state_report",
-    "obs_location", "obs_route", "image_placeholder_text",
+    "obs_location", "obs_route", "obs_visited", "image_placeholder_text",
     # 2026-09-09 加「暂停 → 补一句话 → 继续」：window 视图里是一条普通用户消息（user_note），
     # state 视图里是状态报告的一段（state_user_note）。人打的短句，量不出可信比值。
     "user_note", "state_user_note",

@@ -39,7 +39,9 @@ def test_ios_conventions_hedge_and_defer_to_the_screen():
     assert "通常" in i or "多半" in i
     assert "以当前屏幕为准" in i
     # 对点击任务最要紧的几条
-    assert "›" in i and "开关" in i and "恢复上次" in i
+    # 2026-09-17：「恢复上次」那一句改写成了平台事实的完整两半（离开不等于关掉 /
+    # 少数联网 App 刷新回首页），措辞换了、意图没换，所以钉的短语跟着换。
+    assert "›" in i and "开关" in i and "恢复到你离开的那一屏" in i
 
 
 def test_mirror_section_corrects_ios_common_sense():

@@ -24,13 +24,14 @@ class Labeler:
         return {"screen": {"app": "设置", "name": "某屏", "same_as": None, "anchors": []}, "elements": []}
 
 
-def run_with(fake_env, specs, script, tmp_path, *, mode="on_demand", asker=None, **kw):
+def run_with(fake_env, specs, script, tmp_path, *, mode="on_demand", asker=None, skill_tools="off", **kw):
     dev, per, frames = fake_env([specs[0]] * INITIAL_SETTLE_FRAMES + list(specs))
     per.asker = asker if asker is not None else Labeler()
     model = ScriptedModel(script)
     kw.setdefault("store", isolated_store(tmp_path))
     kw.setdefault("workspace", Workspace(tmp_path))
-    r = run_task("t", dev, per, model, tmp_path, run_config=RunConfig(screen_parse=mode), **kw)
+    r = run_task("t", dev, per, model, tmp_path,
+                 run_config=RunConfig(screen_parse=mode, skill_tools=skill_tools), **kw)
     return r, dev, per, model
 
 
@@ -178,7 +179,9 @@ def test_an_unchanged_frame_is_never_handed_back_as_the_new_observation(fake_env
               [("tap", {"id": 1})], [("wait", {"seconds": 1})], [("scroll", {"direction": "down"})],
               [("observe", {})], [("zoom", {"x1": 0, "y1": 0, "x2": 300, "y2": 300})],
               [("settings__ios-version", {})], DONE]
-    r, *_ = run_with(fake_env, [["设置", "通用"]] * 60, script, tmp_path, skill_store=_skill_store(tmp_path))
+    # 这条用例要把剧本调用也走一遍，所以显式开剧本工具（2026-09-17 起默认关）。
+    r, *_ = run_with(fake_env, [["设置", "通用"]] * 60, script, tmp_path,
+                     skill_store=_skill_store(tmp_path), skill_tools="on")
     assert r.end_reason == "done_success", (r.end_reason, r.error)
     names = {n for n, _, _ in handed}
     assert {"tap", "wait", "scroll", "observe", "zoom", "settings__ios-version"} <= names, names

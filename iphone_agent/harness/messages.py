@@ -97,6 +97,9 @@ class MessageLog:
                                            "function": {"name": name, "arguments": args_json}}]})
 
     def tool_result(self, call_id: str, text: str):
+        # ⚠ 2026-09-18（最终评审）：tool 消息的内容**不再保证是纯 JSON**。09-18 起前面可能多一行
+        #   系统给的结论（loop._verdict_line：「这一步没有核实（…）。别当它成了：…」），
+        #   要按 JSON 解析这条消息的地方得先去掉首行（tests/test_memory_tools.py 那类断言尤其容易撞上）。
         self._msgs.append({"role": "tool", "tool_call_id": call_id,
                            "_seg": "tool_result", "content": text})
 

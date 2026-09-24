@@ -136,3 +136,25 @@ def test_render_leaves_out_the_procedure_line_when_there_were_none(tmp_path):
     lines = T.render(T.tap_outcomes(tmp_path))
     assert not any("剧本内点击" in line for line in lines)
     assert any("变了之后看图" in line and "0/1" in line for line in lines), lines
+
+
+def test_verdicts_are_counted_for_every_action_and_runs_are_defined_once(tmp_path):
+    """Task 8 ①：统计改按结论（成了/没成/没核实）覆盖全部动作，剧本步单列；
+    「一次运行」改成「有 steps.jsonl 且至少一条 result.ok 为真的动作记录」（spec C3）。"""
+    _run(tmp_path, "20260918-000000-aaaa", [
+        {"action": {"name": "tap", "args": {}}, "model": {"expect": None},
+         "result": {"ok": True, "changed": True, "expect_check": {"met": None, "by": "missing"}}},
+        {"action": {"name": "type", "args": {"text": "18"}}, "result": {"ok": True, "changed": True, "verified": "unknown"}},
+        {"action": {"name": "type", "args": {"text": "a"}}, "result": {"ok": True, "changed": True, "verified": "true"}},
+        {"action": {"name": "observe", "args": {}}, "result": {"ok": True, "changed": None}},
+        {"action": {"name": "tap", "args": {}}, "result": {"ok": False, "error": "out_of_image"}},
+        {"kind": "procedure_step", "action": {"name": "tap", "args": {}},
+         "result": {"ok": True, "changed": True, "expect_check": {"met": None, "by": "missing"}}},
+    ])
+    _run(tmp_path, "20260918-000001-bbbb", [            # 没有一个 ok 的动作：不算一次运行
+        {"action": {"name": "tap", "args": {}}, "result": {"ok": False, "error": "out_of_image"}}])
+    stats = T.tap_outcomes(tmp_path)
+    assert stats["verdicts"] == {"tap": {"unknown": 1}, "type": {"unknown": 1, "met": 1},
+                                 "procedure:tap": {"unknown": 1}}
+    assert stats["counts"]["runs"] == 1 and stats["counts"]["runs_with_unknown"] == 1
+    assert any("没核实" in line for line in T.render(stats))

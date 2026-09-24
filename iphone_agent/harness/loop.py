@@ -12,10 +12,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from iphone_agent import config, timing
-from iphone_agent.driver.injector import ActivateFailed
+from iphone_agent.driver.injector import MIRROR_HIDDEN_HINT, ActivateFailed
 from iphone_agent.driver.timing import IOS_TIMING, SCROLL_LINES, SCROLL_LINES_H
 from iphone_agent.harness import budget as budget_mod
 from iphone_agent.harness import recap, safety
+
+# ⚠ 计划 R11：run_task 里已经有一个局部变量 `verdict`（守卫的判决），直接 import 模块名会被它遮住。
+from iphone_agent.harness import verdict as verdict_mod
 from iphone_agent.harness.actions import ValidationError, validate_action
 from iphone_agent.harness.audit import RunFacts, never_reached
 from iphone_agent.harness.executor import Executor, ToolResult, full_screen_note
@@ -29,7 +32,7 @@ from iphone_agent.harness.messages import (
     to_wire,
 )
 from iphone_agent.harness.procedure import COUNTED_FAILURES, ProcedureRunner
-from iphone_agent.harness.prompt import prompt_hash, system_prompt
+from iphone_agent.harness.prompt import hash_of, prompt_hash, system_prompt
 from iphone_agent.harness.reconnect import ensure_connected
 from iphone_agent.harness.runlog import RunLog, frame_name
 from iphone_agent.harness.runlog import frame_stub as _frame_stub
@@ -88,15 +91,32 @@ FALLBACK_DONE_HINT = ("你报了失败。程序先补看了一次全屏，元素
 FALLBACK_NO_PROGRESS_NOTE = "已连续多步无进展，程序补看了一次全屏；目标还不在就换路或 done(failed)。"
 
 
-def _fallback_text(o, *, done: bool) -> str:
-    """兜底那一帧交回模型时怎么说。看全屏失败要照实说（spec §9），然后照常把决定交回模型。"""
+def _fallback_text(o, *, reason: str) -> str:
+    """兜底那一帧交回模型时怎么说。看全屏失败要照实说（spec §9），然后照常把决定交回模型。
+
+    ⚠ 2026-09-18（最终评审 M5）：三种触发（done_failed / no_progress / unverified）的说法**只有这一个入口**。
+      "unverified" 那一段原来内联在 _unverified_fallback 里又把 full_screen_note 的三态重写了一遍 ——
+      同一条规矩两个地方各写一遍，迟早只改一个（CLAUDE.md §7）。
+    """
     note = full_screen_note(o)
-    if done:
+    if reason == "done_failed":
         return FALLBACK_DONE_HINT if note is None else (
             f"你报了失败。程序补看了一次全屏，但{note}。据此再判断；确实做不到就再 done(failed)。"
             + FALLBACK_MEMORY_NOTE)
+    if reason == "unverified":
+        # 调用方在前面已经说过「连续 N 步没有核实」，这里接着说这一帧。
+        return ("系统补看了一次全屏，下面的元素列表是完整的；先确认自己在哪，再继续。" if note is None
+                else f"系统补看了一次全屏，但{note}；先确认自己在哪，再继续。")
     return FALLBACK_NO_PROGRESS_NOTE if note is None else (
         f"已连续多步无进展，程序补看了一次全屏，但{note}；目标还不在就换路或 done(failed)。")
+
+
+def _missing_text(tool: str, missing: list[str]) -> str:
+    """缺必填参数时给模型的话。tap 的 expect 直接用工具定义里那段写法说明，只此一份（CLAUDE.md §7）。"""
+    from iphone_agent.harness import tools as T
+    if tool == "tap" and "expect" in missing:
+        return "tap 缺 expect（必填）。" + T._TAP_EXPECT_DESC
+    return f"{tool} 缺必填参数：{'、'.join(missing)}。补上再发一次。"
 
 
 def _config_snapshot(model) -> dict:
@@ -214,13 +234,18 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     catalog = None
     index_text = None
     knowledge_errors: list[str] = []
+    # 剧本端不端给模型（config.SKILL_TOOLS_* 写了为什么默认关）。索引和工具列表必须
+    # 用**同一个**布尔值：索引说「可直接调」而工具列表里没有那个工具，就是 §3 的静默假话。
+    proc_tools_on = rc.skill_tools == "on"
     try:
         catalog = skill_store.load()
-        index_text = catalog.index_text()
+        index_text = catalog.index_text(procedure_tools=proc_tools_on)
     except Exception as e:      # noqa: BLE001 —— 知识层坏了不能顶掉任务
         knowledge_errors.append(f"load: {type(e).__name__}: {e}")
         catalog = None
         index_text = None
+    # 知识那半边：索引非空就有。剧本工具那半边要等路由 + select_procedures 才定，
+    # 这里只能按开关推算一个初值，真值在下面装配系统提示词时校正（log.set_prompt_hash）。
     has_skills = bool(index_text)
     allow_coords = model.resolved.model.allow_coord_tap
     log = RunLog(runs_root, task=task, model=model.resolved.spec,
@@ -230,13 +255,34 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                                      "twin_hints": rc.twin_hints,
                                      "location_hints": rc.location_hints, "memory": rc.memory,
                                      "screen_parse": rc.screen_parse,
+                                     "skill_tools": rc.skill_tools,
                                      "platform": _platform_info()}),
-                 prompt_hash=prompt_hash(allow_coords, has_skills))
+                 prompt_hash=prompt_hash(allow_coords, has_skills,
+                                         has_skills and proc_tools_on))
     if on_start:
         # ⚠ 运行目录必须**开跑时**就交出去。第一版只在结束时给，
         #   于是网页整个过程都不知道去哪儿取截图，只能等任务跑完才看到画面 ——
         #   而「看着它做」恰恰是过程中才有意义的事。
         on_start(log.dir.name)
+    # ---- 开跑前检查：镜像是不是被完全盖住了 ----
+    # ⚠ 2026-09-18：四次真机失败全出在 open_app 翻主屏页的那一下 —— 当时镜像被别的窗口
+    #   完全盖住、一条缝都没露，滚轮没处落，抬窗口又失败（macOS 对后台 App 抢前台有抵抗），
+    #   于是任务跑到一半、步数和模型调用都花了才以「抬窗口失败」死掉。
+    #   只有滚轮需要镜像露出来：macOS 按**真实指针下方最上面的窗口**路由滚轮；
+    #   点击走 SkyLight 按窗口 id 投递、键盘走 CGEventPostToPid，盖住了照样送得到（docs/14）。
+    #   先前的修法 779d09a 把每次点击都挂到窗口层级检查上，误拦了后台点击，已在 58dad74 撤回。
+    #   所以这里只在开跑前查一次，判据就是滚轮挑落点用的那一条（injector.exposed_anchor）：
+    #   露出一小块就放行、什么都不改；一点都没露就当场结束 —— 不按 home、不调模型、不计步。
+    try:
+        exposed = device.mirror_exposed()
+    except Exception as e:      # noqa: BLE001 —— 检查自己炸了不能顶掉任务，留档照常跑
+        exposed = True
+        log.step({"step": 0, "ts": time.time(), "error_phase": "preflight",
+                  "error": f"{type(e).__name__}: {e}"})
+    if not exposed:
+        log.set_section("preflight", {"mirror_exposed": False, "message": MIRROR_HIDDEN_HINT})
+        log.finish("mirror_hidden", 0, None, None, "", {"model_calls": 0})
+        return RunResult("mirror_hidden", 0, None, None, log.dir, MIRROR_HIDDEN_HINT)
     store = store if store is not None else MemoryStore(ws.memory_dir)
     # 屏幕图从既往运行日志现拼。⚠ 拼图失败绝不能顶掉任务 —— 它只是参考。
     try:
@@ -270,13 +316,20 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             route_res.error = (route_res.error or "") + f" resolve: {type(e).__name__}: {e}"
     try:
         # ⚠ 门禁必须是 catalog is not None **and** has_skills，不能只看 catalog。
-        #   `_SKILLS` 那段系统提示（system_prompt 里 has_skills 才加）是唯一告诉模型
-        #   「app__proc 是什么、中途失败怎么办」的文字；它只看 index_text() 是否为空，
-        #   而 index_text() 只统计 status=="verified" 的 App。人审时批了剧本
-        #   （status=verified）却没顺手把它挂靠的 App 也批 verified，是正常的审核路径，
-        #   不是异常文件——这时 has_skills=False 但 eligible_procedures 仍会选出这条剧本。
+        #   `_SKILLS_PROCEDURES` 那段系统提示（2026-09-17 起由 has_proc_tools 单独控制，
+        #   而 has_proc_tools = bool(procedures)）是唯一告诉模型
+        #   「app__proc 是什么、中途失败怎么办」的文字；has_skills 只看 index_text() 是否为空，
+        #   而 index_text() 只统计对模型可见的 App（M.app_visible：有正文或 description，
+        #   2026-09-17 起不再要求 status=="verified"，见 skills/store.py:visible_apps）。
+        #   剧本能不能自动调用另问 M.is_callable（status=verified 且 risk=read），跟它挂靠的
+        #   App 有没有人写过内容是两件事——App 从来没人写过一个字（extract.ensure_app 的空壳）
+        #   却已经有一条走通了的 verified 剧本，是正常的审核路径，不是异常文件——
+        #   这时 has_skills=False 但 eligible_procedures 仍会选出这条剧本。
         #   两者必须绑在一起，模型才不会拿到一个没被介绍过的工具。
-        procedures = select_procedures(catalog, tool_scope) if (catalog is not None and has_skills) else []
+        #   skill_tools=off 再加一道总闸：一条剧本定义都不放出去（索引那头的「可直接调」标
+        #   已经在 index_text 里一起去掉了，两头必须同时闭）。
+        procedures = (select_procedures(catalog, tool_scope)
+                      if (catalog is not None and has_skills and proc_tools_on) else [])
     except Exception as e:          # noqa: BLE001 —— 选不出剧本就不放剧本，照常跑
         knowledge_errors.append(f"select_procedures: {type(e).__name__}: {e}")
         procedures = []
@@ -288,6 +341,20 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         knowledge_errors.append(f"tool_defs: {type(e).__name__}: {e}")
         proc_by_tool = {}
         tools = []
+    # ⚠ 2026-09-18（spec B1）：工具定义里写了 required 的参数，执行层从来不校验 —— tap 的 expect 09-11 就改成
+    #   必填了（tools.py:66），模型 61% 不写，点击预期核对六成时间在挨饿（09-12 之后 119 次点击里 73 次）。
+    #   按 schema 查，不写死「tap 缺 expect」：以后哪个工具加必填字段，这道闸自动生效。
+    #   ⚠ 不进 validate_action：剧本的 tap expect 恒为 None（procedure.py:172），且剧本共用 validate_action。
+    required_by_tool = {t["function"]["name"]: tuple(t["function"]["parameters"].get("required", ()))
+                        for t in tools}
+    # 当前这个拒绝流里，上一次因为必填参数被拒时缺的是哪几个（计划 R2；
+    # 2026-09-20 更正：只在动作真正执行后清零，见下面执行处的注释）。
+    # ⚠ 2026-09-18（Task 6 评审发现 2）：这个键**只比缺的参数、不带工具名**。带工具名的话，
+    #   `tools.py:23` 把 reason 列成了每个工具的必填项，一个从不写 reason、又在不同工具间换来换去的
+    #   弱模型每次都算「换了个缺法」→ 每次都被拒 → MAX_CONSECUTIVE_REJECTIONS 次之后任务直接
+    #   model_error 结束，而这些动作在这道闸之前是照常执行的。spec B1 写的是「不能让弱模型卡死在这儿」，
+    #   所以放宽：最坏情况只是「拒一次、放一次」交替（多花一倍模型调用），掐不死任务。
+    last_missing: tuple | None = None
     # 位置感收窄（spec §4.6）：命中的 App 的子图排在全图前面，先问子图。
     app_maps = []
     if screen_map is not None:
@@ -297,7 +364,14 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             except Exception:       # noqa: BLE001 —— 子图拼不出来就用全图，绝不顶掉任务
                 pass
     msgs = MessageLog()
-    msgs.system(system_prompt(allow_coords, has_skills))
+    # ⚠ 2026-09-17：剧本那一段只能在**工具列表里真有 `app__proc`** 时才发。
+    #   判据是 procedures 非空，不是开关 —— 开着开关但 select_procedures 一条都没选出来，
+    #   工具列表里照样一个 `__` 都没有，这时候还教模型「名字带 __ 的就是剧本」
+    #   就是 CLAUDE.md §3 的静默假话。知识那半边另算，只看索引。
+    sys_text = system_prompt(allow_coords, has_skills, bool(procedures))
+    msgs.system(sys_text)
+    # 留档以真正发出去的字节为准（构造 RunLog 时剧本还没选完，那时写的是推算值）。
+    log.set_prompt_hash(hash_of(sys_text))
     mem_msg: str | None = None
     recent_msg: str | None = None
     # 被跳过的坏 run.json 数：它是「摘要代码自己坏了」与「确实没有历史运行」的
@@ -381,7 +455,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     twin_live = None
     current_twin: dict | None = None
     # 这一步模型看到的观察里有没有【位置】/【路线】（学习曲线评测按它分组，spec 2026-09-12 §8.2）。
-    current_hints: dict = {"location": False, "route": False}
+    current_hints: dict = {"location": False, "route": False, "visited": False}
     try:
         from iphone_agent.twin import record as twin_record
         if twin_record.needs_initial_rebuild(ws):
@@ -480,7 +554,12 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
     observation_mismatch = 0
     taps = {"by_id": 0, "by_coord": 0, "coord_unclassified": 0}
     fallback_used = False                                   # 每个任务至多一次，两种触发共用（spec §3.5）
-    fallback_by = {"done_failed": 0, "no_progress": 0}
+    # ⚠ 普通 dict，不是 defaultdict：新的触发原因必须在这里先登记成 0，
+    #   否则 _take_fallback 里的 `fallback_by[reason] += 1` 是 KeyError。
+    fallback_by = {"done_failed": 0, "no_progress": 0, "unverified": 0}
+    # ⚠ 2026-09-18（最终评审）：必填闸拒了几次、放行了几次（spec B1 的两条出路），进 run.json。
+    #   验收「模型到底写不写 expect」要靠它归因：只留在每一步的记录里等于要人去 steps.jsonl 里数（CLAUDE.md §3）。
+    required_gate = {"rejected": 0, "let_through": 0}
     step_timer: timing.StepTimer | None = None      # 本轮的计时器（spec 2026-09-14 §8.2）；异常出口也要拿到它
     startup_timer: timing.StepTimer | None = None
     startup_timing: dict | None = None
@@ -535,16 +614,69 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         # `_` 开头的键是给状态报告用的进程内材料（如 _elements_by_id），不落盘。
         log.step({k: v for k, v in record.items() if not k.startswith("_")})
 
-    def _bound_result(res: ToolResult) -> str:
+    unverified_said = False           # 没有看图的一方时，「没核实」只完整说一次（计划 R5）
+
+    def _verdict_line(res: ToolResult, action) -> str | None:
+        """执行层的结论翻成给模型看的那一句人话（spec C1）。没什么要说的就返回 None。
+
+        ⚠ 2026-09-18（spec C1，现场 一次真机运行的第 12 步、一次真机运行的第 16 步）：
+          结论原来只以裸字段出现（"expect_check":{"met":null,"by":"missing"}、"verified":"unknown"），
+          提示词里没有一处解释过它们，模型读不出「这一步没人替你核过」，于是把点歪了的一步当成了。
+        ⚠ 一个动作只算一次：这里带着「没有看图的一方时只完整说一次」的记账（计划 R5），
+          算两次就白白用掉那份额度。所以由调用方算一次、两个视图共用同一句（CLAUDE.md §7）——
+          window 的 tool_result 和 state 的【上一步结果】。**两边都要给**：window 仍是生产默认
+          （config.CONTEXT_MODE，docs/19 §5「window 仍是默认」），上面那两个现场跑的也是 window，
+          只放进【上一步结果】等于对着真正在跑的那条路什么都没做（CLAUDE.md §3）。
+        """
+        nonlocal unverified_said
+        d = json.loads(res.to_json())
+        v = verdict_mod.of(action.name, action.args, d)
+        no_judge = getattr(perceiver, "asker", None) is None
+        line = verdict_mod.say(v, action.name, d, quiet=no_judge and unverified_said)
+        if line and no_judge and v.state == "unknown" and v.by != "missing":
+            unverified_said = True
+            line += "（这次运行没有看图核对的一方，之后没核实的步骤不再逐条提醒。）"
+        return line
+
+    def _bound_result(res: ToolResult, line: str | None = None) -> str:
         """【上一步结果】的额度（docs/19 §3.3）。
 
         成功尾截：collect/recall 这类的关键内容在前面。失败中间挖：报错的关键行常在
         尾部，一律尾截正好把它砍掉。
+
+        ⚠ 2026-09-18（spec C1）：`line` 是 _verdict_line 算好的那句人话，排在 JSON 前面。
+          拒绝路径不传：动作没执行过，没有结论可说。
+        ⚠ 2026-09-18（最终评审 M4）：额度的账要说准 —— 这里原来写的是「不占 JSON 的截断额度」，
+          只对 state 视图成立（这一句由本函数拼在截断之后，确实是白给的）。window 视图是另一条路：
+          那句话在 msgs.tool_result 里和 JSON 拼成同一条 tool 消息，截断在 messages.windowed 里，
+          **占**同一份额度。好在那边是头截（`content[:cap]`），排在最前面的这一句不会被切掉。
         """
         raw, cap = res.to_json(), config.LATEST_TOOL_RESULT_MAX_CHARS
-        if res.ok:
-            return raw[:cap] + "…" if len(raw) > cap else raw
-        return middle_truncate(raw, cap)
+        body = (raw[:cap] + "…" if len(raw) > cap else raw) if res.ok else middle_truncate(raw, cap)
+        return f"{line}\n{body}" if line else body
+
+    def _rejection_limit_hit() -> bool:
+        """连续拒绝计数 + 上限。五处拒绝共用（CLAUDE.md §7）—— 原来逐字复制了五遍，其中一处的文案已经漂了。"""
+        nonlocal consecutive_rejections, end_reason, error_detail
+        consecutive_rejections += 1
+        if consecutive_rejections < config.MAX_CONSECUTIVE_REJECTIONS:
+            return False
+        end_reason = "model_error"
+        error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用/安全闸）"
+        _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
+                    "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+        return True
+
+    def _reject(action, record: dict, res: ToolResult, code: str) -> bool:
+        """单个动作被拒（不上设备、不计步）的统一收尾。返回 True = 到上限了，调用方 break。"""
+        nonlocal last_result_text, last_transition
+        msgs.tool_result(action.call_id, res.to_json())
+        record.update({"validation": code, "result": json.loads(res.to_json())})
+        last_result_text, last_transition = _bound_result(res), None
+        _flush(record)
+        if on_step:
+            on_step(record)
+        return _rejection_limit_hit()
 
     def observe_now(fallback: bool = False) -> Observation:
         nonlocal obs_frame_file
@@ -581,8 +713,8 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             except Exception:      # noqa: BLE001 —— 孪生任何一处坏了都不影响任务
                 pass
         # ⚠ 三段分开留着，不要先拼再传：拼完就分不开，而 elements_text 的占比
-        #   一旦被【位置】【路线】污染，B9「元素列表要不要有上限」的结论就是错的。
-        #   那两段有自己的上限（MAX_EDGES / MAX_HOPS），治理方式完全不同。
+        #   一旦被【位置】【路线】【去过的屏】污染，B9「元素列表要不要有上限」的结论就是错的。
+        #   那几段有自己的上限（MAX_EDGES / MAX_HOPS / MAX_VISITED + VISITED_MAX_CHARS），治理方式完全不同。
         obs_parts: list[tuple[str, str]] = [("obs_elements", o.elements_text)]
         if twin_live is not None:
             try:
@@ -590,14 +722,16 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
             except Exception as e:  # noqa: BLE001 —— 孪生坏了 = 没有孪生
                 current_twin = None
                 twin_errors.append(f"observe: {type(e).__name__}: {e}")
-        where = plan = None
+        where = plan = been = None
         if not rc.location_hints:
             pass                    # 评测对照组：孪生和 screenmap 一段都不给（spec 2026-09-12 §8.2）
         elif rc.twin_hints:
-            # 【位置】【路线】由孪生出（spec 2026-09-11 §6）。认不出 / 孪生坏了就什么都不说。
+            # 【位置】【路线】【去过的屏】由孪生出（spec 2026-09-11 §6）。认不出 / 孪生坏了就什么都不说。
+            # 三段的规则都在 twin/render.py 里；【去过的屏】自己知道【路线】给得出路时该闭嘴。
             if twin_live is not None and current_twin is not None:
                 try:
                     where, plan = twin_live.position(), twin_live.route(task)
+                    been = twin_live.visited(task)
                 except Exception as e:      # noqa: BLE001
                     twin_errors.append(f"render: {type(e).__name__}: {e}")
         elif screen_map is not None:
@@ -612,11 +746,13 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                     plan = plan or route_hint(m_, task, ts)
             except Exception:      # noqa: BLE001 —— 位置感是锦上添花，绝不能顶掉任务
                 where = plan = None
-        current_hints = {"location": bool(where), "route": bool(plan)}
+        current_hints = {"location": bool(where), "route": bool(plan), "visited": bool(been)}
         if where:
             obs_parts.append(("obs_location", where))
         if plan:
             obs_parts.append(("obs_route", plan))
+        if been:
+            obs_parts.append(("obs_visited", been))
         # ⚠ raw 里照常记：日志和 window 模式都靠它，state 模式只是不把它发出去。
         msgs.user_observation(obs_parts, _png_b64(o.marked_image),
                               px=(o.width_px, o.height_px))
@@ -660,24 +796,58 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
         fallback_by[reason] += 1
         return observe_now(fallback=True)
 
+    def _say_aside(note: str) -> None:
+        """程序自己插的一句话，**两个视图的模型都要读到**（CLAUDE.md §3、§7）：
+        window（生产默认）走一条 user_text，state 走【上一步结果】—— 前缀任务一开始就冻结了，塞不进去。"""
+        nonlocal last_result_text
+        if rc.context_mode == "state":
+            # 前缀冻结了，催促放进【上一步结果】（和空回复催促同一个做法，loop.py 空回复那段）
+            last_result_text = f"{last_result_text or ''}\n{note}".strip()
+        else:
+            msgs.user_text(note, seg="repair_prompt")
+
     def _no_progress_fallback() -> dict:
         """guard 判了 stop、任务即将以 no_progress 结束：程序补看一次全屏再交回模型（spec §3.5 (b)）。
         返回一条程序发出的 observe 记录（不计步），调用方走 _log_other 落盘（计划 R6）。"""
-        nonlocal last_result_text, last_transition
+        nonlocal last_transition
         guard.grant_fallback()
         prog = {"step": steps, "ts": time.time(), "by": "program", "observation_id": obs.observation_id,
                 "before_frame_id": obs.frame_id, "observation": _observation_snapshot(obs, obs_frame_file),
                 "action": {"name": "observe", "args": {}}, "result": {"ok": True, "changed": None},
                 "fallback": {"reason": "no_progress"}}
         o = _take_fallback("no_progress")
-        note = _fallback_text(o, done=False)
+        note = _fallback_text(o, reason="no_progress")
         # 新帧是程序补看的，【上一步之后】那段说的还是模型上一步的变化 —— 和 done 兜底那条路一样清掉（终审发现 6）。
         last_transition = None
-        if rc.context_mode == "state":
-            # 前缀冻结了，催促放进【上一步结果】（和空回复催促同一个做法，loop.py 空回复那段）
-            last_result_text = f"{last_result_text or ''}\n{note}".strip()
-        else:
-            msgs.user_text(note, seg="repair_prompt")
+        _say_aside(note)
+        _adopt_new(prog, o)
+        return prog
+
+    def _unverified_fallback() -> dict | None:
+        """连续 UNVERIFIED_WARN 步「做了、画面也变了，但没人核实成没成」（spec 2026-09-18 C2，计划 R6）。
+
+        ⚠ 2026-09-18（一次真机运行的第 12 步）：点歪进了微博登录页，没写 expect → 没人核对 →
+          「变了且是新画面」→ 无进展计数清零。错页面被记成进展，同一个坐标后面又点了两轮。
+          守卫那边已经不清零了（guard.record_outcome 的 unverified 分支），这里负责**明说**给模型。
+        ⚠ 能不能补看由 `_fallback_due()` 说了算，它还查了整屏解析模式、本任务的兜底余量、
+          以及**有没有看图的一方**。没有看图的一方时它恒为假 —— 而那恰恰是每一步都没核实的那种运行，
+          所以「只说话、让模型自己 observe」不是退路，是这条路上的常态。
+          补看要用掉的是和另两种触发共用的那一份额度（每任务至多一次）。
+        返回补看的那条 observe 记录（不计步，调用方走 _log_other 落盘）；没补看返回 None。
+        """
+        nonlocal last_transition
+        note = f"连续 {config.UNVERIFIED_WARN} 步没有核实成没成。"
+        if not _fallback_due():
+            _say_aside(note + "先 observe 看清当前屏幕、确认自己在哪，再继续。")
+            return None
+        prog = {"step": steps, "ts": time.time(), "by": "program", "observation_id": obs.observation_id,
+                "before_frame_id": obs.frame_id, "observation": _observation_snapshot(obs, obs_frame_file),
+                "action": {"name": "observe", "args": {}}, "result": {"ok": True, "changed": None},
+                "fallback": {"reason": "unverified"}}
+        o = _take_fallback("unverified")
+        # 看全屏失败要照实说（spec §9）：不能交回一个看起来完整、实际只有 OCR 的列表。这句话由 _fallback_text 出。
+        _say_aside(note + _fallback_text(o, reason="unverified"))
+        last_transition = None
         _adopt_new(prog, o)
         return prog
 
@@ -843,6 +1013,10 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                     budgets_by_call.append(call_budget)
 
                     if not reply.actions:
+                        # ⚠ 2026-09-20（真机 run 20260920-155906-58c6）：这里原来清 last_missing——
+                        # 「隔了别的回复就重新计」。但空回复根本没到必填闸，模型还是那个没写 expect
+                        # 的回复没被处理，清空只会让它再被拒一次，白烧 MAX_CONSECUTIVE_REJECTIONS 额度。
+                        # 改成只在动作真正执行时才清（见下面 consecutive_rejections = 0 处）。
                         empty_replies += 1
                         _log_other({"step": steps + 1, "ts": time.time(), "observation_id": obs.observation_id,
                                     "rejected": "empty_reply",
@@ -864,6 +1038,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
 
                     # 一次多个工具调用：全部拒绝
                     if len(reply.actions) > 1:
+                        # ⚠ 2026-09-20：同上，多工具调用也没到必填闸，不算「隔了一个回复」，不清 last_missing。
                         res = ToolResult(ok=False, error="rejected_multiple_calls",
                                          hint="一次只发一个工具调用")
                         for a in reply.actions:
@@ -873,12 +1048,9 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                                     "rejected": "multiple_calls", "count": len(reply.actions),
                                     "model": {"latency_ms": reply.latency_ms, "usage": reply.usage},
                                     "budget": call_budget}, ends_step=True)
-                        consecutive_rejections += 1
-                        if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                            end_reason = "model_error"
-                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                        "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                        # 这一块不走 _reject：它没有单条动作记录（多个 call_id 各自回一条 tool_result，
+                        # 整轮只记一条 _log_other），只共用计数 + 上限那一段。
+                        if _rejection_limit_hit():
                             break
                         last_result_text, last_transition = _bound_result(res), None
                         continue
@@ -910,7 +1082,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                               "_elements_by_id": {e.id: e.text for e in obs.elements}}
                     if current_twin is not None:
                         record["twin"] = current_twin          # 这一帧当时认成了什么：事后分析不用重跑
-                    record["hints"] = dict(current_hints)      # 这一步模型看到【位置】/【路线】没有
+                    record["hints"] = dict(current_hints)      # 这一步模型看到【位置】/【路线】/【去过的屏】没有
                     if obs.observation_id != sent_observation_id:
                         # 内部 invariant（spec §6.3）：构造视图和校验用的应是同一个 obs，这里只能抓 loop 自己换错对象的 bug。
                         # 抓不到模型凭记忆用旧编号 —— 那一类的防线是 OCR 编号稳定、zoom 不复用编号、tapped 回显。
@@ -921,21 +1093,35 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                     try:
                         if "_parse_error" in action.args:
                             raise ValidationError("invalid_args", "arguments 不是合法 JSON")
+                        # ⚠ 2026-09-18（spec B1）：必填参数闸。reason / expect 不在 args 里，在 Action 上。
+                        # ⚠ 2026-09-20（真机 run 20260920-155906-58c6，「用 Spotlight 算 128×37」；改动前
+                        #   这道题 7 步通过）：R2 原来的规矩是「中间隔了任何别的回复就重新计」，在四处清
+                        #   last_missing（空回复、多工具调用、非 missing_required 校验错误、闸自身放行后）。
+                        #   现场：模型缺 expect 被拒 → 第二次仍缺 expect 但坐标越界，闸按「紧接着第二次」
+                        #   放行，随后被 validate_action 的 out_of_image 拒掉 —— 这条校验错误把 last_missing
+                        #   清了 → 第三次仍缺 expect 但坐标合法（本该执行）又被必填闸当成「新的缺法」拒了一次。
+                        #   同一个拒绝流里模型已经被告知过一次要写 expect，再拒一次只是白烧
+                        #   MAX_CONSECUTIVE_REJECTIONS 的额度：这次必填闸贡献了连续 5 次拒绝里的 2 次，
+                        #   任务被 model_error 掐死。裁定改为：只有动作真正执行了（consecutive_rejections
+                        #   清零的那一刻）才清 last_missing、重新计——被别的原因拒掉（空回复、多工具调用、
+                        #   其他校验错误、同屏重复、安全闸、recall 预算）都不算「隔了一个回复」。
+                        said = {"reason": action.reason, "expect": action.expect}
+                        missing = [k for k in required_by_tool.get(action.name, ())
+                                   if not (said[k] if k in said else action.args.get(k) not in (None, ""))]
+                        key = tuple(missing) if missing else None    # 只比缺的参数，不带工具名（评审发现 2）
+                        if missing and key != last_missing:
+                            last_missing = key
+                            required_gate["rejected"] += 1
+                            raise ValidationError("missing_required", _missing_text(action.name, missing))
+                        if missing:
+                            # 紧接着第二次还缺（计划 R2）：放行。不能让弱模型卡死在这儿；结论由执行层标 unknown/missing。
+                            record["missing_required"] = missing
+                            required_gate["let_through"] += 1
                         action = validate_action(action, obs, proc_by_tool,
                                                  allow_coord_tap=allow_coords)
                     except ValidationError as e:
                         res = ToolResult(ok=False, error=e.code, hint=e.message)
-                        msgs.tool_result(action.call_id, res.to_json())
-                        record.update({"validation": e.code, "result": json.loads(res.to_json())})
-                        last_result_text, last_transition = _bound_result(res), None
-                        _flush(record)
-                        if on_step: on_step(record)
-                        consecutive_rejections += 1
-                        if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                            end_reason = "model_error"
-                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                        "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                        if _reject(action, record, res, e.code):
                             break
                         continue
 
@@ -949,17 +1135,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                     # 3. 同屏同动作拒绝
                     if guard.check_repeat(action, obs.state_key, obs.width_px, obs.height_px):
                         res = ToolResult(ok=False, error="repeated_action", hint="这个动作在当前画面上已经做过且没有变化，换一个。")
-                        msgs.tool_result(action.call_id, res.to_json())
-                        record.update({"validation": "repeated_action", "result": json.loads(res.to_json())})
-                        last_result_text, last_transition = _bound_result(res), None
-                        _flush(record)
-                        if on_step: on_step(record)
-                        consecutive_rejections += 1
-                        if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                            end_reason = "model_error"
-                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                        "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                        if _reject(action, record, res, "repeated_action"):
                             break
                         continue
 
@@ -989,17 +1165,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                                             "target": decision.target}
                         if outcome != "confirmed":
                             res = ToolResult(ok=False, error=outcome, hint=safety.hint(outcome, what))
-                            msgs.tool_result(action.call_id, res.to_json())
-                            record.update({"validation": outcome, "result": json.loads(res.to_json())})
-                            last_result_text, last_transition = _bound_result(res), None
-                            _flush(record)
-                            if on_step: on_step(record)
-                            consecutive_rejections += 1
-                            if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                                end_reason = "model_error"
-                                error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用/安全闸）"
-                                _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                            "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                            if _reject(action, record, res, outcome):
                                 break
                             continue
 
@@ -1011,18 +1177,7 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                         res = ToolResult(ok=False, error="recall_budget_exhausted",
                                          hint=f"{action.name} 每次运行最多 {recall_budget[action.name]} 次，"
                                               f"已用完；用当前屏幕上的信息继续。")
-                        msgs.tool_result(action.call_id, res.to_json())
-                        record.update({"validation": "recall_budget_exhausted",
-                                       "result": json.loads(res.to_json())})
-                        last_result_text, last_transition = _bound_result(res), None
-                        _flush(record)
-                        if on_step: on_step(record)
-                        consecutive_rejections += 1
-                        if consecutive_rejections >= config.MAX_CONSECUTIVE_REJECTIONS:
-                            end_reason = "model_error"
-                            error_detail = f"连续 {config.MAX_CONSECUTIVE_REJECTIONS} 次动作被拒绝（校验失败/同屏重复/多工具调用）"
-                            _log_other({"step": steps + 1, "ts": time.time(), "error_phase": "rejection_limit",
-                                        "error": f"连续 {consecutive_rejections} 次动作被拒绝，未消耗有效步数"})
+                        if _reject(action, record, res, "recall_budget_exhausted"):
                             break
                         continue
 
@@ -1030,13 +1185,14 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                     steps += 1
                     record["step"] = steps
                     consecutive_rejections = 0
+                    last_missing = None    # 动作真正执行了：拒绝流结束，必填闸重新计（见上面 2026-09-20 的注释）
                     if action.name == "done":
                         if action.args["status"] == "failed" and _fallback_due():
                             # ⚠ 2026-09-14（spec 按需看图 §3.5 (a)）：事故的形状恰恰是「模型不知道列表里漏了东西」
                             #   （工资账户，CLAUDE.md §4）。程序不判断屏幕上缺什么，只在模型要放弃时补齐证据再让它判断 ——
                             #   这是重试，不是推断隐藏状态（CLAUDE.md §2）。任务不结束，这一步照常计步。
                             o_fb = _take_fallback("done_failed")
-                            res = ToolResult(ok=False, error="fallback_observe", hint=_fallback_text(o_fb, done=True))
+                            res = ToolResult(ok=False, error="fallback_observe", hint=_fallback_text(o_fb, reason="done_failed"))
                             msgs.tool_result(action.call_id, res.to_json())
                             record.update({"result": json.loads(res.to_json()), "fallback": {"reason": "done_failed"},
                                            "no_progress": guard.no_progress})
@@ -1129,7 +1285,18 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                         verdict = res.extra.get("guard_verdict")
                     else:
                         # 第三态（变了但看图复核说没达到预期）也在 record_result 里判，别在这儿拼参数。
-                        verdict = guard.record_result(action, res, new_obs)
+                        # ⚠ 2026-09-18（最终评审 I1）：没有看图的一方时，unknown/unverified 是**结构性**的 ——
+                        #   没有任何一方能核实，每个「变了」的点击都是它，和剧本回放（自己核对过）同理。
+                        #   不排除的后果在离线重放全部留档时看得见：新规矩会把「点空多但仍在推进」的运行掐断 ——
+                        #   一次真机运行里的 18 个 tap 里 11 个点空、7 个到新画面但没核实，
+                        #   新规矩第 19 步熔断，而它实际第 29 步才成功。
+                        #   为什么不改成「减一」：那会让「点歪 → 关掉 → 再点歪」这种环的净增长变成 0，
+                        #   一道本来拦得住的熔断就永远不触发了。
+                        #   模型仍然知道情况：Task 6 那句「这一步没有核实…（这次运行没有看图核对的一方，
+                        #   之后不再逐条提醒）」照旧说（_verdict_line）。
+                        verdict = guard.record_result(
+                            action, res, new_obs,
+                            count_unverified=getattr(perceiver, "asker", None) is not None)
                     if guard.dead_taps >= config.DEAD_TAPS_ALERT:
                         # 连续几次点击画面纹丝不动：不是模型的事，走恢复阶梯（没法重做那一下，
                         # 所以只要某一级真的做了事就清计数再看；全失败抛 DeviceChannelDead → device_error）。
@@ -1139,10 +1306,21 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                         record["recovery"] = recovery.drain()
                     if verdict == "warn":
                         res.hint = (res.hint or "") + " 已连续多步无进展：" + no_progress_hint(guard.last_reason)
-                    msgs.tool_result(action.call_id, res.to_json())
+                    # ⚠ 2026-09-18（spec C1）：结论那句人话算一次、两个视图共用（见 _verdict_line）。
+                    # ⚠ 2026-09-18（Task 6 评审发现 3）：它跑在动作**已经打到设备之后**，抛出去就被外层
+                    #   except Exception 接住、整轮以 device_error 收场，而那一步手机状态已经变了。
+                    #   和本文件里孪生 / 位置感 / 通知那几处同一条规矩：锦上添花的东西绝不顶掉任务。
+                    #   失败退回纯 JSON，原因记在这一步上 —— 静默降级是 CLAUDE.md §3 的静默假话。
+                    try:
+                        v_line = _verdict_line(res, action)
+                    except Exception as e:      # noqa: BLE001
+                        v_line = None
+                        record["verdict_line_error"] = f"{type(e).__name__}: {e}"
+                    msgs.tool_result(action.call_id,
+                                     f"{v_line}\n{res.to_json()}" if v_line else res.to_json())
                     record.update({"result": json.loads(res.to_json()), "no_progress": guard.no_progress})
 
-                    last_result_text = _bound_result(res)
+                    last_result_text = _bound_result(res, v_line)
 
                     _twin_after(record, new_obs)
 
@@ -1176,6 +1354,10 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                     if verdict == "stop" and _fallback_due():
                         # spec §3.5 (b)：先补看、推新帧，再落这一步的记录 —— 这一轮的计时（Task 9）因此包含兜底解析。
                         prog = _no_progress_fallback()
+                    elif verdict == "unverified":
+                        # ⚠ 2026-09-18（spec C2）：连续几步没核实。和上面那条同一个位置 ——
+                        #   要在动作那一帧已经推给模型之后再补看，否则新帧会被这一步的 push_obs 盖掉。
+                        prog = _unverified_fallback()
                     _flush(record)
                     if on_step: on_step(record)
                     if prog is not None:
@@ -1273,6 +1455,10 @@ def run_task(task: str, device, perceiver, model, runs_root: Path,
                 pass
             try:
                 log.set_section("taps", taps)
+            except Exception:           # noqa: BLE001 —— 落盘失败不能影响任务终态
+                pass
+            try:
+                log.set_section("required_gate", required_gate)
             except Exception:           # noqa: BLE001 —— 落盘失败不能影响任务终态
                 pass
 

@@ -28,7 +28,14 @@ class ScriptedModel:
             # KeyboardInterrupt 继承自 BaseException 而非 Exception：
             # 用 isinstance(item, Exception) 判断会漏过它，见任务报告「简报代码问题」一节。
             raise item
-        actions = [Action(n, a, "r", None, f"c{len(self.seen)}_{i}") for i, (n, a) in enumerate(item)]
+        actions = []
+        for i, (n, a) in enumerate(item):
+            a = dict(a)
+            # 像一个守规矩的模型：tap 默认带 expect（tools.py 里它是必填）。脚本里显式写 "expect": None 才是「不写」。
+            expect = a.pop("expect", "预期" if n == "tap" else None)
+            # reason 同理：每个工具都把它列为必填（tools.py:23），脚本里显式写 "reason": "" 才是「不写」。
+            reason = a.pop("reason", "r")
+            actions.append(Action(n, a, reason, expect, f"c{len(self.seen)}_{i}"))
         return ModelReply(actions=actions, text="", model_version="fake-1", usage=self.usage, latency_ms=1)
 
 
@@ -52,9 +59,11 @@ def isolated_store(tmp_path):
     return MemoryStore(tmp_path / "memory")
 
 
-def run(fake_env, specs, script, tmp_path, task_text="t", **kw):
+def run(fake_env, specs, script, tmp_path, task_text="t", asker=None, **kw):
     from iphone_agent.workspace import Workspace
     dev, per, frames = fake_env([specs[0]] * INITIAL_SETTLE_FRAMES + list(specs))
+    if asker is not None:
+        per.asker = asker            # 装配方式和 test_loop_adopt.run_with 一致
     model = ScriptedModel(script)
     kw.setdefault("store", isolated_store(tmp_path))
     # 不传 workspace 会退到 tmp_path.parent —— 那是 pytest 的 basetemp，
@@ -292,7 +301,7 @@ def test_successful_run_has_no_error(fake_env, tmp_path):
 
 
 def test_initial_observation_waits_for_the_home_press_to_settle(fake_env, tmp_path):
-    """真机 bug（2026-09-07，runs/20260907-142838-fbc1）：按完 Cmd+1 立刻抓帧，
+    """真机 bug（2026-09-07，一次真机运行）：按完 Cmd+1 立刻抓帧，
     抓到的是翻页动画中途的那一页；模型基于它选了「设置」，等它想完三五秒动作发出去时，
     iOS 早已落到第一页，同一个网格位置上是 Gemini —— 打开了错误的 App。
     坐标和几何都没错，错在观察到了一个已经不存在的画面。
@@ -908,6 +917,13 @@ def test_no_internal_keys_at_any_depth_in_steps_and_run_json(fake_env, tmp_path)
 
 # ---- 第四组：知识层（路由、注入、剧本工具、提取、留档）----
 
+def tools_on():
+    """剧本工具 2026-09-17 起默认关（config.SKILL_TOOLS_DEFAULT）。下面这些用例钉的是
+    「开着的时候剧本长什么样」，所以显式开。⚠ 在**调用时**构造，不做成模块级常量：
+    RunConfig 的几个 default_factory 就是为了在调用时才读 config（见 workspace.py）。"""
+    return RunConfig(skill_tools="on")
+
+
 def _skill_store(tmp_path, with_proc=True):
     from iphone_agent.skills import model as M
     from iphone_agent.skills.store import SkillStore
@@ -938,7 +954,7 @@ def test_routing_call_comes_first_and_scopes_tools_and_injection(fake_env, tmp_p
     from iphone_agent.skills.route import ROUTE_TOOL
     script = [[("route", {"scenario": "", "apps": ["settings"]})],
               [("done", {"status": "success", "result": "x"})]]
-    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=_skill_store(tmp_path))
+    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=_skill_store(tmp_path), run_config=tools_on())
     assert m.tools_seen[0] == [ROUTE_TOOL]
     assert "settings__ios-version" in [t["function"]["name"] for t in m.tools_seen[1]]
     blob = json.dumps(m.seen[1], ensure_ascii=False)
@@ -989,7 +1005,7 @@ def test_skill_tools_and_skills_prompt_always_come_together(fake_env, tmp_path):
         provenance=M.Provenance(runs=["a", "b"], verified_count=2, last_ok="2026-09-08"),
         steps=[M.Step(do="tap", target="通用", expect=("关于本机",))]))
     script = [[("route", {"scenario": "", "apps": []})], [("done", {"status": "success", "result": "x"})]]
-    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=store)
+    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=store, run_config=tools_on())
     names = [t["function"]["name"] for t in m.tools_seen[-1]]
     has_tool = "settings__ios-version" in names
     has_prompt = any("app__proc" in json.dumps(x, ensure_ascii=False) or "剧本" in json.dumps(x, ensure_ascii=False)
@@ -1022,7 +1038,7 @@ def test_procedure_call_is_one_step_with_substeps_logged_and_provenance_updated(
               [("settings__ios-version", {})],
               [("done", {"status": "success", "result": "x"})]]
     r, dev, m = run(fake_env, [["设置", "通用"], ["关于本机"], ["关于本机"], ["关于本机"], ["关于本机"]],
-                    script, tmp_path, skill_store=store)
+                    script, tmp_path, skill_store=store, run_config=tools_on())
     assert r.end_reason == "done_success" and r.steps == 2
     steps = RunLog.read_steps(r.run_dir)
     subs = [s for s in steps if s.get("kind") == "procedure_step"]
@@ -1049,7 +1065,7 @@ def test_procedure_substeps_do_not_jump_ahead_of_the_pending_action_record(fake_
               [("settings__ios-version", {})],
               [("done", {"status": "success", "result": "x"})]]
     specs = [["设置", "通用"]] + [["通用", "关于本机"]] * 4 + [["关于本机", "iOS版本"]] * 6
-    r, dev, m = run(fake_env, specs, script, tmp_path, skill_store=store)
+    r, dev, m = run(fake_env, specs, script, tmp_path, skill_store=store, run_config=tools_on())
     assert r.end_reason == "done_success" and r.steps == 3
     steps = RunLog.read_steps(r.run_dir)
     names = [("sub" if s.get("kind") == "procedure_step" else (s.get("action") or {}).get("name"))
@@ -1088,7 +1104,7 @@ def test_a_procedures_stop_verdict_ends_the_run_without_a_second_record(fake_env
 
     script = [[("route", {"scenario": "", "apps": ["settings"]})],
               [("settings__ios-version", {})]]
-    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=_skill_store(tmp_path))
+    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=_skill_store(tmp_path), run_config=tools_on())
     assert r.end_reason == "no_progress" and r.steps == 1
     assert "无进展" in (r.error or "")
     assert "settings__ios-version" not in seen, "剧本已经记过账了，主循环又补了一枪"
@@ -1102,7 +1118,7 @@ def test_a_procedures_warn_verdict_reaches_the_model(fake_env, tmp_path, monkeyp
     script = [[("route", {"scenario": "", "apps": ["settings"]})],
               [("settings__ios-version", {})],
               [("done", {"status": "success", "result": "x"})]]
-    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=_skill_store(tmp_path))
+    r, dev, m = run(fake_env, [["a"], ["a"]], script, tmp_path, skill_store=_skill_store(tmp_path), run_config=tools_on())
     assert r.end_reason == "done_success"
     assert "已连续多步无进展" in json.dumps(m.seen[2], ensure_ascii=False)
 
@@ -1607,3 +1623,359 @@ def test_push_obs_swallows_refresh_from_observation_exceptions(fake_env, tmp_pat
     r, dev, m = run(fake_env, [["通用"]], [[("done", {"status": "success", "result": "x"})]], tmp_path,
                     workspace=ws)
     assert r.end_reason == "done_success", "孪生刷新炸了不该影响任务"
+
+
+# --- 开跑前检查：镜像是不是被完全盖住了（2026-09-18）---
+
+def test_preflight_ends_a_fully_covered_run_before_touching_the_device(fake_env, tmp_path):
+    """镜像一条缝都没露：不按 home、不调模型、不计步，直接以 mirror_hidden 结束，并把话说清楚。"""
+    from iphone_agent.driver.injector import MIRROR_HIDDEN_HINT
+    from iphone_agent.workspace import Workspace
+    dev, per, _ = fake_env([["a"]] * 3)
+    dev.exposed = False
+    model = ScriptedModel([[("done", {"status": "success", "result": "x"})]])
+    r = run_task("打开设置", dev, per, model, tmp_path, store=isolated_store(tmp_path),
+                 workspace=Workspace(tmp_path))
+    assert r.end_reason == "mirror_hidden" and r.steps == 0
+    assert dev.calls == [], "被盖住时不该有任何设备动作（连 home 都不按）"
+    assert model.seen == [], "不该花一次模型调用"
+    assert r.error == MIRROR_HIDDEN_HINT
+    meta = json.loads((r.run_dir / "run.json").read_text())
+    assert meta["end_reason"] == "mirror_hidden" and meta["steps"] == 0
+    assert meta["preflight"]["mirror_exposed"] is False
+    assert "一小条" in meta["preflight"]["message"] and "后台" in meta["preflight"]["message"]
+    assert meta["usage"].get("model_calls") == 0
+
+
+def test_preflight_passes_when_only_a_strip_is_exposed(fake_env, tmp_path):
+    """只露出右边一条也算露着 —— 判据是 driver 里那条共享规则，这里用真实规则跑一遍。"""
+    from iphone_agent.driver.geometry import Rect
+    from iphone_agent.driver.injector import exposed_anchor
+    content = Rect(100, 100, 300, 600)
+    strip = [{"kCGWindowLayer": 0, "kCGWindowNumber": 777,
+              "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 380, "Height": 2000}},
+             {"kCGWindowLayer": 0, "kCGWindowNumber": 99,
+              "kCGWindowBounds": {"X": 94, "Y": 62, "Width": 312, "Height": 644}}]
+    dev, per, frames = fake_env([["通用"]] * (INITIAL_SETTLE_FRAMES + 4))
+    dev.mirror_exposed = lambda: exposed_anchor(99, content, windows=strip) is not None
+    model = ScriptedModel([[("done", {"status": "success", "result": "ok"})]])
+    from iphone_agent.workspace import Workspace
+    r = run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path),
+                 workspace=Workspace(tmp_path))
+    assert r.end_reason == "done_success"
+    assert ("key", "home") in dev.calls and len(model.seen) >= 1
+
+
+def test_preflight_check_failure_does_not_block_the_run(fake_env, tmp_path):
+    """检查本身炸了（比如窗口列表取不到）不能顶掉任务：留档，照常跑。"""
+    from iphone_agent.workspace import Workspace
+    r, dev, m = run(fake_env, [["a"]] * 3, [[("done", {"status": "success", "result": "x"})]], tmp_path)
+    assert r.end_reason == "done_success" and dev.exposure_checks == 1
+    dev2, per2, _ = fake_env([["a"]] * 10)
+    dev2.raise_on["mirror_exposed"] = RuntimeError("窗口列表取不到")
+    r2 = run_task("t", dev2, per2, ScriptedModel([[("done", {"status": "success", "result": "x"})]]),
+                  tmp_path, store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
+    assert r2.end_reason == "done_success"
+    assert any(s.get("error_phase") == "preflight" for s in RunLog.read_steps(r2.run_dir))
+
+
+# ---- 2026-09-18（spec「不知道」不放行 B1/C1）：必填参数闸 + 把结论说给模型 ----
+
+def _steps(run_dir):
+    return [json.loads(line) for line in (run_dir / "steps.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def _text_of(messages):
+    return json.dumps(messages, ensure_ascii=False)
+
+
+def test_tap_without_expect_is_rejected_once_then_let_through_as_unknown(fake_env, tmp_path):
+    """⚠ 2026-09-18：tap 的 expect 09-11 就是必填了，执行层从来不校验 —— 模型 61% 不写，
+    点击预期核对六成时间在挨饿。先拒一次（不上设备），紧接着同一个动作再缺就放行，由执行层标「没核实」。"""
+    tap = ("tap", {"x": 100, "y": 65, "expect": None})
+    r, dev, model = run(fake_env, [["通用"]] * 3 + [["关于本机"]] * 6,
+                        [[tap], [tap], [("done", {"status": "success", "result": "x"})]], tmp_path)
+    taps = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"]
+    assert taps[0]["validation"] == "missing_required" and "expect" in taps[0]["result"]["hint"]
+    assert len([c for c in dev.actions if c[0] == "tap"]) == 1          # 被拒的那次没上设备
+    assert taps[1]["missing_required"] == ["expect"]
+    assert taps[1]["result"]["verdict"] == {"state": "unknown", "by": "missing"}
+    assert "没有核实" in _text_of(model.seen[2])                       # 第三次 decide 时模型读得到那句话
+    # ⚠ 2026-09-18（最终评审）：这道闸拒了几次、放行了几次要进 run.json —— 验收「模型到底写不写 expect」
+    #   只能靠它归因；只留在每一步的记录里，等于要人自己去 steps.jsonl 里数（CLAUDE.md §3）。
+    meta = json.loads((r.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert meta["required_gate"] == {"rejected": 1, "let_through": 1}
+
+
+def test_a_rejected_reply_in_between_does_not_reset_the_let_through(fake_env, tmp_path):
+    """⚠ 2026-09-20 更正：这条用例原来叫 test_a_different_reply_in_between_resets_the_let_through，
+    钉的是旧 R2——「中间隔了任何别的回复（含别的校验错误）就重新计」。中间那个 `wait(seconds=0)`
+    其实自己也被拒了（`invalid_args`：`config.WAIT_MIN_S=0.5`，0 不合法），从没有真正上过设备；
+    旧代码里任何非 missing_required 的校验错误都会清 last_missing，所以恰好「重新计」。
+    按新规矩（同一个拒绝流里同样的缺法只拒一次，只有动作真正执行才重新计），一个自己也被拒掉的
+    `wait` 不算「隔了一个回复」——紧接着的第二个 tap 还在同一个拒绝流里，该放行并执行。"""
+    tap = ("tap", {"x": 100, "y": 65, "expect": None})
+    bad_wait = ("wait", {"seconds": 0})     # 小于 WAIT_MIN_S，会被 invalid_args 拒掉，没有真正执行
+    r, dev, _ = run(fake_env, [["通用"]] * 12,
+                    [[tap], [bad_wait], [tap], [("done", {"status": "success", "result": "x"})]],
+                    tmp_path)
+    taps = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"]
+    assert taps[0]["validation"] == "missing_required"
+    assert "validation" not in taps[1] and taps[1]["missing_required"] == ["expect"]
+    assert len([c for c in dev.actions if c[0] == "tap"]) == 1
+
+
+def test_the_missing_gate_only_rejects_once_per_rejection_stream(fake_env, tmp_path):
+    """⚠ 2026-09-20（真机 run 20260920-155906-58c6，「用 Spotlight 算 128×37」；改动前这道题 7 步通过）：
+    第二次缺 expect 的回复紧接着按 R2 放行，但坐标越界，被 validate_action 的 out_of_image 拒掉——
+    这条『别的校验错误』把 last_missing 清零，导致第三次坐标合法、仍缺 expect 的回复（本该执行）
+    被必填闸当成『新的缺法』又拒了一次。两次必填闸拒绝叠上其余拒绝，
+    把 MAX_CONSECUTIVE_REJECTIONS 的额度烧光，任务被 model_error 掐死。
+    裁定：同一个拒绝流里同样的缺法只拒一次，只有动作真正执行了才重新计。
+    """
+    tap_1 = ("tap", {"x": 100, "y": 65, "expect": None})
+    tap_2_oob = ("tap", {"x": 100, "y": 5000, "expect": None})   # 假环境图像 400x800，y 远超边界
+    tap_3_ok = ("tap", {"x": 120, "y": 65, "expect": None})
+    r, dev, _ = run(fake_env, [["通用"]] * 12,
+                    [[tap_1], [tap_2_oob], [tap_3_ok], [("done", {"status": "success", "result": "x"})]],
+                    tmp_path)
+    assert r.end_reason != "model_error", r.error
+    taps = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"]
+    assert taps[0]["validation"] == "missing_required"
+    assert taps[1]["validation"] == "out_of_image"
+    # 第三次：坐标合法，且和上一次因必填闸被拒时缺的是同一个参数 —— 放行并真正执行，不是再被拒一次。
+    assert "validation" not in taps[2]
+    assert taps[2]["missing_required"] == ["expect"]
+    assert len([c for c in dev.actions if c[0] == "tap"]) == 1
+
+
+def test_after_an_action_executes_the_missing_gate_starts_a_fresh_rejection_stream(fake_env, tmp_path):
+    """证明「执行」确实会重置：紧接着放行执行之后，下一次换了坐标但仍缺 expect，
+    不能因为『上上次』缺过同样的参数就直接放行——必须重新拒一次。"""
+    tap_a = ("tap", {"x": 100, "y": 65, "expect": None})
+    tap_b = ("tap", {"x": 200, "y": 65, "expect": None})
+    r, dev, _ = run(fake_env, [["通用"]] * 12,
+                    [[tap_a], [tap_a], [tap_b], [("done", {"status": "success", "result": "x"})]],
+                    tmp_path)
+    taps = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"]
+    # 1: 拒；2: 紧接着同样缺 → 放行并执行（重置点）；3: 执行过了，重新计 → 再拒一次
+    assert [t.get("validation") for t in taps] == ["missing_required", None, "missing_required"]
+    assert taps[1]["missing_required"] == ["expect"]
+    assert len([c for c in dev.actions if c[0] == "tap"]) == 1
+
+
+def test_a_tap_with_expect_passes_the_gate(fake_env, tmp_path):
+    r, dev, _ = run(fake_env, [["通用"]] * 3 + [["关于本机"]] * 6,
+                    [[("tap", {"x": 100, "y": 65, "expect": "出现「关于本机」"})],
+                     [("done", {"status": "success", "result": "x"})]], tmp_path)
+    tap = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"][0]
+    assert "validation" not in tap and tap["result"]["verdict"]["state"] == "met"
+
+
+def test_required_gate_is_not_inside_validate_action():
+    """闸绝不能进 validate_action：剧本的 tap expect 恒为 None（procedure.py），而剧本共用 validate_action ——
+    进去了就是把所有剧本一起拒掉（spec 评审的阻断 1）。"""
+    import inspect
+
+    from iphone_agent.harness import actions
+    assert "missing_required" not in inspect.getsource(actions)
+
+
+def _last_tool(messages):
+    return [x for x in messages if x["role"] == "tool"][-1]["content"]
+
+
+# 三屏，每屏三条互不重叠的文字：每次 tap 的 text_diff 都远超 TEXT_DIFF_THRESHOLD，
+# changed 稳稳为真（用两三个字的单元素屏会因为 text_diff=2 被判成没变，见 conftest 的 ⚠）。
+_R5_PAGES = [["通用", "关于本机", "软件更新"], ["隐私与安全性", "定位服务", "跟踪"], ["电池", "健康状况", "充电优化"]]
+_R5_SPECS = [_R5_PAGES[0]] * INITIAL_SETTLE_FRAMES + _R5_PAGES
+_R5_MOVES = {(0, "tap"): INITIAL_SETTLE_FRAMES + 1,
+             (INITIAL_SETTLE_FRAMES + 1, "tap"): INITIAL_SETTLE_FRAMES + 2}
+
+
+def test_without_a_judge_the_unverified_line_is_said_in_full_once_then_quiets_down(action_env, tmp_path):
+    """计划 R5：没有看图的一方时，每一步都「没核实」—— 逐条提醒就是刷屏。
+    第一次照常说并声明「之后不再逐条提醒」，之后闭嘴。"""
+    from iphone_agent.workspace import Workspace
+    dev, per, _ = action_env(_R5_SPECS, _R5_MOVES)
+    assert getattr(per, "asker", None) is None, "这个用例的前提就是没有看图核对的一方"
+    model = ScriptedModel([[("tap", {"x": 100, "y": 65})], [("tap", {"x": 100, "y": 120})],
+                           [("done", {"status": "success", "result": "x"})]])
+    run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
+    first = _last_tool(model.seen[1])
+    assert "没有核实" in first and "不再逐条提醒" in first
+    second = _last_tool(model.seen[2])
+    assert "没有核实" not in second and '"unverified"' in second, "字段还在，只是不再逐条念"
+
+
+def test_quiet_never_swallows_a_missing_expect(action_env, tmp_path):
+    """计划 R5：`by="missing"` 不受 quiet 影响 —— 没写 expect 是模型自己的事，
+    跟「这次运行没有看图的一方」无关，必须每次都说。"""
+    from iphone_agent.workspace import Workspace
+    dev, per, _ = action_env(_R5_SPECS, _R5_MOVES)
+    no_expect = ("tap", {"x": 100, "y": 120, "expect": None})
+    model = ScriptedModel([[("tap", {"x": 100, "y": 65})],          # 先用掉「只说一次」的额度
+                           [no_expect],                             # 被必填闸拒一次
+                           [no_expect],                             # 紧接着再缺 → 放行，结论 unknown/missing
+                           [("done", {"status": "success", "result": "x"})]])
+    run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
+    assert "不再逐条提醒" in _last_tool(model.seen[1])
+    assert "没有核实" in _last_tool(model.seen[3])
+
+
+# ---- 2026-09-18（Task 6 评审发现 2）：闸的作用面不止「tap 缺 expect」----
+
+_NO_REASON_WAIT = ("wait", {"seconds": 0, "reason": ""})
+
+
+def _no_reason_scroll(direction):
+    return ("scroll", {"direction": direction, "reason": ""})
+
+
+def test_two_different_tools_missing_the_same_field_still_count_as_the_same_miss(fake_env, tmp_path):
+    """⚠ 2026-09-18（评审发现 2，改 R2）：比较键只比「缺的参数元组」，不带工具名。
+
+    `tools.py:23` 把 reason 列成了每个工具的必填项。键里带工具名的话，一个从不写 reason、
+    又在不同工具间换来换去的弱模型每次都算「换了个缺法」→ 每次都被拒 →
+    MAX_CONSECUTIVE_REJECTIONS 次之后任务直接 model_error 结束，而这些动作改动前是照常执行的。
+    spec B1 明写「不能让弱模型卡死在这儿」，所以放宽：最坏是「拒一次、放一次」交替。
+    """
+    r, dev, _ = run(fake_env, [["a"]] * 12,
+                    [[_NO_REASON_WAIT], [_no_reason_scroll("down")],
+                     [("done", {"status": "success", "result": "x"})]], tmp_path)
+    acts = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") in ("wait", "scroll")]
+    assert acts[0]["validation"] == "missing_required" and "reason" in acts[0]["result"]["hint"]
+    assert "validation" not in acts[1] and acts[1]["missing_required"] == ["reason"]
+
+
+def test_a_model_that_never_writes_reason_is_not_killed_by_the_rejection_limit(fake_env, tmp_path):
+    """同上：交替着拒一次放一次，永远够不到连续拒绝上限，任务不会被这道闸掐死。"""
+    from iphone_agent import config
+    script = [[_NO_REASON_WAIT], [_no_reason_scroll("down")],
+              [_NO_REASON_WAIT], [_no_reason_scroll("up")],
+              [_NO_REASON_WAIT], [_no_reason_scroll("left")]]
+    assert len(script) > config.MAX_CONSECUTIVE_REJECTIONS, "回复条数要多过上限，才谈得上「没被掐死」"
+    r, dev, _ = run(fake_env, [["a"]] * 30, script, tmp_path)
+    assert r.end_reason != "model_error", r.error
+    acts = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") in ("wait", "scroll")]
+    assert [s.get("validation") for s in acts[:6]] == [
+        "missing_required", None, "missing_required", None, "missing_required", None]
+
+
+def test_a_broken_verdict_line_never_takes_the_task_down(action_env, tmp_path, monkeypatch):
+    """⚠ 2026-09-18（Task 6 评审发现 3）：那句人话是锦上添花，跑在动作**已经打到设备之后**。
+
+    它抛出去会被外层 except Exception 接住、整轮以 device_error 收场，而那一步手机状态已经变了 ——
+    和这个文件里孪生 / 位置感 / 通知那几处同一条规矩：绝不能顶掉任务。
+    失败退回纯 JSON，原因记在这一步上（CLAUDE.md §3：失败要能被看见）。
+    """
+    from iphone_agent.harness import verdict as verdict_mod
+    from iphone_agent.workspace import Workspace
+
+    def boom(*a, **kw):
+        raise RuntimeError("说不出话")
+
+    monkeypatch.setattr(verdict_mod, "say", boom)
+    dev, per, _ = action_env(_R5_SPECS, _R5_MOVES)
+    model = ScriptedModel([[("tap", {"x": 100, "y": 65})],
+                           [("done", {"status": "success", "result": "x"})]])
+    r = run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path),
+                 workspace=Workspace(tmp_path))
+    assert r.end_reason == "done_success", r.error
+    tap = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"][0]
+    assert tap["verdict_line_error"].startswith("RuntimeError:") and "说不出话" in tap["verdict_line_error"]
+    assert _last_tool(model.seen[1]).startswith("{"), "退回纯 JSON，前面不挂半句话"
+
+
+# --- 连续几步没核实要明说（spec 2026-09-18 C2）---
+#
+# ⚠ 2026-09-18 现场 一次真机运行的第 12 步：点歪进了微博登录页，没写 expect →
+#   没人核对 →「变了且是新画面」→ 计数清零。错页面被记成进展，同一个坐标后面又点了两轮。
+
+_UNVERIFIED_SPECS = [["a"]] * 3 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6
+_UNVERIFIED_TAPS = [[("tap", {"x": 100 + i, "y": 65})] for i in range(3)]
+_DONE_FAILED = [("done", {"status": "failed", "result": "x"})]
+
+
+def _cannot_answer():
+    """有看图的一方，但「是不是预期的样子」一律答不出 → 每一步 unknown/unverified。
+
+    ⚠ 2026-09-18（最终评审 I1）：这三条原来跑在**没有看图的一方**的环境里。守卫现在在那种环境里
+      不数 unverified（loop 传 count_unverified=False，见那里的注释），这句话于是不会出现 ——
+      换成「有看图方但答不出」，考的还是同一段编排。
+    用 test_loop_adopt.Labeler 而不是 CountingAsker：整屏解析要照常成功，不然这一帧会另外满足
+      fallback_due，走的就是「补看一次全屏」那条路，而这三条考的是「补不了看时只说那句话」。
+      在函数里 import：模块级会和 test_loop_adopt 反向 import 撞成循环。
+    """
+    from tests.test_loop_adopt import Labeler
+    return Labeler()
+
+
+def test_three_unverified_taps_in_a_row_are_called_out(fake_env, tmp_path):
+    # 有看图的一方但一句都答不出 + 预期对不上文字 → 每一下都是 unknown/unverified；三下之后要明说。
+    # 生产默认是 window 视图（config.CONTEXT_MODE），这一条就跑在它上面。
+    r, dev, model = run(fake_env, _UNVERIFIED_SPECS, _UNVERIFIED_TAPS + [_DONE_FAILED], tmp_path,
+                        asker=_cannot_answer())
+    assert "连续 3 步没有核实" in _text_of(model.seen[3])
+    assert "先 observe" in _text_of(model.seen[3]), "补不了看就得让模型自己去看"
+
+
+def test_the_same_call_out_reaches_the_state_view(fake_env, tmp_path):
+    """两个视图的模型都要读到这句话（CLAUDE.md §3、§7）：window 走 user_text，state 走【上一步结果】。"""
+    r, dev, model = run(fake_env, _UNVERIFIED_SPECS, _UNVERIFIED_TAPS + [_DONE_FAILED], tmp_path,
+                        asker=_cannot_answer(), run_config=RunConfig(context_mode="state"))
+    assert "连续 3 步没有核实" in _text_of(model.seen[3])
+
+
+def test_the_call_out_does_not_end_the_task_or_burn_a_step(fake_env, tmp_path):
+    """它只是一句话（补不了看的时候）：不改结束原因、不多记一步、不碰恢复阶梯。"""
+    r, dev, model = run(fake_env, _UNVERIFIED_SPECS, _UNVERIFIED_TAPS + [_DONE_FAILED], tmp_path,
+                        asker=_cannot_answer())
+    assert r.end_reason == "done_failed" and r.steps == 4, r.error
+    assert not [s for s in _steps(r.run_dir) if s.get("by") == "program"]
+
+
+# --- 没有看图的一方时，守卫退回旧行为（最终评审 I1）---
+#
+# ⚠ 2026-09-18：没有任何一方能核实时，unknown/unverified 是**结构性**的 —— 每个「变了」的点击都是它，
+#   和剧本回放（自己核对过、传 count_unverified=False）同理：说它「没人核实成没成」没有信息量。
+#   离线重放全部留档：新规矩会把「点空多但仍在推进」的运行掐断 —— 一次真机运行
+#   18 个 tap 里 11 个点空、7 个到新画面但没核实，新规矩第 19 步熔断，而它实际第 29 步成功了。
+
+_I1_PAGES = [["通用", "关于本机", "软件更新"], ["隐私与安全性", "定位服务", "跟踪"],
+             ["电池", "健康状况", "充电优化"], ["声音", "触感", "铃声"],
+             ["墙纸", "锁定屏幕", "主屏幕"], ["辅助功能", "触控", "显示"],
+             ["Siri", "搜索", "建议"]]
+# 交替：点空的一下（到文字相同的下一帧 → changed=False）和到新画面的一下（changed=True、没核实）。
+_I1_SPECS = [_I1_PAGES[0]] * INITIAL_SETTLE_FRAMES + [_I1_PAGES[0]] + [
+    p for page in _I1_PAGES[1:] for p in (page, page)][:-1]
+_I1_MOVES = {(0, "tap"): INITIAL_SETTLE_FRAMES} | {
+    (i, "tap"): i + 1 for i in range(INITIAL_SETTLE_FRAMES, len(_I1_SPECS) - 1)}
+# 同一屏上连着两下（点空的那一下和到新画面的那一下）落在不同的桶里，才不会被「同屏同动作」拒掉。
+_I1_TAPS = [[("tap", {"x": 100 + 35 * (i % 2), "y": 65})] for i in range(12)]
+
+
+def _run_i1(dev, per, tmp_path, **kw):
+    from iphone_agent.workspace import Workspace
+    model = ScriptedModel(list(_I1_TAPS))
+    r = run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path),
+                 workspace=Workspace(tmp_path), **kw)
+    return r, model
+
+
+def test_without_a_judge_an_unverified_step_still_counts_as_progress(action_env, tmp_path):
+    """没有看图的一方：「变了、到了新画面」照旧算进展，交替的点空攒不到 6 步，任务不该被熔断掐断。"""
+    dev, per, _ = action_env(_I1_SPECS, _I1_MOVES)
+    assert getattr(per, "asker", None) is None, "这个用例的前提就是没有看图核对的一方"
+    r, _ = _run_i1(dev, per, tmp_path)
+    assert r.end_reason != "no_progress", r.error
+    assert r.steps == len(_I1_TAPS) + 1, "12 下点完，脚本用尽后那条 done(failed) 才结束"
+
+
+def test_with_a_judge_that_cannot_answer_the_same_run_is_stopped(action_env, tmp_path):
+    """有看图的一方、只是这一问答不出：新规矩照旧计 —— 没核实的一步不清零，点空攒到 6 就熔断。"""
+    dev, per, _ = action_env(_I1_SPECS, _I1_MOVES)
+    per.asker = _cannot_answer()
+    r, _ = _run_i1(dev, per, tmp_path)
+    assert r.end_reason == "no_progress", r.error

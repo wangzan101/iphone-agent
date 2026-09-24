@@ -10,14 +10,20 @@ from itertools import pairwise
 from pypinyin import lazy_pinyin
 
 from iphone_agent import config
+from iphone_agent.appids import app_id_for
 from iphone_agent.driver.device import WindowMoved
 from iphone_agent.driver.geometry import OutOfWindow, image_to_screen
 from iphone_agent.driver.injector import ActivateFailed
 from iphone_agent.driver.timing import IOS_TIMING
 from iphone_agent.harness import judge, recap
-from iphone_agent.harness.actions import Action, icon_y_above_label, screen_neutral
+from iphone_agent.harness.actions import (
+    BUILTIN_ACTION_NAMES,
+    Action,
+    icon_y_above_label,
+    screen_neutral,
+)
 from iphone_agent.harness.settle import settle
-from iphone_agent.memory.screenmap import app_id_for
+from iphone_agent.harness.verdict import Verdict
 from iphone_agent.perceive import transition as tr
 from iphone_agent.perceive.change import did_change, local_mad
 from iphone_agent.perceive.elements import Observation
@@ -61,6 +67,12 @@ class ToolResult:
 # 09-09 改成第三次说「别试了」，模型照样换 20 种方式试。设备故障不该交给模型：
 # 有恢复阶梯（recovery.py）时它根本看不到这句；没有阶梯时它看到的也只是事实。
 TYPING_NOT_LANDED = "按键没有落进输入框（这次是 {what!r}）：键盘通道可能失效了。"
+# ⚠ 2026-09-18（Task 4 评审）：点了输入法候选却没上屏，是**点击**没生效，不是键盘通道失效 ——
+#   两句话给模型指的路正好相反（换个候选再点 / 换词都没用）。按通道分开说，别共用上面那句。
+CANDIDATE_NOT_ON_SCREEN = "点了候选 {what!r}，但它没有上屏。"
+# 「字没落上去」这件事，按送字的通道各有一套说法：(给模型的 hint, 写进结论的 why)。
+_NOT_LANDED = {"keyboard": (TYPING_NOT_LANDED, "按键没有落进输入框"),
+               "tap": (CANDIDATE_NOT_ON_SCREEN, "点了候选，但它没有上屏")}
 
 
 def full_screen_note(obs) -> str | None:
@@ -303,7 +315,30 @@ class Executor:
             return "keyboard"
         return None
 
+    def _conclude(self, res: ToolResult, v: Verdict, **legacy) -> None:
+        """结论的**唯一写入口**：verdict，连同这个出口原来就写的旧字段（expect_check / verified / judged）。
+
+        ⚠ 2026-09-18（spec「不知道」不放行）：原来点击、打字、选候选、open_app 各拼各的字段，
+          消费方各读各的 —— 新增一个出口就再忘一次，「不知道」就是这么一路按 ok 放行的。
+          旧字段留着是因为 guard / 孪生 / 历史表 / 剧本抽取 / 旧留档回放都在读，值不变；
+          tests 里的 _aligned 钉着「写进去的结论」和「从旧字段推出来的结论」state 一致。
+        """
+        res.extra.update({k: val for k, val in legacy.items() if val is not None})
+        res.extra["verdict"] = v.to_json()
+
     def _run_once(self, action: Action, obs: Observation) -> tuple[ToolResult, Observation | None]:
+        res, new = self._dispatch(action, obs)
+        # ⚠ 2026-09-18（spec「不知道」不放行）：出口兜底。会改画面的动作 ok 了却没人下结论 = 漏网的出口，
+        #   标出来，不放过（CLAUDE.md §3）。剧本工具名不在 BUILTIN_ACTION_NAMES 里，不兜。
+        # ⚠ 2026-09-18（最终评审 3b）：这里**故意**直接写 res.extra["verdict"]，不走 _conclude ——
+        #   它兜的正是「_conclude 没被调到 / 坏掉了」这一种情况，走它等于让自己兜自己：
+        #   _conclude 一坏，兜底跟着一起不响，这道防线就没了。全文件写 verdict 的只有这两处。
+        if (res.ok and "verdict" not in res.extra and action.name not in ("done", "handover")
+                and action.name in BUILTIN_ACTION_NAMES and not screen_neutral(action)):
+            res.extra["verdict"] = Verdict("unknown", "unconcluded", "执行层没有给这个动作下结论").to_json()
+        return res, new
+
+    def _dispatch(self, action: Action, obs: Observation) -> tuple[ToolResult, Observation | None]:
         n = action.name
         if n == "done":
             return ToolResult(ok=True), None
@@ -390,9 +425,10 @@ class Executor:
         if n in ("scroll_until", "collect"):
             return self._scroll_scan(action, obs)
         if n == "switch_ime":
+            was = self._ime_chinese
             self.dev.toggle_ime()
             self._ime_chinese = None      # 切完是什么模式要重新验，不能假设翻转成功
-            return {}
+            return {"_ime_was": was}
         if n == "erase":
             self.dev.backspace(a["count"]); return {}
         if n == "key":
@@ -410,7 +446,7 @@ class Executor:
                 return self._type_via_ime(a["text"], obs)
             baseline = self._region_texts(obs)
             baseline_all = set(obs.text_set)
-            self.dev.type(a["text"])
+            via = self.dev.type(a["text"])
             # ⚠ 中文模式下打 ASCII，字母会变成**拼音待上屏**，英文根本打不出来 ——
             #   而且是静默失败：动作报成功、屏幕也变了（候选栏冒出来了）。
             #   混合输入必须管这一侧，不能只管中文那一侧。
@@ -420,17 +456,19 @@ class Executor:
                 self._ime_chinese = True
                 self.dev.backspace(len(a["text"]))     # 只退自己刚打的
                 self.dev.toggle_ime()
-                self.dev.type(a["text"])
+                via = self.dev.type(a["text"])
                 self._ime_chinese = False
             else:
                 self._ime_chinese = False
-            return {"_baseline": baseline, "_baseline_all": baseline_all, "_target": a["text"]}
+            return {"_baseline": baseline, "_baseline_all": baseline_all, "_target": a["text"],
+                    "_typed_via": via}
         if n == "open_app":
             return self._open_app(a["name"], obs)
         raise ValueError(n)
 
     # ---- 动作后 ----
     def _after(self, action: Action, before: Observation, extra: dict):
+        # wait 也走这里（为了拿新观察），但它是 screen_neutral：不下结论，出口兜底也不管它。
         frame_before = self._frame_of(before)
         frame, settled = settle(self.dev, frame_before, IOS_TIMING[action.name], ahash)
         new = self.per.observe(frame)
@@ -454,12 +492,10 @@ class Executor:
         # ⚠ tap_px 传 None：local_mad 是像素级循环，上面真正需要它时已经算过一次了。
         t = tr.transition(before, new, None, max(len(before.elements), len(new.elements)) + 1)
         if action.name == "type":
-            extra_target = extra.get("_target", "")
-            verified = self._verify_type(new, extra.pop("_baseline"), extra.pop("_target"),
+            target = extra.pop("_target", "")
+            verified = self._verify_type(new, extra.pop("_baseline"), target,
                                          extra.pop("_baseline_all", None))
-            res.extra["verified"] = verified
-            if verified == "false":
-                res.hint = TYPING_NOT_LANDED.format(what=extra_target)
+            self._conclude_type(res, before, new, target, verified, extra.pop("_typed_via", None))
         elif not changed and action.name in HINTS:
             # ---- 像素判据说「没变化」：看图复核一次 ----
             # 原来到这里就直接下结论了，而两个判据都是纯像素的（aHash 汉明 + 文本集合差），
@@ -472,50 +508,56 @@ class Executor:
                                         action.expect, self.asker)
             if eff is not None and eff.worked:
                 res.changed = True
-                res.extra["judged"] = {"worked": True, "confidence": eff.confidence,
-                                       "why": eff.why}
+                judged = {"worked": True, "confidence": eff.confidence, "why": eff.why}
                 # ⚠ 不写 hint：HINTS 那句是「可能没点中，换个目标」，而这里刚判定它**生效了**。
                 #   两句一起发出去，模型会照那句错的走。
+                # ⚠ 2026-09-18（最终评审 M2）：说的只是**不写 HINTS 那一句**，不是「这条路永远没有 hint」——
+                #   往下走到 _conclude_changed，tap 的第二问（是不是预期的样子）答「没达到」时它会写
+                #   「画面变了，但看图复核说没达到预期：…」。那是另一件事的结论，不矛盾。
+                # ⚠ 2026-09-18（spec B5）：原来这里把「动作生效了」直接写成 expect_check.met=True ——
+                #   两个问题混了（judge.py 模块文档「一条硬规矩」）。生效 ≠ 达到预期：再按预期核一次。
+                #   judged 保持是「生效了吗」那一问的答案、**不带 on_change**：守卫靠它认「低于指纹分辨率的变化」
+                #   （guard.record_result 的 fine），带上 on_change 会被当成见过的画面记成打转。
+                self._conclude_changed(action, before, new, t, res, judged=judged)
             else:
                 res.hint = HINTS[action.name]
+                judged = None
                 if eff is not None:
-                    res.extra["judged"] = {"worked": False, "confidence": eff.confidence,
-                                           "why": eff.why}
+                    judged = {"worked": False, "confidence": eff.confidence, "why": eff.why}
                     # 模型看过两张图说没生效 —— 这比汉明距离有说服力得多，交给模型当线索。
                     res.hint += f"（看图复核也说没生效：{eff.why}）"
-            if action.name == "tap":
-                res.extra["expect_check"] = (_vision_check(eff) if action.expect
-                                             else {"met": None, "by": "missing"})
-        elif changed and action.expect and action.name in HINTS:
-            # ---- 像素判据说「变了」：变了 ≠ 做对了 ----
-            # 上面那条「只在否定侧问」的规矩管的是**动作生效没**；这里问的是另一件事：
-            # **生效了，但去的是不是对的地方**。误点进一个错页面正是「变了」——
-            # 以前一律当成功，guard 还把它记成进展（guard.py record_outcome 的注释）。
-            # ⚠ 2026-09-11：tap 的 expect 改成必填（tools.py）。先看「」里的字有没有新出现 ——
-            #   肯定信号，直接确认、不花钱看图；对不上才问判官。改之前留档里只有 9.7% 的点击带 expect，
-            #   这条复核只触发过 1 次。
-            # on_change=True 让 guard.record_result 分得清这次 judged 是哪一路来的（那边的注释）。
-            matched = expect_met_by_text(action.expect, t.added) if action.name == "tap" else None
-            if matched is not None:
-                res.extra["expect_check"] = {"met": True, "by": "text", "matched": matched}
+                # ⚠ 2026-09-18（spec B5）：画面没变的 tap 根本没问过「是不是预期的样子」，
+                #   旧字段如实写 not_asked，不再拿「生效了吗」的答案冒充它。
+                self._conclude(res, Verdict("not_met", "vision" if eff is not None else "pixels",
+                                            why=eff.why if eff is not None else ""),
+                               judged=judged,
+                               expect_check={"met": None, "by": "not_asked"} if action.name == "tap" else None)
+        elif changed and action.name in HINTS:
+            self._conclude_changed(action, before, new, t, res)
+        elif action.name == "switch_ime":
+            # ⚠ 2026-09-18（spec B6）：switch_ime 不在 HINTS 里，原来变不变都拿不到任何结论，
+            #   _ime_chinese 置 None 等下一次打字去撞。它正是 CLAUDE.md §2 那次事故的主角
+            #   （toggle_ime 把一个正确的中文模式切走）。切完问一次现在是什么，信念换成事实。
+            was = extra.pop("_ime_was", None)
+            mode = judge.ime_mode(new.image, self.asker)
+            if mode is None:
+                self._conclude(res, Verdict("unknown", "unverified", why="切完是什么输入法，没核成"))
             else:
-                # ⚠ 2026-09-11 终审：tap 在这里问「画面是不是预期的样子」（judge.met_expectation），
-                #   不问「这个动作生效了吗」（did_action_work，给「画面没变」那一侧写的）—— 画面已经变了，
-                #   按字面答「点中了、页面动了 = 生效」会放过错页面。非 tap 动作行为不变。
-                #   judged 的键名保持 worked / on_change：guard 的 off_track、孪生的记账都读它，改名会静默坏掉。
-                ask = judge.met_expectation if action.name == "tap" else judge.did_action_work
-                eff = ask(before.image, new.image, action.describe(), action.expect, self.asker)
-                if eff is not None:
-                    res.extra["judged"] = {"worked": eff.worked, "confidence": eff.confidence,
-                                           "why": eff.why, "on_change": True}
-                    if not eff.worked:
-                        res.hint = f"画面变了，但看图复核说没达到预期：{eff.why}。先确认自己在哪。"
-                if action.name == "tap":
-                    res.extra["expect_check"] = _vision_check(eff)
-        elif changed and action.name == "tap":
-            res.extra["expect_check"] = {"met": None, "by": "missing"}
+                now = mode == "chinese"
+                # ⚠ 2026-09-18（最终评审 M8）：这里写 False 会让 _type_via_ime 开头那次**预翻转**
+                #   （`if self._ime_chinese is False: toggle_ime()`）真的执行 —— 看图把一个中文键盘
+                #   误判成英文时，下一次打字会先把**正确的**中文模式切走。形状正是 CLAUDE.md §2 那次事故
+                #   （toggle_ime 把正确的中文模式切走，App 内容框 8 次全挂）。
+                #   之所以还是写：这是全项目唯一一处能把「信念」换成「事实」的地方，而且后果有界且自愈 ——
+                #   切错了候选栏就是空的，_type_via_ime 会退格 + 切回来 + 重打，代价是一次多余往返。
+                self._ime_chinese = now
+                if was is not None and was == now:
+                    res.hint = f"切换之后输入法还是{'中文' if now else '英文'}，没切过去。"
+                    self._conclude(res, Verdict("not_met", "vision", why=res.hint, seen=mode))
+                else:
+                    self._conclude(res, Verdict("met", "vision", seen=mode))
         # ---- 主屏 / Spotlight 上点图标（icon_above）也要核对打开的是不是那个 App ----
-        # ⚠ 2026-09-11 闸门 B 错归（runs/20260907-142838-fbc1:2）：模型在主屏第 2 页的前帧上
+        # ⚠ 2026-09-11 闸门 B 错归（一次真机运行的第 2 步）：模型在主屏第 2 页的前帧上
         #   tap icon_above「设置」，点击那一刻手机其实已经翻到第 1 页（前帧过期），
         #   同一位置是 Gemini —— 打开了 Gemini，孪生按标签记成「设置」。前帧里没有任何结构
         #   信号能发现这件事：画面确实变了，点的也确实是 icon_above。只有**核对打开后的身份**
@@ -529,6 +571,13 @@ class Executor:
             el = before.element(action.args.get("id")) if "id" in action.args else None
             if el is not None and el.text.strip():
                 res.extra["identity"] = self._identity(el.text, new)
+                ident = res.extra["identity"]
+                # ⚠ 2026-09-18（spec「不知道」不放行）：身份核对是对「落在哪」最硬的一条证据：
+                #   核出别的 App = 没成；核对了 = 成了（哪怕没写 expect）。没问成就别覆盖上面的结论。
+                if ident.get("verified") is False:
+                    self._conclude(res, Verdict("not_met", "identity", seen=str(ident.get("seen") or "")))
+                elif ident.get("verified") is True:
+                    self._conclude(res, Verdict("met", "identity", seen=str(ident.get("seen") or "")))
         # ---- 不光说「变了」，还要说**变成了什么** ----
         # changed=True 只是一个布尔。模型得自己从几十个元素里认出哪一格变了 ——
         # 2026-09-09 真机（记一笔账）：点了数字 1，金额从 '0.00' 变成 '1'，
@@ -550,12 +599,123 @@ class Executor:
         res.extra.update({k: v for k, v in extra.items() if not k.startswith("_")})
         return res, new
 
+    def _conclude_changed(self, action: Action, before: Observation, new: Observation, t, res: ToolResult,
+                          judged: dict | None = None) -> None:
+        """画面变了（或看图说生效了）之后：变了 ≠ 做对了。按模型写的预期核对，三种结论都经 _conclude 写。
+
+        ⚠ 2026-09-18（spec「不知道」不放行）：这一段原来摊在 _after 的两条 elif 里，
+          「变了但没写 expect」那一条只写 expect_check、不产生任何结论，于是按 ok 放行。
+
+        `judged` 非 None = 调用方已经问过「生效了吗」（低于指纹分辨率的变化），这里不许覆盖它。
+
+        原来那两段的注释原样保留在下面：
+        ---- 像素判据说「变了」：变了 ≠ 做对了 ----
+        「只在否定侧问」那条规矩管的是**动作生效没**；这里问的是另一件事：
+        **生效了，但去的是不是对的地方**。误点进一个错页面正是「变了」——
+        以前一律当成功，guard 还把它记成进展（guard.py record_outcome 的注释）。
+        ⚠ 2026-09-11：tap 的 expect 改成必填（tools.py）。先看「」里的字有没有新出现 ——
+          肯定信号，直接确认、不花钱看图；对不上才问判官。改之前留档里只有 9.7% 的点击带 expect，
+          这条复核只触发过 1 次。
+        on_change=True 让 guard.record_result 分得清这次 judged 是哪一路来的（那边的注释）。
+        """
+        tap = action.name == "tap"
+        if not action.expect:
+            # tap 的 expect 是必填（tools.py），缺了 = 没法核；其它动作的预期本来就可选，变了就按变了算。
+            v = Verdict("unknown", "missing") if tap else Verdict("met", "pixels")
+            self._conclude(res, v, judged=judged, expect_check={"met": None, "by": "missing"} if tap else None)
+            return
+        matched = expect_met_by_text(action.expect, t.added) if tap else None
+        if matched is not None:
+            self._conclude(res, Verdict("met", "text", seen=matched), judged=judged,
+                           expect_check={"met": True, "by": "text", "matched": matched})
+            return
+        if not tap and judged is not None:
+            # ⚠ 2026-09-18（评审发现 1）：非 tap 动作这里问的就是 did_action_work，和「画面没变」那一侧
+            #   逐参数相同的一问。调用方（低于指纹分辨率那条路）已经问过了，再问一遍是**同一个问题问两遍**：
+            #   成本翻倍，两次答案还可能不一致 —— judged 留第一问、verdict 取第二问，同一个结果里两个字段打架。
+            #   tap 不走这条：它第二问的是另一件事（met_expectation，「是不是预期的样子」）。
+            self._conclude(res, Verdict("met", "vision"), judged=judged)
+            return
+        # ⚠ 2026-09-11 终审：tap 在这里问「画面是不是预期的样子」（judge.met_expectation），
+        #   不问「这个动作生效了吗」（did_action_work，给「画面没变」那一侧写的）—— 画面已经变了，
+        #   按字面答「点中了、页面动了 = 生效」会放过错页面。非 tap 动作行为不变。
+        #   judged 的键名保持 worked / on_change：guard 的 off_track、孪生的记账都读它，改名会静默坏掉。
+        ask = judge.met_expectation if tap else judge.did_action_work
+        eff = ask(before.image, new.image, action.describe(), action.expect, self.asker)
+        if eff is None:
+            if not tap:
+                # ⚠ 2026-09-18（评审发现 2）：非 tap 动作没问成时结论是 met/pixels，不是 unknown。
+                #   两个理由：像素给出的是**肯定**结论，按 CLAUDE.md §2 可以直接用（要复核的是否定结论）；
+                #   而且这里一个旧字段都没写，写 unknown 会和 of() 从旧字段推出来的 met/pixels 打架（计划 R1）。
+                #   非 tap 的「成了」= 动作生效了，和它不带 expect 时是同一个口径。
+                self._conclude(res, Verdict("met", "pixels"))
+                return
+            self._conclude(res, Verdict("unknown", "unverified", why="看图核对没问成"), judged=judged,
+                           expect_check=_vision_check(None))
+            return
+        if judged is None:
+            judged = {"worked": eff.worked, "confidence": eff.confidence, "why": eff.why, "on_change": True}
+        if not eff.worked:
+            res.hint = f"画面变了，但看图复核说没达到预期：{eff.why}。先确认自己在哪。"
+        self._conclude(res, Verdict("met" if eff.worked else "not_met", "vision",
+                                    why="" if eff.worked else eff.why),
+                       judged=judged, expect_check=_vision_check(eff) if tap else None)
+
+    def _conclude_type(self, res: ToolResult, before: Observation, new: Observation, target: str,
+                       verified: str, typed_via: str | None, *,
+                       channel: str = "keyboard", what: str | None = None) -> None:
+        """打字的结论。文字判据的肯定 / 否定照用；它答不出（unknown）、或驱动自己说不可靠（shifted）时读回。
+
+        ⚠ 2026-09-18（一次真机运行的第 16 步）：打「18」只上屏「8」，_verify_type 因为屏上本来就有
+          「Q ios18」答了 unknown，照样报 ok；模型 type / erase 来回五轮才发现。
+        ⚠ verified 的三个旧值含义不变，"false" 仍然 = 一个字都没落、键盘通道可能死了（_channel_failure 靠它爬梯）。
+          读回发现「落了但落错了」是 "wrong"：那是模型该知道的事，不是设备故障，**不进阶梯**。
+
+        `channel` = 这次字是怎么送上屏的："keyboard" 键盘直打，"tap" 点了输入法候选。
+        ⚠ 2026-09-18（Task 4 评审）：点候选走的是 **tap 通道，不是键盘**。`_channel_failure` 只认
+          `verified == "false"`，tap 通道下写 "false" 会去爬键盘恢复阶梯（release_all / 重连 / 重启镜像），
+          而键盘根本没毛病 —— 所以 tap 通道下「没落」一律写 "wrong"，hint 和 why 也一并换成说点击。
+          恢复阶梯的触发条件本身一个字没动。
+        `what` = hint 里怎么称呼这次要打的东西（候选带编号，如 "1设置"）。不给就用 target。
+        """
+        hint_tpl, why_not_landed = _NOT_LANDED[channel]
+        not_landed = "false" if channel == "keyboard" else "wrong"
+        if typed_via:
+            res.extra["typed_via"] = typed_via
+        if verified == "true" and typed_via != "shifted":
+            return self._conclude(res, Verdict("met", "text"), verified="true")
+        if verified == "false":
+            res.hint = hint_tpl.format(what=what or target)
+            return self._conclude(res, Verdict("not_met", "text", why=why_not_landed), verified=not_landed)
+        r = judge.typed_landed(before.image, new.image, target, self.asker)
+        if r is None or r.landed is None:
+            # 读回也没结论：文字判据原来说 true 的（shifted 那条路）保持 true，别因为多问了一次反而降级。
+            if verified == "true":
+                return self._conclude(res, Verdict("met", "text"), verified="true")
+            return self._conclude(res, Verdict("unknown", "unverified", why="打进去没有，没核成"),
+                                  verified="unknown")
+        if r.landed:
+            return self._conclude(res, Verdict("met", "readback", seen=r.seen), verified="true")
+        if r.field_changed is False:
+            res.hint = hint_tpl.format(what=what or target)
+            return self._conclude(res, Verdict("not_met", "readback", why=why_not_landed, seen=r.seen),
+                                  verified=not_landed)
+        return self._conclude(res, Verdict("not_met", "readback", seen=r.seen), verified="wrong")
 
     # ---- 中文输入：驱动 iOS 自己的输入法 ----
     # 候选编号只有一位（1-9）。原来写 \d+ 会把 '10000' 整串当编号吃掉，
     # 剥完剩空串，于是分不出「编号 1 的候选」和「一个叫 10000 的东西」。
     _CAND_PREFIX = re.compile(r"^\s*([1-9])\s*")
     _CJK = re.compile(r"[\u4e00-\u9fff]")
+
+    def _cand_text(self, s: str) -> str:
+        """\u5019\u9009\u5143\u7d20\u7684\u6587\u5b57\u5265\u6389\u7f16\u53f7\uff08"1\u8bbe\u7f6e" \u2192 "\u8bbe\u7f6e"\uff09\u3002
+
+        \u26a0 2026-09-18\uff08\u6700\u7ec8\u8bc4\u5ba1 M7\uff09\uff1a\u6311 hit \u7684\u4e24\u5904\u548c _commit_candidate \u6838\u5bf9\u4e0a\u5c4f\u7684\u90a3\u4e00\u5904
+          \u539f\u6765\u5404\u628a\u300c\u5265\u7f16\u53f7 + strip\u300d\u6284\u4e86\u4e00\u904d \u2014\u2014 \u540c\u4e00\u6761\u89c4\u77e9\u4e09\u4e2a\u5165\u53e3\uff0c\u8fdf\u65e9\u53ea\u6539\u4e00\u4e2a\uff08CLAUDE.md \u00a77\uff09\u3002
+          **strip \u4e0d\u80fd\u7701**\uff1a\u7559\u4e00\u4e2a\u5c3e\u7a7a\u683c\uff0c`target in t` \u6bcf\u4e00\u6761\u90fd\u4f1a\u843d\u7a7a\u3002
+        """
+        return self._CAND_PREFIX.sub("", s).strip()
 
     def _candidates(self, obs: Observation, near_text: str | None = None) -> list:
         """输入法候选栏。靠**几何**认，不靠「以数字开头」。
@@ -625,7 +785,7 @@ class Executor:
                 continue
             if any(b <= a for a, b in pairwise(nums)):   # 编号必须递增
                 continue
-            if not any(self._CJK.search(self._CAND_PREFIX.sub("", e.text)) for _, e in numbered):
+            if not any(self._CJK.search(self._cand_text(e.text)) for _, e in numbered):
                 continue
             ok.append((band[0].center[1], [e for _, e in numbered]))
         if not ok:
@@ -674,8 +834,7 @@ class Executor:
         after_typing = self.per.observe(frame)
 
         cands = self._candidates(after_typing, pinyin)
-        hit = next((e for e in cands
-                    if self._CAND_PREFIX.sub("", e.text).strip() == text), None)
+        hit = next((e for e in cands if self._cand_text(e.text) == text), None)
         shown = [e.text for e in cands]
         if not cands and pinyin.lower() not in "".join(
                 e.text for e in after_typing.elements).lower():
@@ -726,8 +885,7 @@ class Executor:
             frame, settled = settle(self.dev, frame, IOS_TIMING["type"], ahash)
             after_typing = self.per.observe(frame)
             cands = self._candidates(after_typing, pinyin)
-            hit = next((e for e in cands
-                        if self._CAND_PREFIX.sub("", e.text).strip() == text), None)
+            hit = next((e for e in cands if self._cand_text(e.text) == text), None)
             shown = [e.text for e in cands]
         self._ime_chinese = bool(cands)
         if not cands:
@@ -780,23 +938,21 @@ class Executor:
         frame, settled = settle(self.dev, frame, IOS_TIMING["tap"], ahash)
         new = self.per.observe(frame)
         ch = did_change(obs, new)
-        changed = ch.changed
-        extra = {"pinyin": pinyin, "picked": picked, "candidates": shown}
-        if not changed:
-            # ⚠ 这条路**不走 _after**，所以那边的看图复核管不到它 —— 得在这儿自己问一次。
-            #   而中文输入恰恰是最容易被像素判据看漏的：2026-09-09 真机实测，
-            #   'nihao' 变成 '你好' 只贡献 hamming=1、text_diff=6，两个都低于阈值（2 / 8）。
-            #   那一跑里模型因此以为没输入成功，去点了撤销、又重打一遍，白花两步。
-            eff = judge.did_action_work(obs.image, new.image,
-                                        f"用输入法选中候选 {picked!r}，让 {picked!r} 上屏",
-                                        f"{picked} 出现在输入框里", self.asker)
-            if eff is not None:
-                extra["judged"] = {"worked": eff.worked, "confidence": eff.confidence,
-                                   "why": eff.why}
-                changed = eff.worked
-        return {"_done": ToolResult(
-            ok=True, changed=changed, hamming=ch.hamming, text_diff=ch.text_diff,
-            settled=settled, extra=extra), "_obs": new}
+        res = ToolResult(ok=True, changed=ch.changed, hamming=ch.hamming, text_diff=ch.text_diff,
+                         settled=settled, extra={"pinyin": pinyin, "picked": picked, "candidates": shown})
+        # ⚠ 2026-09-18（spec B4）：原来「画面变了就算成」—— 候选栏消失画面当然会变，这个肯定结论什么都证明不了；
+        #   只有「没变」才问一次看图。现在和 ASCII 打字走同一条核对（CLAUDE.md §7），只是文字判据换成
+        #   _verify_commit（基线是 ref，带候选栏的那一帧 —— 理由见它的注释）、通道标成 tap。
+        #   'nihao' → '你好' 的像素差低于阈值（2026-09-09 实测 hamming=1、text_diff=6，阈值 2 / 8）：
+        #   那一跑里模型因此以为没输入成功，去点了撤销、又重打一遍，白花两步。核出落了，就按落了报 changed。
+        # picked 带编号（"1设置"），核对的是上屏的那个词。剥编号这一步和 _type_via_ime 挑 hit 时
+        # 共用 _cand_text，只此一份（CLAUDE.md §7）。
+        target = self._cand_text(picked)
+        self._conclude_type(res, ref, new, target, self._verify_commit(new, ref, target), None,
+                            channel="tap", what=picked)
+        if res.extra["verdict"]["state"] == "met":
+            res.changed = True
+        return {"_done": res, "_obs": new}
 
     def _candidate_missing(self, text: str, pinyin: str, shown: list[str],
                            obs: Observation, frame) -> dict:
@@ -856,6 +1012,21 @@ class Executor:
             return "false"
         return "unknown"
 
+    @staticmethod
+    def _verify_commit(new: Observation, ref: Observation, target: str) -> str:
+        """点完候选，字上屏了没。只认**点候选之前那一帧（带候选栏）里没有、点完才出现**的文字。
+
+        ⚠ 2026-09-18（Task 4 评审实测）：不能拿打拼音之前那一帧当基线 —— 我们只点「剥掉编号正好等于目标」
+          的候选，候选栏自己就带着目标词（"设置" in "1设置"）。点击没生效、候选栏还在时，它算「新出现的文字」，
+          文字判据恒答 true，读回一次都不问：点了候选什么都没发生，却报 met。
+          也不复用 _verify_type：它的「上次 tap 附近那一带」在候选栏贴着光标时（App 正文里）同样被候选栏污染。
+        一字不差 = 点击没生效；有新文字但不含目标 = 答不出，交给读回（一个判据只在自己的分辨率内下结论）。
+        """
+        appeared = new.text_set - ref.text_set
+        if any(target in t for t in appeared):
+            return "true"
+        return "false" if new.text_set == ref.text_set else "unknown"
+
     # ---- 高阶滚动：内部循环滚动+观察，对外只是一个动作 ----
     def _scroll_scan(self, action: Action, obs: Observation):
         """scroll_until / collect 共用的「滚一屏 → 等稳 → 观察」循环。
@@ -888,7 +1059,7 @@ class Executor:
         reached_end = False
         still = 0               # 连续几屏没变化 —— 见下面为什么不能只看一次
         # ⚠ 「一次都没动过」和「滚到底了」是两回事，必须分开报。
-        #   2026-09-08 真机（runs/20260908-022551-5204）：在通用页 scroll_until
+        #   2026-09-08 真机（一次真机运行）：在通用页 scroll_until
         #   找「关于本机」，滚了两次画面纹丝不动，工具报「滚不动了（到底/到顶）」。
         #   模型于是相信关于本机不在通用里，改去设置首页找，把「更新到 iOS 26.6.1」
         #   这条**可更新版本**当成当前版本报了 done(success) —— 真值是 18.3.1。
@@ -967,6 +1138,14 @@ class Executor:
                 hint = f"到达 {config.SCROLL_MAX_SCREENS} 屏上限，**还没到底**，下面可能还有。"
         res = ToolResult(ok=True, changed=ch.changed, hamming=ch.hamming, text_diff=ch.text_diff,
                          settled=settled, hint=hint, extra=extra)
+        # ⚠ 2026-09-18（spec B7）：「一次都没滚动起来」不能报成「到底了没找到」——
+        #   一次真机运行 就是滚不动被当成到底，模型据此把可更新版本当成当前版本报了 success。
+        if never_moved:
+            self._conclude(res, Verdict("unknown", "never_moved", why="一次都没滚动起来，不能说到底了"))
+        elif n == "scroll_until" and hit is None:
+            self._conclude(res, Verdict("not_met", "text", why=hint or ""))
+        else:
+            self._conclude(res, Verdict("met", "text"))
         # 一屏没滚时不重推同一个观察 —— 消息流里出现重复观察块会让模型以为画面翻了一页。
         return res, (cur if cur is not obs else None)
 
@@ -1070,18 +1249,31 @@ class Executor:
         #   下一次直达就用得上 —— 这台手机的「了解」随使用增长，而不是永远只有第 1 页。
         wrong: list[dict] = []
         direct = self._open_app_from_layout(name, obs, wrong)
+        # ⚠ 2026-09-18（spec「不知道」不放行）：直达开成了原来在这里就 return 了，三条路的出口有两个。
+        #   收成一个 —— 结论（下面那一段）才有唯一的落点，一个规则一个入口（CLAUDE.md §7）。
+        #   layout_miss / wrong_app 仍只在「直达没成」那一侧写，与原来逐字节相同。
         if isinstance(direct, tuple):
-            return direct
-        home = self._open_app_from_home(name, obs, wrong)
-        if isinstance(home, tuple):
-            res, new = home
+            res, new = direct
         else:
-            res, new = self._open_app_via_spotlight(name, obs, wrong, home)
-            res.extra["home_miss"] = home["why"]
-        if direct is not None:
-            res.extra["layout_miss"] = direct
-        if wrong:
-            res.extra["wrong_app"] = wrong
+            home = self._open_app_from_home(name, obs, wrong)
+            if isinstance(home, tuple):
+                res, new = home
+            else:
+                res, new = self._open_app_via_spotlight(name, obs, wrong, home)
+                res.extra["home_miss"] = home["why"]
+            if direct is not None:
+                res.extra["layout_miss"] = direct
+            if wrong:
+                res.extra["wrong_app"] = wrong
+        # 三条路报 ok 之前都过了 _identity，结论就从它来：核对了 = 开成了，核出别的 App = 没成，
+        # 没问成 = 不知道（照旧报 ok，但不许当成开成了）。ok=False 的那一路不下结论（verdict.of 记 n/a）。
+        if res.ok:
+            ident = res.extra.get("identity") or {}
+            if isinstance(ident.get("verified"), bool):
+                self._conclude(res, Verdict("met" if ident["verified"] else "not_met", "identity",
+                                            seen=str(ident.get("seen") or "")))
+            else:
+                self._conclude(res, Verdict("unknown", "unverified", why="打开之后没核成是哪个 App"))
         return res, new
 
     def _open_app_via_spotlight(self, name: str, obs: Observation, wrong: list | None = None,
@@ -1112,7 +1304,7 @@ class Executor:
         #   而空搜索框里它不在（对照过，基线是干净的）。
         #
         #   为什么不走输入法：「记账本」这种 App 名根本不在输入法词库里，
-        #   打 jizhangben 给出的候选是同音的普通词组，永远选不中 App 名。
+        #   打 jizhangben 给出的候选是「以募集章」「一目几张」，永远选不中。
         #   而 dev.type() 拿到中文会走粘贴通道，粘贴在本环境实测不通（docs/15）。
         #   所以以前 open_app 对中文 App 名是**坏的** —— 之前能打开纯属侥幸：
         #   模型手搓的流程里输入法失败了，反而把拼音字母留在了框里。
@@ -1157,7 +1349,7 @@ class Executor:
                 return self._spotlight_gave_up(name, typed, query, home, new)
         # ⚠ 离开了 Spotlight ≠ 进了目标 App。2026-09-10 真机：打字没落屏，搜索框里留着旧词
         #   beiwanglu，结果列表底部的分组标题「设置」被精确匹配中；点它没反应 → 点它上方 →
-        #   进了一条备忘录 → 报 ok via=icon_above（runs/20260910-193640-bfd7）。
+        #   进了一条备忘录 → 报 ok via=icon_above（一次真机运行）。
         #   身份交给看图的一方；说不是就当没开成，走不打字的那条退路。
         #   （2026-09-14 起那条退路排在前面、已经走过了，这里直接报 app_not_found，见上面 row is None 那条 ⚠。）
         ident = self._identity(name, new)
@@ -1386,13 +1578,17 @@ class Executor:
         return min(loose, key=lambda e: e.center[1]) if loose else None
 
     def _skill_text(self, kind: str, name: str) -> str | None:
-        """只读当前索引里可见的条目：draft App、proposed 场景、损坏文件都读不到（spec §4.5）。"""
+        """只读当前索引里可见的条目：没内容的空壳 App、proposed 场景、损坏文件都读不到（spec §4.5）。
+        App 那一支问 M.app_visible——2026-09-17 起跟 status 是否 verified 无关，
+        判据要和 Catalog.visible_apps / index_text 一致，不然会出现「索引里看得见，
+        use_skill 读不到」这种自相矛盾。"""
+        from iphone_agent.skills import model as M
         from iphone_agent.skills.store import INDEX_TRUST
         if self.catalog is None:
             return None
         if kind == "app":
             a = self.catalog.app(name)
-            if a is None or a.status != "verified":
+            if a is None or not M.app_visible(a):
                 return None
             return f"【App】{a.display}\n{a.body.strip()}\n{INDEX_TRUST}"
         s = self.catalog.scenarios.get(name)

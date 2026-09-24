@@ -695,30 +695,48 @@ def test_dry_run_confirm_never_sends():
 
 # =========================== 分层与自陈可信度 ==============================
 
-def test_real_system_prompt_hits_the_exact_constant_layer():
-    """真实前缀里最大的一块必须走第 1 层：它是确定性的，不该被估。"""
+def _real_prefix_budget():
+    """真实前缀（system + 工具表）的一次记账，下面两条用例共用。"""
     from iphone_agent.harness.prompt import system_prompt
     from iphone_agent.harness.tools import tool_defs
 
-    text = system_prompt(allow_coord_tap=True, has_skills=True)
+    text = system_prompt(allow_coord_tap=True, has_knowledge=True, has_proc_tools=True)
     log = MessageLog()
     log.system(text)
     log.freeze()
-    b = budget.account(log.raw(), tool_defs(True), None,
-                       context_mode="state", call_index=0, model_id="m")
+    return budget.account(log.raw(), tool_defs(True), None,
+                          context_mode="state", call_index=0, model_id="m")
+
+
+def test_real_system_prompt_hits_the_exact_constant_layer():
+    """真实前缀里最大的一块必须走第 1 层：它是确定性的，不该被估。
+
+    ⚠ 2026-09-18（Task 6 评审发现 1）：工具表那半边搬到了下面那条独立用例 ——
+      这条整体 xfail(strict) 之后，写在它后面的 tools_schema 断言永远跑不到。
+    """
+    b = _real_prefix_budget()
     sysdeg = b["segments"]["system"]
     assert sysdeg["layer"] == tokens.LAYER_EXACT
-    assert sysdeg["est"] == 3051          # 2026-09-1x 按需看图：提示词版本 23（感知一节改为「默认只有 OCR」）
-                                           # 后重标：5446 字。出处 docs/superpowers/acceptance/2026-09-15-token标定/
-                                           # probe-segments-20260915-115841.json（上一版 2873）
-    tsc = b["segments"]["tools_schema"]
+    assert sysdeg["est"] == 3130          # 2026-09-20 提示词版本 25（结果前面那句话是系统核对的结论）
+                                           # 后重标：剧本工具开这版 5579 字。出处
+                                           # docs/superpowers/acceptance/2026-09-20-token标定/
+                                           # probe-segments-20260920-154027.json（上一版 3087）
+    # ⚠ system + 工具表合起来是冻结前缀的大头。分层的全部收益就在这一行里。
+    assert b["est_by_layer"][tokens.LAYER_EXACT] == 3130 + 6308
+
+
+def test_real_tools_schema_hits_the_exact_constant_layer():
+    """工具表那一段也必须走第 1 层。
+
+    ⚠ 2026-09-18（Task 6 评审发现 1）：从上面那条里拆出来，**绝不能跟着 system 一起 xfail** ——
+      连同 test_tokens.py 那条，全仓就这两处钉住「tools.py 没被误改」。
+    """
+    tsc = _real_prefix_budget()["segments"]["tools_schema"]
     assert tsc["layer"] == tokens.LAYER_EXACT
     assert tsc["est"] == 6308             # 2026-09-1x 按需看图：observe 描述改为看全屏后重标：
                                            # 18 个工具，走 tools= 参数；出处
                                            # docs/superpowers/acceptance/2026-09-15-token标定/
                                            # probe-segments-20260915-115841.json（上一版 6265）
-    # ⚠ 这两段合起来是冻结前缀的大头。分层的全部收益就在这一行里。
-    assert b["est_by_layer"][tokens.LAYER_EXACT] == 3051 + 6308
 
 
 def test_changed_prompt_falls_back_to_the_ratio_layer_not_the_stale_constant():
@@ -728,7 +746,7 @@ def test_changed_prompt_falls_back_to_the_ratio_layer_not_the_stale_constant():
     from iphone_agent.harness.prompt import system_prompt
 
     log = MessageLog()
-    log.system(system_prompt(allow_coord_tap=True, has_skills=True) + "X")
+    log.system(system_prompt(allow_coord_tap=True, has_knowledge=True, has_proc_tools=True) + "X")
     log.freeze()
     b = budget.account(log.raw(), None, None,
                        context_mode="state", call_index=0, model_id="m")
