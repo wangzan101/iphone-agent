@@ -67,5 +67,11 @@ class LiveTwin:
         owner, rec = self._seen
         return render.route(self.state, owner, rec, task)
 
+    def visited(self, task: str) -> str | None:
+        if self._seen is None:
+            return None
+        owner, rec = self._seen
+        return render.visited(self.state, owner, rec, task, self.state.display(owner))
+
     def summary(self) -> dict:
         return self.state.stats.to_dict()

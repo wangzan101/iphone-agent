@@ -23,9 +23,9 @@ def test_pairs_count_wrong_merges_and_splits(tmp_path):
 
 def test_owner_truth(tmp_path):
     s = sim(tmp_path)
-    r = run_bench(s, [], [{"event": "r1:2", "app": "she-zhi"}, {"event": "r1:1", "app": "system"},
-                          {"event": "r1:3", "app": "bei-wang-lu"}])
-    assert r.wrong_owner == [("r1:3", "she-zhi", "bei-wang-lu")] and not r.passed
+    r = run_bench(s, [], [{"event": "r1:2", "app": "settings"}, {"event": "r1:1", "app": "system"},
+                          {"event": "r1:3", "app": "notes"}])
+    assert r.wrong_owner == [("r1:3", "settings", "notes")] and not r.passed
 
 
 def test_unknown_owner_is_allowed_but_unresolved_events_still_fail_the_gate(tmp_path):
@@ -46,14 +46,14 @@ def test_zero_concrete_owner_coverage_is_not_passed(tmp_path):
 def test_zero_resolved_different_pairs_is_not_passed(tmp_path):
     """没有任何一对「different」标注双方都落到了具体屏 —— 闸门 A 也没被真正核验过。"""
     s = sim(tmp_path)
-    r = run_bench(s, [], [{"event": "r1:2", "app": "she-zhi"}])
+    r = run_bench(s, [], [{"event": "r1:2", "app": "settings"}])
     assert r.wrong_owner == [] and r.concrete_owner == 1 and r.resolved_different == 0 and not r.passed
 
 
 def test_bench_passes_with_nonzero_concrete_coverage(tmp_path):
     s = sim(tmp_path)
     pairs = [{"a": "r1:2", "b": "r1:3", "label": "different"}]
-    owners = [{"event": "r1:2", "app": "she-zhi"}, {"event": "r1:3", "app": "she-zhi"}]
+    owners = [{"event": "r1:2", "app": "settings"}, {"event": "r1:3", "app": "settings"}]
     r = run_bench(s, pairs, owners)
     assert r.passed and r.concrete_owner == 2 and r.resolved_different == 1
 
@@ -62,7 +62,7 @@ def test_report_lists_apps_and_state_counts(tmp_path):
     write_run(tmp_path, "r1", settings_run())
     text = report_text(Workspace(tmp_path))
     assert "认屏：认出" in text and "归属：核身份进入" in text
-    assert "设置（she-zhi）：3 屏" in text and "关于本机" in text
+    assert "设置（settings）：3 屏" in text and "关于本机" in text
 
 
 def test_cli_bench_resolves_evalset_relative_to_cwd(tmp_path, monkeypatch, capsys):

@@ -2,7 +2,7 @@
 import json
 
 from iphone_agent.memory.screenmap import app_id_for
-from iphone_agent.twin.record import RecordStats, TwinState, record_run, replay_run, simulate
+from iphone_agent.twin.record import RecordStats, TwinState, rebuild, record_run, replay_run, simulate
 from iphone_agent.workspace import Workspace
 from tests.twin_fixtures import (
     SET,
@@ -14,6 +14,7 @@ from tests.twin_fixtures import (
     settings_run,
     sid_of,
     step,
+    tree_bytes,
     write_run,
 )
 
@@ -22,7 +23,7 @@ def mem():
     return TwinState(None, stats=RecordStats())
 
 
-def by_name(state, app="she-zhi"):
+def by_name(state, app="settings"):
     return {s.name: s for s in state.screens_of(app)}
 
 
@@ -48,7 +49,7 @@ def test_second_run_confirms_screens_and_counts_edges_twice(tmp_path):
     replay_run(st, write_run(tmp_path, "r1", settings_run()))
     replay_run(st, write_run(tmp_path, "r2", settings_run(t0=100, first="r1")))
     s = by_name(st)
-    assert len(st.screens_of("she-zhi")) == 3
+    assert len(st.screens_of("settings")) == 3
     assert s["通用"].visits == 2 and s["通用"].status == "confirmed"
     assert next(iter(s["设置"].transitions.values())).count == 2
 
@@ -57,9 +58,9 @@ def test_same_run_twice_changes_nothing(tmp_path):
     st = mem()
     d = write_run(tmp_path, "r1", settings_run())
     replay_run(st, d)
-    before = {x.id: x.to_json() for x in st.screens_of("she-zhi")}
+    before = {x.id: x.to_json() for x in st.screens_of("settings")}
     replay_run(st, d)
-    assert {x.id: x.to_json() for x in st.screens_of("she-zhi")} == before
+    assert {x.id: x.to_json() for x in st.screens_of("settings")} == before
     assert st.stats.skipped_applied > 0
 
 
@@ -68,7 +69,7 @@ def test_unverified_open_app_records_nothing(tmp_path):
     recs[0]["result"] = {"ok": True, "changed": True}              # 7322f80 之前的留档没有 identity
     st = mem()
     replay_run(st, write_run(tmp_path, "r1", recs))
-    assert st.screens_of("she-zhi") == [] and st.stats.skipped == 4
+    assert st.screens_of("settings") == [] and st.stats.skipped == 4
 
 
 def _one_screen_run(action, args=None, result=None, after_obs=None):
@@ -130,7 +131,7 @@ def test_tap_on_vision_element_or_unknown_id_records_no_edge(tmp_path):
             step(4, screen_obs("f4.png", "搜索", "通用"), "done")]
     st = mem()
     replay_run(st, write_run(tmp_path, "r1", recs))
-    assert all(not s.transitions for s in st.screens_of("she-zhi"))
+    assert all(not s.transitions for s in st.screens_of("settings"))
 
 
 def test_observation_after_zoom_is_not_recognized_as_a_screen(tmp_path):
@@ -141,7 +142,7 @@ def test_observation_after_zoom_is_not_recognized_as_a_screen(tmp_path):
             step(3, zoomed, "done", {"status": "success"})]
     st = mem()
     replay_run(st, write_run(tmp_path, "r1", recs))
-    assert [s.name for s in st.screens_of("she-zhi")] == ["关于本机"]
+    assert [s.name for s in st.screens_of("settings")] == ["关于本机"]
 
 
 def test_new_screen_found_as_after_is_created_once_and_first_visit_keeps_it_provisional(tmp_path):
@@ -170,7 +171,7 @@ def test_simulate_maps_every_event_to_owner_state_and_screen(tmp_path):
     assert sim.by_event["r1:1"] == ("system", "skipped", None)
     owner, state, sid = sim.by_event["r1:4"]
     # 第一次来的屏，模型 same_as=null → 认屏态是 new（旧几何规则按标题认成 matched）；落到的还是那一屏
-    assert owner == "she-zhi" and state == "new" and sim.state.get("she-zhi", sid).name == "关于本机"
+    assert owner == "settings" and state == "new" and sim.state.get("settings", sid).name == "关于本机"
     assert sid == sid_of(SET, "r1", "f4.png")
 
 
@@ -185,7 +186,7 @@ def test_finished_run_with_invalid_utf8_steps_does_not_raise(tmp_path):
     with (d / "steps.jsonl").open("ab") as f:
         f.write(b"\xff\xfe not valid utf-8\n")
     sim = simulate(Workspace(tmp_path))
-    assert sim.by_event == {} and sim.state.screens_of("she-zhi") == []
+    assert sim.by_event == {} and sim.state.screens_of("settings") == []
 
 
 def names(st, app=SET):
@@ -312,14 +313,14 @@ def test_unsure_label_after_a_verified_entry_builds_no_screen(tmp_path):
 
 def test_a_known_app_name_cannot_become_another_apps_alias():
     st = TwinState(None, stats=RecordStats(), known_apps=frozenset({SET}))
-    st.learn_alias("设置", "bei-wang-lu")
+    st.learn_alias("设置", "notes")
     assert st.stats.app_aliases_added == 0 and st.stats.app_alias_conflict == 1
     assert st.resolve_app("设置") == SET and st.stats.app_alias_conflict == 1
 
 
 def test_known_app_slug_aliased_elsewhere_resolves_to_unknown():
     st = mem()
-    st.learn_alias("设置", "bei-wang-lu")                     # 学的时候设置还不认识
+    st.learn_alias("设置", "notes")                     # 学的时候设置还不认识
     st.create(SET, "r:f.png", "设置", 0.0)                    # 之后设置自己成了已知 App
     assert st.resolve_app("设置") == "unknown" and st.stats.app_alias_conflict == 1
 
@@ -442,3 +443,46 @@ def test_replay_does_not_count_the_last_after_frame_twice_when_apply_already_rec
     live, replay = _live_stats(recs), _replay_stats(tmp_path, recs)
     assert replay["labeled"] == 3 and replay["new"] >= 1
     assert {k: v for k, v in replay.items() if k != "runs"} == {k: v for k, v in live.items() if k != "runs"}
+
+
+def test_visit_counts_the_level_like_anchors():
+    """spec 打开App落点 §3.3：level 像 anchors 一样按屏计票，「不确定」（None）不计。"""
+    from iphone_agent.twin.identify import Recognition
+    st = mem()
+    s = st.visit("r:f1.png", 0.0, "settings", Recognition("new", None, "关于本机", (), None, "inner"))
+    st.visit("r:f2.png", 1.0, "settings", Recognition("matched", s.id, s.name, (), None, "inner"))
+    st.visit("r:f3.png", 2.0, "settings", Recognition("matched", s.id, s.name, (), None, None))
+    assert s.levels == {"inner": 2} and s.level == "inner"
+
+
+def test_incremental_record_matches_full_rebuild_when_screens_carry_a_level(tmp_path):
+    """⚠ 2026-09-22（终审 M-7）：level 是这期新加的账目，此前没有用例覆盖它在「一个 run 落地就写盘」
+    （record_run，真实主循环走的那条路）和「从头整体重放」（rebuild，spec §4.5 的兜底路）两条链路下
+    是不是同一份字节。这条链路绕：新屏由 tap 的 after 帧建出时，apply() 里当场那次 Recognition
+    被换成不带 level 的版本（record.py 那条 2026-09-22 注释说的「留空」），但存进 `_after_memo`
+    供下一个事件复用的是**换之前**那份、level 还在——下一步真正落地时才计一票；此后再用 same_as
+    命中同一块屏又计一票。分支绕得开，得有字节比对 + 真实计数兜底，不能只读代码断定两条链路一致。
+
+    这个 run 里「通用」屏先由 tap 的 after 帧新建，随后在「通用」上再点一下（after 帧用 same_as
+    指回同一块屏），一共两次落地：验证 record_run 与 rebuild 对它们的处理逐字节相同、且都不是空账。"""
+    ws = Workspace(tmp_path)
+    f1 = home_obs("f1.png")
+    f2 = screen_obs("f2.png", "设置", None, ("通用", "隐私", "电池"), level="top")
+    f3 = screen_obs("f3.png", "通用", "设置", ("关于本机", "软件更新", "存储"), level="inner")
+    # 再次经过「通用」：same_as 指回 f3.png 建出的那块屏，classify() 判「matched」，level 照旧带着。
+    f4 = screen_obs("f4.png", "通用", "设置", ("关于本机", "软件更新", "存储"), level="inner",
+                     same_as=1, candidates=(cand(1, SET, sid_of(SET, "r1", "f3.png"), "通用", "设置"),))
+    recs = [step(1, f1, "open_app", {"name": "设置"}, VERIFIED, after="f2.png", after_observation=f2),
+            step(2, f2, "tap", {"id": id_of(f2, "通用")}, after="f3.png", after_observation=f3),
+            step(3, f3, "tap", {"id": id_of(f3, "软件更新")}, after="f4.png", after_observation=f4),
+            step(4, f4, "done", {"status": "success"})]
+    d = write_run(tmp_path, "r1", recs)
+    record_run(ws, d)
+    incremental = tree_bytes(ws.twin_apps)
+    rebuild(ws)
+    rebuilt = tree_bytes(ws.twin_apps)
+    assert rebuilt == incremental, "record_run（增量）与 rebuild（全量重放）必须落到同一份字节"
+    screens = {json.loads(v)["identity"]["name"]: json.loads(v)["identity"]
+               for k, v in rebuilt.items() if k.startswith("settings/screens/s_") and k.endswith(".json")}
+    assert screens["通用"].get("levels") == {"inner": 2}, \
+        "新建后的下一步 + same_as 命中各计一票——两条链路（增量/全量重放）都要落到这个数，不能是空账"

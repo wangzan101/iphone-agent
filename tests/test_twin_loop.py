@@ -13,7 +13,7 @@ class StubLive:
         StubLive.calls = []
 
     def observe(self, snap):
-        return {"owner": "she-zhi", "state": "matched", "screen_id": "s_x", "name": "关于本机"}
+        return {"owner": "settings", "state": "matched", "screen_id": "s_x", "name": "关于本机"}
 
     def after_action(self, action, result, after, ts):
         StubLive.calls.append(action["name"])
@@ -23,6 +23,9 @@ class StubLive:
 
     def route(self, task):
         return None
+
+    def visited(self, task):
+        return "【去过的屏】孪生记得的"
 
     def summary(self):
         return {"stub": True}
@@ -103,8 +106,8 @@ def test_no_frame_action_then_home_icon_tap_gives_the_next_action_the_right_owne
     assert recs[0]["action"]["name"] == "recall" and recs[0]["result"]["error"] == "memory_not_found"
     assert recs[1]["action"]["name"] == "tap" and recs[1]["result"]["changed"] is True
     done_rec = next(x for x in recs if x["action"]["name"] == "done")
-    # 有了修复：tap 在主屏图标上的归属推进（system → she-zhi）没被跳过。
-    assert done_rec["twin"]["owner"] == "she-zhi"
+    # 有了修复：tap 在主屏图标上的归属推进（system → settings）没被跳过。
+    assert done_rec["twin"]["owner"] == "settings"
     # 没有修复时会是这样（RED 证据，见 fix round 1 报告）：owner 一直卡在 "system"。
 
 
@@ -115,17 +118,19 @@ def test_location_hints_off_means_no_location_or_route_at_all(fake_env, tmp_path
     # System prompt always describes these sections (same in both arms), so only per-step messages are checked.
     seen = json.dumps([x for msgs in m.seen for x in msgs if x.get("role") != "system"], ensure_ascii=False)
     assert "孪生说的" not in seen and "【位置】" not in seen and "【路线】" not in seen
+    assert "【去过的屏】" not in seen
     meta = json.loads((r.run_dir / "run.json").read_text(encoding="utf-8"))
     assert meta["config"]["location_hints"] is False
     recs = [x for x in RunLog.read_steps(r.run_dir) if "action" in x]
-    assert all(x["hints"] == {"location": False, "route": False} for x in recs)
+    assert all(x["hints"] == {"location": False, "route": False, "visited": False} for x in recs)
 
 
 def test_hints_are_recorded_per_step(fake_env, tmp_path, monkeypatch):
     monkeypatch.setattr("iphone_agent.twin.live.LiveTwin", StubLive)
     r, dev, m = run(fake_env, [["a", "b", "c"]] * 2, [DONE], tmp_path)
     recs = [x for x in RunLog.read_steps(r.run_dir) if "action" in x]
-    assert recs[0]["hints"] == {"location": True, "route": False}
+    assert recs[0]["hints"] == {"location": True, "route": False, "visited": True}
+    assert "【去过的屏】孪生记得的" in json.dumps(m.seen, ensure_ascii=False)
 
 
 def test_memory_off_injects_and_writes_nothing(fake_env, tmp_path):

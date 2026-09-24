@@ -59,22 +59,31 @@ PROMPT = PROMPT_ELEMENTS            # 老调用方
 SYSTEM_WORD = "系统"
 UNSURE_WORD = "不确定"
 
+# ⚠ 2026-09-22（spec 打开App落点 §3.1）：这一屏在 App 里的层级。打开 App 是「回到上次离开的那一屏」，
+#   模型要知道自己是不是在首页；on_demand 下它平时不看图，这件事只能由标注的一方说。
+LEVELS = ("home", "top", "inner")
+
+# ⚠ 2026-09-22（终审 M-1）：open 之后立刻盖住页面的权限 / 登录 / 促销弹窗，如果不特意排除会被当成
+#   「从别的页点进来」判成 inner——那句「不是首页，先退回去」对一个从没进过内页的用户是错的指令，
+#   弹窗关掉才知道真落点。level 判定和 anchors／same_as 不一样：弹窗底下那一层还没看清楚，
+#   不能瞎猜，只能先说 null（同一个道理：CLAUDE.md §2，代理指标的否定结论要留复核余地）。
 _SCREEN_BODY = f"""说清楚**这一屏是什么**，放在 screen 里：
 - app：这一屏属于哪个 App，用手机上显示的 App 名。主屏、Spotlight、控制中心、通知中心、App 切换器写「{SYSTEM_WORD}」；看不出来写「{UNSURE_WORD}」
 - name：这一屏叫什么。有页面标题就照抄原文；没有标题就写一个简短描述，例如「提醒事项首页」
 - same_as：下面如果列出了已知页面、而当前画面就是其中之一，填它的编号；都不是、或者没有列表，填 null。同一屏 = 同一个页面，只是内容不同（比如同一个列表里的条目变了）
-- anchors：2 到 5 个这一屏上不随内容变化的文字（页面标题、固定按钮、固定分组名），必须是屏幕上看得见的原文；笔记内容、金额、时间、人名都不算"""
+- anchors：2 到 5 个这一屏上不随内容变化的文字（页面标题、固定按钮、固定分组名），必须是屏幕上看得见的原文；笔记内容、金额、时间、人名都不算
+- level：这一屏在 App 里的层级。home = 冷启动这个 App 时默认显示的那一页（通常底部标签栏第一个被选中、没有返回箭头）；top = App 的其他顶层页（切到了底部或顶部标签栏里别的标签，也没有返回箭头）；inner = 从别的页点进来的页（有返回箭头或关闭按钮，或是弹出的详情、子设置、搜索结果）；画面被弹窗、权限提示、登录框遮住时也填 null；系统屏或看不出来填 null"""
 _SCREEN_SPEC = f"另外{_SCREEN_BODY}"
 
 _OBJECT_OUTPUT = """只输出一个 JSON 对象，不要解释，不要代码围栏。例如：
-{"screen":{"app":"设置","name":"通用","same_as":null,"anchors":["通用","关于本机"]},
+{"screen":{"app":"设置","name":"通用","same_as":null,"anchors":["通用","关于本机"],"level":"inner"},
  "elements":[{"kind":"icon","label":"返回箭头","box":[20,120,60,160]}]}"""
 
 # 整屏解析用它：同一次调用里同时要元素和「这一屏是什么」（spec §3.2）。
 PROMPT_SCREEN = f"{_ELEMENTS_SPEC}\n\n{_SCREEN_SPEC}\n\n{_OBJECT_OUTPUT}\n\n{_GUARD}"
 
 _LABEL_OUTPUT = """只输出一个 JSON 对象，不要解释，不要代码围栏，不要列元素。例如：
-{"screen":{"app":"设置","name":"通用","same_as":null,"anchors":["通用","关于本机"]}}"""
+{"screen":{"app":"设置","name":"通用","same_as":null,"anchors":["通用","关于本机"],"level":"inner"}}"""
 
 # 短标注（spec 2026-09-14 §5.1）：只要「这一屏是什么」，输出约 60–80 token。与 PROMPT_SCREEN 共用 _SCREEN_BODY。
 PROMPT_LABEL = f"你在看一张 iPhone 屏幕截图。{_SCREEN_BODY}\n\n{_LABEL_OUTPUT}\n\n{_GUARD_LABEL}"
@@ -105,9 +114,11 @@ class ScreenLabel:
     name: str
     same_as: int | None
     anchors: tuple[str, ...]
+    level: str | None = None          # LEVELS 之一；None = 没答 / 答坏了 / 系统屏（spec 打开App落点 §3.1）
 
     def to_json(self) -> dict:
-        return {"app": self.app, "name": self.name, "same_as": self.same_as, "anchors": list(self.anchors)}
+        return {"app": self.app, "name": self.name, "same_as": self.same_as, "anchors": list(self.anchors),
+                "level": self.level}
 
 
 @dataclass
@@ -170,8 +181,11 @@ def parse_screen_label(data, n_candidates: int) -> tuple[ScreenLabel | None, str
         t = a.strip()
         if t and len(t) <= LABEL_ANCHOR_MAX and t not in anchors:
             anchors.append(t)
+    # ⚠ 2026-09-22：level 是后加的可选字段 —— 答坏了只把它记成 None，不把整条标注判 invalid，
+    #   否则一个新字段会连带丢掉 app / name / anchors，孪生认屏倒退。
+    level = raw.get("level") if raw.get("level") in LEVELS else None
     return ScreenLabel(app.strip(), name.strip()[:LABEL_NAME_MAX], same,
-                       tuple(anchors[:LABEL_ANCHORS_KEEP])), "ok"
+                       tuple(anchors[:LABEL_ANCHORS_KEEP]), level), "ok"
 
 
 @dataclass(frozen=True)

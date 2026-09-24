@@ -59,16 +59,27 @@ def per_with(asker):
 def test_existing_prompts_are_byte_identical_so_the_vision_cache_survives():
     assert hashlib.sha256(PROMPT_ELEMENTS.encode("utf-8")).hexdigest() == \
         "f1470183d336b93d12d9b79a5d7680d360135e3ee82febabb04263657e3b5ac9"
+    # ⚠ 2026-09-22（spec 打开App落点 §3.1）：PROMPT_SCREEN 加了 level，视觉缓存有意失效一次；PROMPT_ELEMENTS 不动（zoom 缓存保住）。
+    # ⚠ 2026-09-22（终审 M-1）：level 的判法又加了一句「被弹窗/权限/登录框遮住也填 null」，缓存再失效一次——
+    #   这是弹窗误判 inner 那一类问题第一次真的被说清楚，不是补丁。
     assert hashlib.sha256(PROMPT_SCREEN.encode("utf-8")).hexdigest() == \
-        "8ddbce17d3df18a95c20b7822327bb2b8cd5c2b1b5748dd2d1c4dbdfa1971ace"
-    assert len(PROMPT_SCREEN) == 920
+        "b6f30ff345861f070963ef8b89c923d20b16863553a5eb067cdfe8548a553bb8"
+    assert len(PROMPT_SCREEN) == 1137
+
+
+def test_level_guidance_tells_the_model_to_null_out_a_covering_popup():
+    """⚠ 2026-09-22（终审 M-1）：open_app 之后立刻挡住页面的权限/登录/促销弹窗此前会被判成 inner，
+    模型还被告知「不是首页，先退回去」——弹窗不是内页，退回去这句话是错的。level 的判法要显式排除
+    这种情况，两处共用 _SCREEN_BODY 的提示词都要带上这句话（PROMPT_SCREEN 和 PROMPT_LABEL）。"""
+    assert "画面被弹窗、权限提示、登录框遮住时也填 null" in PROMPT_SCREEN
+    assert "画面被弹窗、权限提示、登录框遮住时也填 null" in PROMPT_LABEL
 
 
 def test_label_prompt_shares_the_screen_text_and_asks_for_the_label_only():
     anchors_line = next(ln for ln in PROMPT_SCREEN.splitlines() if ln.startswith("- anchors"))
     assert anchors_line in PROMPT_LABEL and "「系统」" in PROMPT_LABEL and "same_as" in PROMPT_LABEL
     assert "把元素列出来" not in PROMPT_LABEL and '"elements"' not in PROMPT_LABEL
-    cands = [Candidate(1, "she-zhi", "设置", "s_1", "通用")]
+    cands = [Candidate(1, "settings", "设置", "s_1", "通用")]
     assert label_prompt(()) == PROMPT_LABEL
     assert label_prompt(cands) == PROMPT_LABEL + screen_prompt(cands)[len(PROMPT_SCREEN):]
 
@@ -125,7 +136,7 @@ def test_parse_error_belongs_to_its_own_frame():
 def test_on_demand_frame_gets_one_short_label_with_real_candidates():
     a = Asker({"screen": {**GOOD["screen"], "same_as": 1}})
     per = per_with(a)
-    ctx = Ctx([Candidate(1, "she-zhi", "设置", "s_1", "通用")])
+    ctx = Ctx([Candidate(1, "settings", "设置", "s_1", "通用")])
     with per.task_scope(ctx, "on_demand"):
         o = per.observe(frame())
         assert a.prompts == [], "on_demand 的观察本身只跑 OCR"

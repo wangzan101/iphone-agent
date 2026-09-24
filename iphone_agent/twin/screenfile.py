@@ -90,6 +90,9 @@ class Screen:
     name: str
     aliases: set[str] = field(default_factory=set)
     anchors: dict[str, int] = field(default_factory=dict)   # 落地锚点 → 落地次数
+    # ⚠ 2026-09-22（spec 打开App落点 §3.3）：按票存、不存「最新一次答的是什么」——模型偶尔会把一屏
+    #   答错层级（比如把 top 看成 inner），单帧误判不该直接翻转一屏的身份；多帧一起投票才稳。
+    levels: dict[str, int] = field(default_factory=dict)    # 标注说的层级 → 票数
     transitions: dict[tuple, Transition] = field(default_factory=dict)
     visits: int = 0
     status: str = "provisional"
@@ -100,11 +103,27 @@ class Screen:
     def names(self) -> set[str]:
         return {self.name} | self.aliases
 
+    @property
+    def level(self) -> str | None:
+        """票数最多的层级；平票或没票 → None（宁可不说，不说错）。
+        ⚠ 2026-09-22（spec 打开App落点 §3.3、开发原则 §2）：取多数而不是最新一次，理由同 anchors ——
+          代理指标（这里是「模型标注」）平时对、关键时刻错，一次误判不该盖掉之前多次一致的答案；
+          票数打平说明证据本身就不足以下结论，返回 None 比随便挑一个更安全（比如 goto 拿它判「是不是首页」）。"""
+        if not self.levels:
+            return None
+        top = max(self.levels.values())
+        best = [k for k, v in self.levels.items() if v == top]
+        return best[0] if len(best) == 1 else None
+
     def to_json(self) -> dict:
+        ident = {"name": self.name, "aliases": sorted(self.aliases), "anchors": dict(sorted(self.anchors.items()))}
+        # ⚠ 2026-09-22：levels 为空才不写这个键（不写 "levels": {}）——这是本任务的硬约束：老屏文件
+        #   （schema 2、level 加入之前写的）和这次全量重建的结果必须逐字节相同，写一个空 dict 会破坏它。
+        if self.levels:                     # 空的不写：老屏文件与重建结果逐字节不变
+            ident["levels"] = dict(sorted(self.levels.items()))
         return {
             "schema": SCHEMA, "id": self.id, "app": self.app, "created": self.created, "updated": self.updated,
-            "identity": {"name": self.name, "aliases": sorted(self.aliases),
-                         "anchors": dict(sorted(self.anchors.items()))},
+            "identity": ident,
             "transitions": [t.to_json() for _, t in sorted(self.transitions.items())],
             "visits": self.visits, "status": self.status, "first_event": self.first_event,
             "applied_runs": sorted(self.applied_runs), "human": self.human,
@@ -123,6 +142,7 @@ class Screen:
                     created=str(d["created"]), updated=str(d["updated"]), name=name,
                     aliases={str(x) for x in ident.get("aliases") or []},
                     anchors={str(k): int(v) for k, v in (ident.get("anchors") or {}).items()},
+                    levels={str(k): int(v) for k, v in (ident.get("levels") or {}).items()},
                     visits=int(d["visits"]), status=str(d["status"]),
                     applied_runs={str(x) for x in d.get("applied_runs", [])},
                     human=dict(d.get("human") or {}), revision=_rev(d))

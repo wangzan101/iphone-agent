@@ -13,11 +13,13 @@ def el(text, fx, fy, eid, *, source="ocr", conf=0.9):
             "center": [cx, cy], "source": source}
 
 
-SET = "she-zhi"
+SET = "settings"
 
 
-def label(app, name, anchors=(), same_as=None):
-    return {"app": app, "name": name, "same_as": same_as, "anchors": list(anchors)}
+def label(app, name, anchors=(), same_as=None, level=None):
+    # ⚠ 2026-09-22（终审 M-7）：level 加了个可选参数，不传就是 None——旧调用方的输出字节不变
+    # （parse_screen_label 本来就用 .get("level")，多一个值是 None 的键不改校验结果）。
+    return {"app": app, "name": name, "same_as": same_as, "anchors": list(anchors), "level": level}
 
 
 def cand(index, app_id, sid, name, display=None):
@@ -30,7 +32,7 @@ def sid_of(app, run_id, frame):
 
 
 def screen_obs(frame, title=None, back=None, rows=("甲", "乙", "丙"), extra=(), *,
-               app="设置", same_as=None, candidates=(), labeled=True):
+               app="设置", same_as=None, candidates=(), labeled=True, level=None):
     """一屏 App 页：左上返回、正中标题、竖排正文行，外加视觉标注（锚点 = 标题 + 第一行）。"""
     els, i = [], 1
     if back:
@@ -47,7 +49,7 @@ def screen_obs(frame, title=None, back=None, rows=("甲", "乙", "丙"), extra=(
         i += 1
     obs = {"frame_file": frame, "width_px": W, "height_px": H, "elements": els}
     if labeled and title:
-        obs["screen"] = label(app, title, [title, *rows[:1]], same_as)
+        obs["screen"] = label(app, title, [title, *rows[:1]], same_as, level)
         obs["perception"] = {"ocr": len(els), "vision": "ok", "screen": "ok"}
         if candidates:
             obs["screen_candidates"] = list(candidates)

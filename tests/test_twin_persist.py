@@ -33,8 +33,8 @@ def test_record_run_writes_screens_and_is_idempotent(tmp_path):
     d = write_run(tmp_path, "r1", settings_run())
     st = R.record_run(ws, d)
     files = tree_bytes(ws.twin_apps)
-    assert len([k for k in files if k.startswith("she-zhi/screens/s_")]) == 3 and st.screens_created == 3
-    assert "she-zhi/screens/app.json" in files
+    assert len([k for k in files if k.startswith("settings/screens/s_")]) == 3 and st.screens_created == 3
+    assert "settings/screens/app.json" in files
     R.record_run(ws, d)
     assert tree_bytes(ws.twin_apps) == files
 
@@ -83,11 +83,11 @@ def test_rebuild_keeps_human_fields_and_reports_orphans(tmp_path):
     write_run(tmp_path, "r1", settings_run())
     notes = write_run(tmp_path, "r2", notes_run(t0=100))
     R.rebuild(ws)
-    kept = next(ws.twin_apps.glob("she-zhi/screens/s_*.json"))
+    kept = next(ws.twin_apps.glob("settings/screens/s_*.json"))
     d = json.loads(kept.read_text(encoding="utf-8"))
     d["human"] = {"note": "人写的"}
     kept.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    gone = next(ws.twin_apps.glob("bei-wang-lu/screens/s_*.json"))
+    gone = next(ws.twin_apps.glob("notes/screens/s_*.json"))
     g = json.loads(gone.read_text(encoding="utf-8"))
     g["human"] = {"no_go": True}
     gone.write_text(json.dumps(g, ensure_ascii=False), encoding="utf-8")
@@ -97,7 +97,7 @@ def test_rebuild_keeps_human_fields_and_reports_orphans(tmp_path):
     st = R.rebuild(ws)
     assert json.loads(kept.read_text(encoding="utf-8"))["human"] == {"note": "人写的"}
     orphans = json.loads((tmp_path / ".iphone" / "knowledge" / "twin-orphans.json").read_text(encoding="utf-8"))
-    assert orphans[f"bei-wang-lu/{gone.stem}"] == {"no_go": True} and st.orphans == 1
+    assert orphans[f"notes/{gone.stem}"] == {"no_go": True} and st.orphans == 1
 
 
 def test_failed_rebuild_leaves_the_old_twin(tmp_path, monkeypatch):
@@ -114,7 +114,7 @@ def test_failed_rebuild_leaves_the_old_twin(tmp_path, monkeypatch):
 
 def test_corrupt_screen_file_is_quarantined_not_overwritten(tmp_path):
     ws = Workspace(tmp_path)
-    bad = ws.twin_apps / "she-zhi" / "screens" / "s_bad.json"
+    bad = ws.twin_apps / "settings" / "screens" / "s_bad.json"
     bad.parent.mkdir(parents=True)
     bad.write_text("{not json", encoding="utf-8")
     st = R.record_run(ws, write_run(tmp_path, "r1", settings_run()))
@@ -151,7 +151,7 @@ def test_lock_timeout_queues_the_run_and_next_record_catches_up(tmp_path):
         st = R.record_run(ws, d1, lock_wait_s=0.1)
     assert st.lock_timeout == 1 and not ws.twin_apps.exists()
     R.record_run(ws, d2)
-    assert list(ws.twin_apps.glob("she-zhi/screens/s_*.json")) and list(ws.twin_apps.glob("bei-wang-lu/screens/s_*.json"))
+    assert list(ws.twin_apps.glob("settings/screens/s_*.json")) and list(ws.twin_apps.glob("notes/screens/s_*.json"))
 
 
 def test_pending_queue_keeps_undrained_ids_on_mid_drain_failure(tmp_path, monkeypatch):
@@ -170,7 +170,7 @@ def test_pending_queue_keeps_undrained_ids_on_mid_drain_failure(tmp_path, monkey
     with pytest.raises(RuntimeError):
         R.record_run(ws, d3)
     assert R._read_pending(ws) == ["r2"]
-    assert list(ws.twin_apps.glob("she-zhi/screens/s_*.json"))          # r1 已经记进去了
+    assert list(ws.twin_apps.glob("settings/screens/s_*.json"))          # r1 已经记进去了
 
 
 @pytest.mark.parametrize("k", [0, 1, 2, 3])
@@ -212,8 +212,8 @@ def test_two_processes_recording_at_once_are_serialized(tmp_path):
         p.join(60)
     assert all(p.exitcode == 0 for p in ps)
     ws = Workspace(tmp_path)
-    assert list(ws.twin_apps.glob("she-zhi/screens/s_*.json"))
-    assert list(ws.twin_apps.glob("bei-wang-lu/screens/s_*.json"))
+    assert list(ws.twin_apps.glob("settings/screens/s_*.json"))
+    assert list(ws.twin_apps.glob("notes/screens/s_*.json"))
     together = tree_bytes(ws.twin_apps)
     R.rebuild(ws)                                  # 两个 run 碰的是不同 App：顺序无关，必须和重建一致
     assert tree_bytes(ws.twin_apps) == together
@@ -230,22 +230,22 @@ def test_needs_initial_rebuild(tmp_path):
 
 def test_schema1_and_future_files_are_skipped_not_quarantined(tmp_path):
     ws = Workspace(tmp_path)
-    d = ws.twin_apps / "she-zhi" / "screens"
+    d = ws.twin_apps / "settings" / "screens"
     d.mkdir(parents=True)
     (d / "s_old.json").write_text(json.dumps({"schema": 1, "id": "s_old"}), encoding="utf-8")
     (d / "s_new.json").write_text(json.dumps({"schema": 3, "id": "s_new"}), encoding="utf-8")
     st = R.TwinState(ws.twin_apps, writable=True)
-    assert st.screens_of("she-zhi") == []
+    assert st.screens_of("settings") == []
     assert st.stats.stale_schema == 1 and st.stats.unsupported_schema == 1 and st.stats.corrupt == 0
     assert (d / "s_old.json").exists() and (d / "s_new.json").exists() and not (d / ".corrupt").exists()
 
 
-@pytest.mark.parametrize("meta", [{"schema": 3, "app": "she-zhi", "future": True},
-                                  {"app": "she-zhi", "display": "设置", "aliases": ["系统设置"]}])
+@pytest.mark.parametrize("meta", [{"schema": 3, "app": "settings", "future": True},
+                                  {"app": "settings", "display": "设置", "aliases": ["系统设置"]}])
 def test_unsupported_app_meta_survives_a_run_that_enters_the_app(tmp_path, meta):
     """spec §7：app.json 同屏文件一样，不支持的 schema 不隔离、也不覆盖（可能是更新的程序写的）。"""
     ws = Workspace(tmp_path)
-    d = ws.twin_apps / "she-zhi" / "screens"
+    d = ws.twin_apps / "settings" / "screens"
     d.mkdir(parents=True)
     raw = json.dumps(meta, ensure_ascii=False).encode("utf-8")
     (d / "app.json").write_bytes(raw)

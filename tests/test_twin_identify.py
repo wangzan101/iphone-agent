@@ -15,8 +15,8 @@ class St:
         return self.by.get((app, sid))
 
 
-LIST = Screen("s_list", "bei-wang-lu", "r0:f2.png", "t", "t", "iCloud全部备忘录", anchors={"文件夹": 1})
-C1 = ({"index": 1, "app_id": "bei-wang-lu", "screen_id": "s_list", "name": "iCloud全部备忘录"},)
+LIST = Screen("s_list", "notes", "r0:f2.png", "t", "t", "iCloud全部备忘录", anchors={"文件夹": 1})
+C1 = ({"index": 1, "app_id": "notes", "screen_id": "s_list", "name": "iCloud全部备忘录"},)
 TEXTS = frozenset({"iCloud全部备忘录", "文件夹", "编辑"})
 
 
@@ -44,26 +44,26 @@ def test_grounded_keeps_only_anchors_seen_by_ocr():
 def test_plain_app_id():
     assert plain_app_id("系统") == SYSTEM
     assert plain_app_id("不确定") is None and plain_app_id(" ") is None
-    assert plain_app_id("设置") == "she-zhi"
+    assert plain_app_id("设置") == "settings"
 
 
 def test_same_as_matches_and_learns_alias():
-    r = identify(L("全部备忘录", same_as=1), "bei-wang-lu", TEXTS, C1, St(LIST))
+    r = identify(L("全部备忘录", same_as=1), "notes", TEXTS, C1, St(LIST))
     assert r == Recognition("matched", "s_list", "iCloud全部备忘录", ("iCloud全部备忘录", "文件夹"), "全部备忘录")
-    same = identify(L(same_as=1), "bei-wang-lu", TEXTS, C1, St(LIST))
+    same = identify(L(same_as=1), "notes", TEXTS, C1, St(LIST))
     assert same.state == "matched" and same.alias is None
 
 
 def test_same_as_to_missing_screen_is_unresolved():
-    assert identify(L(same_as=1), "bei-wang-lu", TEXTS, C1, St()).state == "candidate_unresolved"
+    assert identify(L(same_as=1), "notes", TEXTS, C1, St()).state == "candidate_unresolved"
 
 
 def test_same_as_to_another_app_is_a_conflict():
-    assert identify(L(same_as=1, app="设置"), "she-zhi", TEXTS, C1, St(LIST)).state == "label_conflict"
+    assert identify(L(same_as=1, app="设置"), "settings", TEXTS, C1, St(LIST)).state == "label_conflict"
 
 
 def test_no_same_as_is_a_new_screen_even_with_the_same_name():
-    r = identify(L(), "bei-wang-lu", TEXTS, C1, St(LIST))
+    r = identify(L(), "notes", TEXTS, C1, St(LIST))
     assert r == Recognition("new", None, "iCloud全部备忘录", ("iCloud全部备忘录", "文件夹"))
 
 
@@ -75,10 +75,18 @@ def test_system_and_unknown_owner_without_same_as_are_skipped():
 def test_unsure_app_without_same_as_is_skipped_even_with_a_real_owner():
     """spec §4.2 最后一行：「不确定」又没有 same_as → 不建屏。归属是核过身份的进入给的也一样。"""
     for app in ("不确定", " "):
-        assert identify(L(app=app), "bei-wang-lu", TEXTS, C1, St(LIST)) == Recognition("skipped")
+        assert identify(L(app=app), "notes", TEXTS, C1, St(LIST)) == Recognition("skipped")
 
 
 def test_system_label_without_same_as_is_skipped_even_with_a_real_owner():
     """spec §4.2 最后一行：标「系统」又没有 same_as → 不建屏。归属是核过身份的进入给的也一样（评审 P1：
     open_app 设置 之后第一帧是权限弹窗）。"""
-    assert identify(L(app="系统"), "bei-wang-lu", TEXTS, C1, St(LIST)) == Recognition("skipped")
+    assert identify(L(app="系统"), "notes", TEXTS, C1, St(LIST)) == Recognition("skipped")
+
+
+def test_identify_passes_the_label_level_through():
+    """spec 打开App落点 §3.3：标注说的层级原样带进 Recognition，matched / new 都要带。"""
+    from iphone_agent.perceive.screen import ScreenLabel
+    from iphone_agent.twin.record import TwinState
+    rec = identify(ScreenLabel("设置", "关于本机", None, (), "inner"), "settings", frozenset(), (), TwinState(None))
+    assert rec.state == "new" and rec.level == "inner"

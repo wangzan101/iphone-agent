@@ -281,7 +281,7 @@ def test_label_agree_compares_both_prompts_on_the_same_real_candidates(evalset):
 
     class Ctx:
         def candidates(self, texts):
-            return [Candidate(1, "she-zhi", "设置", "s_1", "通用")]
+            return [Candidate(1, "settings", "设置", "s_1", "通用")]
 
     class Asker:
         prompts: list = []
@@ -295,17 +295,17 @@ def test_label_agree_compares_both_prompts_on_the_same_real_candidates(evalset):
     r = B.label_agree(evalset, per, Ctx(), "rev-1")
     assert r["frames"] == 1 and r["both_ok"] == 1 and len(Asker.prompts) == 2
     assert all("1. 设置 / 通用" in p for p in Asker.prompts), "两个提示词拿到同一份候选"
-    assert r["agree"] == {"app": 1.0, "name": 1.0, "same_as": 1.0, "anchors": 0.0}
+    assert r["agree"] == {"app": 1.0, "name": 1.0, "same_as": 1.0, "anchors": 0.0, "level": 1.0}
     assert r["mismatches"][0]["fields"] == ["anchors"] and r["twin_revision"] == "rev-1"
 
 
 def test_twin_fingerprint_changes_with_the_twin(tmp_path):
     d = tmp_path / "apps"
     assert B.twin_fingerprint(d) == "0:empty"
-    (d / "she-zhi" / "screens").mkdir(parents=True)
-    (d / "she-zhi" / "screens" / "s_1.json").write_text("{}", encoding="utf-8")
+    (d / "settings" / "screens").mkdir(parents=True)
+    (d / "settings" / "screens" / "s_1.json").write_text("{}", encoding="utf-8")
     one = B.twin_fingerprint(d)
-    (d / "she-zhi" / "screens" / "s_1.json").write_text('{"x": 1}', encoding="utf-8")
+    (d / "settings" / "screens" / "s_1.json").write_text('{"x": 1}', encoding="utf-8")
     assert one.startswith("1:") and B.twin_fingerprint(d) != one
 
 

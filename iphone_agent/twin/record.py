@@ -15,7 +15,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from iphone_agent.memory.screenmap import SYSTEM, UNKNOWN, _run_finished, app_id_for
+from iphone_agent.appids import app_id_for
+from iphone_agent.memory.screenmap import SYSTEM, UNKNOWN, _run_finished
 from iphone_agent.perceive.screen import parse_screen_label
 from iphone_agent.twin.events import TRANSITION_ACTIONS, AppTracker, Event, read_run_events
 from iphone_agent.twin.identify import Recognition, identify, norm_text, ocr_elements, ocr_texts, plain_app_id
@@ -294,6 +295,11 @@ class TwinState:
         s.visits += 1
         for a in rec.anchors:
             s.anchors[a] = s.anchors.get(a, 0) + 1
+        # ⚠ 2026-09-22（spec 打开App落点 §3.3）：level 像 anchors 一样只在 visit 里计票，apply() 里
+        #   after 帧刚创建那一刻不计（那处造的是 Recognition("matched", ns.id, ns.name)，level 留空）——
+        #   这帧下一次作为某个事件的 before 时会正常走到这里、连同标注一起计一票，不需要在创建处特殊处理。
+        if rec.level:
+            s.levels[rec.level] = s.levels.get(rec.level, 0) + 1
         if rec.alias and rec.alias not in s.aliases:
             s.aliases.add(rec.alias)
             self.stats.aliases_added += 1

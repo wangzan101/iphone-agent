@@ -9,8 +9,10 @@ from iphone_agent.harness.runlog import frame_name, observation_snapshot
 from iphone_agent.perceive.observe import Perceiver
 from iphone_agent.perceive.ocr import RawBox
 from iphone_agent.perceive.screen import (
+    LEVELS,
     PROMPT,
     PROMPT_ELEMENTS,
+    PROMPT_LABEL,
     PROMPT_SCREEN,
     Candidate,
     ScreenLabel,
@@ -63,8 +65,8 @@ def test_screen_prompt_shares_the_element_spec_and_lists_candidates():
     assert PROMPT_SCREEN.startswith(head)
     assert "same_as" in PROMPT_SCREEN and "「系统」" in PROMPT_SCREEN and "「不确定」" in PROMPT_SCREEN
     assert screen_prompt(()) == PROMPT_SCREEN
-    p = screen_prompt([Candidate(1, "bei-wang-lu", "备忘录", "s_a", "iCloud全部备忘录"),
-                       Candidate(2, "bei-wang-lu", "备忘录", "s_b", "文件夹")])
+    p = screen_prompt([Candidate(1, "notes", "备忘录", "s_a", "iCloud全部备忘录"),
+                       Candidate(2, "notes", "备忘录", "s_b", "文件夹")])
     assert "1. 备忘录 / iCloud全部备忘录\n2. 备忘录 / 文件夹" in p and p.startswith(PROMPT_SCREEN)
 
 
@@ -92,7 +94,7 @@ def test_valid_label_is_cleaned():
     lab, st = parse_screen_label({"screen": raw}, 1)
     assert st == "ok"
     assert lab == ScreenLabel("设置", "名" * 40, 1, ("通用", "a", "b", "c", "d"))
-    assert lab.to_json() == {"app": "设置", "name": "名" * 40, "same_as": 1, "anchors": ["通用", "a", "b", "c", "d"]}
+    assert lab.to_json() == {"app": "设置", "name": "名" * 40, "same_as": 1, "anchors": ["通用", "a", "b", "c", "d"], "level": None}
     assert parse_screen_label({"screen": {**GOOD, "anchors": "通用"}}, 0)[0].anchors == ()
 
 
@@ -109,7 +111,7 @@ def test_broken_screen_segment_keeps_elements():
 def test_observe_carries_label_candidates_and_status():
     asker = Asker({"screen": {**GOOD, "same_as": 1}, "elements": EL})
     per = Perceiver(ocr=lambda im: [RawBox("通用", 0.99, 0.1, 0.8, 0.3, 0.04)], asker=asker)
-    ctx = Ctx([Candidate(1, "she-zhi", "设置", "s_1", "通用")])
+    ctx = Ctx([Candidate(1, "settings", "设置", "s_1", "通用")])
     with per.task_scope(ctx, "always"):
         o = per.observe(frame())
     assert ctx.seen == [["通用"]]
@@ -118,7 +120,7 @@ def test_observe_carries_label_candidates_and_status():
     snap = observation_snapshot(o, frame_name(o.frame_id))
     assert snap["frame_file"] == "frame_001.png"
     assert snap["screen"]["name"] == "通用"
-    assert snap["screen_candidates"] == [{"index": 1, "app_id": "she-zhi", "app_display": "设置",
+    assert snap["screen_candidates"] == [{"index": 1, "app_id": "settings", "app_display": "设置",
                                           "screen_id": "s_1", "name": "通用"}]
     o2 = per.observe(frame(2))           # 解除绑定之后：没有候选段
     assert asker.prompts[-1] == PROMPT_SCREEN and o2.screen_candidates == []
@@ -154,3 +156,37 @@ def test_zoom_keeps_the_elements_prompt():
     base = per.observe(frame())
     per.zoom(base, (0, 0, 300, 300))
     assert asker.prompts[-1] == PROMPT_ELEMENTS
+
+
+# ⚠ 2026-09-22：level 字段测试（spec 打开App落点 §3.1）
+
+
+def _raw(**kw):
+    return {"screen": {"app": "设置", "name": "通用", "same_as": None, "anchors": ["通用"], **kw}}
+
+
+@pytest.mark.parametrize("level", LEVELS)
+def test_level_is_read_when_it_is_one_of_the_three(level):
+    label, status = parse_screen_label(_raw(level=level), 0)
+    assert status == "ok" and label.level == level
+
+
+@pytest.mark.parametrize("bad", [None, "", "Home", "首页", 1, True, ["inner"]])
+def test_a_bad_or_missing_level_is_none_and_keeps_the_rest_of_the_label(bad):
+    """2026-09-22：level 是后加的可选字段，答坏了不该连带丢掉 app / name / anchors —— 那会让孪生认屏倒退。"""
+    label, status = parse_screen_label(_raw(level=bad), 0)
+    assert status == "ok" and label.level is None and label.name == "通用" and label.anchors == ("通用",)
+    label2, status2 = parse_screen_label(_raw(), 0)
+    assert status2 == "ok" and label2.level is None
+
+
+def test_level_round_trips_through_to_json():
+    """留档里存的是 to_json，孪生重放时再过一遍 parse_screen_label —— level 要能原样回来。"""
+    label = ScreenLabel("设置", "通用", None, ("通用",), "inner")
+    again, status = parse_screen_label({"screen": label.to_json()}, 0)
+    assert status == "ok" and again == label
+
+
+def test_both_prompts_ask_for_the_level():
+    for p in (PROMPT_SCREEN, PROMPT_LABEL):
+        assert "- level：" in p and '"level":"inner"' in p

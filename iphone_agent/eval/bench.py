@@ -314,7 +314,7 @@ def diff(a: dict, b: dict) -> list[str]:
     return lines
 
 
-LABEL_FIELDS = ("app", "name", "same_as", "anchors")
+LABEL_FIELDS = ("app", "name", "same_as", "anchors", "level")
 
 
 def _bench_frames(root: Path) -> list[Path]:
@@ -418,7 +418,8 @@ def label_agree(root: Path, perceiver, ctx, twin_revision: str, limit: int | Non
         same = {"app": plain_app_id(short.app) == plain_app_id(full.label.app),
                 "name": norm_text(short.name) == norm_text(full.label.name),
                 "same_as": short.same_as == full.label.same_as,
-                "anchors": {norm_text(a) for a in short.anchors} == {norm_text(a) for a in full.label.anchors}}
+                "anchors": {norm_text(a) for a in short.anchors} == {norm_text(a) for a in full.label.anchors},
+                "level": short.level == full.label.level}
         for k, ok in same.items():
             agree[k] += ok
         if not all(same.values()):

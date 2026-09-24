@@ -13,8 +13,13 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from iphone_agent.memory.screenmap import SYSTEM, UNKNOWN, app_id_for
+from iphone_agent.appids import app_id_for
+from iphone_agent.fingerprint import is_ocr_row  # noqa: F401 —— 老调用方仍从这里 import
+from iphone_agent.memory.screenmap import SYSTEM, UNKNOWN
 from iphone_agent.perceive.screen import SYSTEM_WORD, UNSURE_WORD
+
+# ⚠ 2026-09-16：`is_ocr_row` 挪到了 `iphone_agent/fingerprint.py` —— 剧本指纹也要用它，
+#   而 skills / harness 都不该 import twin。挪法同 `riskwords.py`：定义只有一份，这里 import 回来。
 
 _BACK_PREFIX = "<〈‹"             # NFKC 之后「＜」已经是「<」
 
@@ -31,13 +36,6 @@ def norm_text(s: str) -> str:
     if not any(unicodedata.category(c)[0] in "LN" for c in t):
         return ""
     return t
-
-
-def is_ocr_row(e: dict) -> bool:
-    """这一行元素是不是 OCR 那一路读到的（source 为 ocr / both）。唯一入口：孪生身份与任务判定器共用（CLAUDE.md §7）。
-    旧留档没有 source：confidence == 0 的是视觉元素（2026-09-11：新留档 1797 个视觉元素全为 0，OCR/融合 7475 个里 1 个）。"""
-    src = e.get("source")
-    return src in ("ocr", "both") or (src is None and e.get("confidence") != 0)
 
 
 def ocr_elements(elements) -> list[dict]:
@@ -87,6 +85,9 @@ class Recognition:
     name: str | None = None
     anchors: tuple[str, ...] = ()
     alias: str | None = None          # same_as 认出、而这次叫法不同：要加进别名集合
+    # ⚠ 2026-09-22（spec 打开App落点 §3.3）：level 这一期只记不用，消费方是以后的 goto——
+    #   这里只把标注原样传下去，「该不该据此判定回到了首页」这类语义判断留给看图的一方（开发原则 §2）。
+    level: str | None = None          # 标注说的层级；TwinState.visit 时计一票
 
 
 def identify(label, owner: str, texts: frozenset[str], candidates: tuple[dict, ...], state) -> Recognition:
@@ -101,7 +102,7 @@ def identify(label, owner: str, texts: frozenset[str], candidates: tuple[dict, .
             # 按 spec §4.1 屏 id 实时与重放一致，这里不该发生；发生了就是 bug，必须看得见。
             return Recognition("candidate_unresolved")
         alias = label.name if label.name not in s.names() else None
-        return Recognition("matched", s.id, s.name, anchors, alias)
+        return Recognition("matched", s.id, s.name, anchors, alias, label.level)
     if owner in (SYSTEM, UNKNOWN):
         return Recognition("skipped")
     # ⚠ 2026-09-12：spec §4.2 最后一行——「系统」或「不确定」又没有 same_as → 不建屏、不记转移。只看 owner 不够：
@@ -112,4 +113,4 @@ def identify(label, owner: str, texts: frozenset[str], candidates: tuple[dict, .
     if plain_app_id(label.app) in (None, SYSTEM):
         return Recognition("skipped")
     # same_as 为 null：新建。同 App 已有同名屏也新建（宁可分开，不可合错），计数交给 TwinState.create。
-    return Recognition("new", None, label.name, anchors)
+    return Recognition("new", None, label.name, anchors, None, label.level)
