@@ -7,6 +7,7 @@ Automated regression tests exercise mocked device behavior, transport handling, 
 - `tests/data/wire_*_golden.json`: synthetic protocol messages.
 - `evalset/labels/00-current.json`: synthetic home-screen geometry at a historical compatibility path. It is not a recording of a user's installed apps. Legacy test names/comments referring to real data describe their origin, not this public fixture.
 - `evalset/tasks/settings-ios-version.json`: illustrative read task. Replace its expected version and UI text for your own test phone.
+- `evalset/tasks/hard/`: twelve read-only tasks that are deliberately harder than the daily set — third-party apps, Chinese input, deep entry points, media libraries, and apps that open behind a popup. Run them with `iphone eval tasks --set hard` (or `iphone eval verify <id> <run_dir> --set hard`). They are a separate ruler: task loading is not recursive, so they never mix into the top-level numbers. Search results change daily, so those tasks only check that the query was typed and the result page reached; adapt the search terms, and the tasks that name an app you do not have, to your own phone.
 
 No raw runs, OCR captures, private notes or historical performance datasets are shipped.
 

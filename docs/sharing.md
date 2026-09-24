@@ -38,7 +38,11 @@ Screenshots and recordings may reveal notifications, account names, addresses, c
 
 The app profile and skill have different jobs. “This is Settings” belongs in app knowledge. “Read the iOS version and check the row label” belongs in a skill.
 
-The repository includes a [draft app profile](../examples/shared-skill/knowledge/apps/settings/APP.md) and [draft skill](../examples/shared-skill/skills/read-ios-version/SKILL.md). They live under `examples/`, so they are not installed into the active shared knowledge layer.
+The shared layer ships knowledge for thirteen Apple system apps under `knowledge/apps/`. Read one before writing your own: they describe how an app behaves (which controls OCR cannot read, which page an app resumes on, which actions are irreversible), not what is on any particular phone.
+
+App IDs are canonical English slugs. A pack declares every name it answers to — Chinese display name, English display name, and the pinyin ID used before this convention — in its frontmatter `aliases:`, so the same knowledge applies on a phone in either language. Adding a language means adding a line there, not changing code. Two packs claiming the same alias is an error, not a coin flip.
+
+The repository also includes a [draft app profile](../examples/shared-skill/knowledge/apps/settings/APP.md) and [draft skill](../examples/shared-skill/skills/read-ios-version/SKILL.md). They live under `examples/`, so they are not installed into the active shared knowledge layer.
 
 ## Export something you have learned
 

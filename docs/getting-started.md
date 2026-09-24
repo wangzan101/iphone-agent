@@ -139,6 +139,7 @@ Once you have something worth sharing, follow [the sharing checklist](sharing.md
 | `iphone` command not found | Activate this checkout's virtual environment and confirm the editable install completed. |
 | Mirror missing, paused or disconnected | Open iPhone Mirroring manually and restore the connection before retrying. |
 | Capture or input permissions fail | Follow `iphone doctor`; verify which host application needs permission and restart it if needed. |
+| A task ends immediately with `mirror_hidden` | Another window is covering the mirror completely. Move it so a sliver shows: taps and typing work in the background, but scrolling and home-screen page flips (used to open apps) only reach the topmost window under the pointer. `iphone doctor` reports the same check. |
 | Configuration permissions rejected | Run `chmod 600 .iphone/config.toml` on the intended workspace's config. |
 | API authentication or model error | Recheck endpoint, model ID and API access locally; do not post the key. |
 | Settings disappear between commands | Check the current directory and `IPHONE_WORKSPACE`. |

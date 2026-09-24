@@ -156,9 +156,9 @@ Our vision is a revisable model of the device: where apps are, what screens mean
 | Layer | Current state |
 |---|---|
 | Home-screen layout | Implemented: schema, grid inference, persistence and scanning. |
-| Layout-assisted app opening | Implemented: the home screen is tried first, identity is verified, and it falls back when the layout is wrong. |
-| Screen knowledge | Implemented: screens named by a vision label, rebuildable from stored runs, with wrong-merge and wrong-owner merge gates. |
-| Location and route hints | Implemented: "where you are" and "routes that worked from here", marked as reference rather than instruction. |
+| Layout-assisted app opening | Implemented: the home screen is tried first, identity is verified, it falls back when the layout is wrong, and the result says which screen it landed on. |
+| Screen knowledge | Implemented: screens named by a vision label, with a recorded level (home / top / inner), rebuildable from stored runs, with wrong-merge and wrong-owner merge gates. |
+| Location and route hints | Implemented: "where you are", "routes that worked from here" and "screens you have been to", marked as reference rather than instruction. |
 | Cross-task memory and skills | Implemented separately; broader integration is evolving. |
 | Broad compatibility and robust stale-state handling | Active validation and development work. |
 
@@ -207,6 +207,8 @@ iphone skill export <app-id> ./skill-export
 
 Replace `<app-id>` with an ID shown by the list. Export requires an app in your personal layer; a fresh workspace may have none. It removes selected provenance fields, but the resulting text and files still need review before sharing.
 
+The shared layer now ships knowledge for thirteen Apple system apps (settings, weather, notes, reminders, calendar, clock, photos, calculator, health, maps, files, app-store, shortcuts). App IDs are canonical English slugs, and each pack lists the names it answers to in its frontmatter `aliases:`, so the same knowledge applies whether your phone shows 设置 or Settings. To support another language, add that display name to the pack's `aliases:` — no code change. A workspace created before this release keeps its old pinyin directories; `iphone skill migrate-ids` shows what would move and `--apply` moves it.
+
 Start from [a small example skill](examples/shared-skill/skills/read-ios-version/SKILL.md), then follow [the sharing guide](docs/sharing.md). The example is a draft, not a validated app pack. Community distribution and review conventions are still growing.
 
 ## Models: bring your own
@@ -232,7 +234,7 @@ Configure from the web Settings page or `.iphone/config.toml`. See [setup](docs/
 
 The harness is an explicit task loop. The driver handles capture and input; perception turns pixels into usable observations; memory and skills carry context across runs; the twin layer begins to model the device.
 
-This export passes **1,784 automated tests** in an independent macOS/Python 3.13 environment. These are regression tests, not a real-device task-success benchmark. See [evaluation](docs/evaluation.md) and [architecture](docs/architecture.md).
+This export passes **2,046 automated tests** in an independent macOS/Python 3.13 environment. These are regression tests, not a real-device task-success benchmark. See [evaluation](docs/evaluation.md) and [architecture](docs/architecture.md).
 
 ## Build with us
 

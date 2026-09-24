@@ -15,9 +15,11 @@ iphone twin show    # print the stored layout
 
 `open_app` tries the home screen first: if the layout says which page an app sits on, it goes there directly instead of starting from search. When the layout is empty, stale or wrong, it falls back, and it verifies that the screen it landed on really is the app it asked for before reporting success.
 
+Opening an app resumes wherever it was left, so a successful open does not mean you are on the app's first page. The result now reports its landing — which screen, and whether that screen is the app's home page — and says so in plain words rather than leaving the model to find out.
+
 ## App layer: screens
 
-Each screen the agent visits can become a small file under an app: a name, the anchors that identify it, and the transitions observed out of it. A screen is named by a vision label — the semantic judgement of "what is this screen" belongs to whoever is looking at the picture, not to a threshold in the code. Without a label, a screen is not recognised; the code only checks a claimed identity against anchors it already stored.
+Each screen the agent visits can become a small file under an app: a name, the anchors that identify it, and the transitions observed out of it. A screen is named by a vision label — the semantic judgement of "what is this screen" belongs to whoever is looking at the picture, not to a threshold in the code. The label also states the screen's **level**: `home` (the page a cold start shows), `top` (another top-level tab) or `inner` (reached from somewhere else). Levels are stored as a vote count, so one misread cannot flip a screen's identity, and a tie reports nothing rather than guessing. When a popup, permission prompt or login sheet covers the page the level is left empty — the page underneath has not been seen. Without a label, a screen is not recognised; the code only checks a claimed identity against anchors it already stored.
 
 This record is built by replaying finished run records, so it can be rebuilt from scratch at any time, and rebuilding twice produces byte-identical files.
 
@@ -29,9 +31,11 @@ iphone twin bench     # merge gates: wrong-merge and wrong-owner must both be ze
 
 During a task, the same replay logic runs in memory so the twin grows live; only the post-run pass writes to disk.
 
-## Location and route hints
+## Location, route and map hints
 
-When the agent recognises the current screen, it can put two short sections into the model's context: **where you are** and **routes that worked from here**. Both carry an explicit trust boundary in the text — this came from earlier runs, it is reference and not instruction, it may be stale or wrong, and the current screen wins any disagreement.
+When the agent recognises the current screen, it can put short sections into the model's context: **where you are**, **routes that worked from here**, and **screens you have been to**. All of them carry an explicit trust boundary in the text — this came from earlier runs, it is reference and not instruction, it may be stale or wrong, and the current screen wins any disagreement.
+
+The route hint only fires when the task names a destination literally, which most tasks do not: a task that asks for the iOS version does not say "About". Rather than loosening the match — that would be the code guessing at meaning — the third section hands over the app's map: the screens already visited, how often, and how to walk to each from here, with unreachable ones listed as such instead of hidden. Choosing a destination is the model's job. When the route hint does fire it wins, so the same thing is never said twice, and the map section is capped so it cannot crowd out the element list.
 
 ## Merge gates
 
