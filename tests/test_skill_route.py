@@ -50,8 +50,20 @@ def test_resolve_scenario_decides_apps_and_ignores_model_apps():
     r = R.parse_route(reply("daily-expense", ["settings"]), cat)
     scen, expand, scope = R.resolve(r, cat)
     assert scen.name == "daily-expense"
-    assert [a.name for a in expand] == ["jizhangben"], "alipay 不在 catalog 里，只展开存在且 verified 的"
+    assert [a.name for a in expand] == ["jizhangben"], "alipay 不在 catalog 里；draft-app 存在但没内容，也不展开"
     assert scope == ["alipay", "jizhangben"]
+
+
+def test_resolve_expands_a_draft_app_that_has_content():
+    """2026-09-17：写了内容的草稿 App 也该展开——status 不再是「能不能读」的门。"""
+    cat = catalog()
+    cat.apps["draft-app"] = M.AppProfile("draft-app", "草稿", "草稿", "write", "draft", "2026-09-08", "有正文了")
+    cat.scenarios["daily-expense"] = M.Scenario(
+        "daily-expense", "记今天的账", ("draft-app", "jizhangben"), "write", "manual", "…")
+    r = R.parse_route(reply("daily-expense", []), cat)
+    scen, expand, scope = R.resolve(r, cat)
+    assert scen.name == "daily-expense"
+    assert {a.name for a in expand} == {"draft-app", "jizhangben"}
 
 
 def test_resolve_apps_only_and_nothing():

@@ -25,6 +25,10 @@ MODEL_TIMEOUT_S = 120
 OP_TIMEOUT_S = 10
 NO_PROGRESS_WARN = 3
 NO_PROGRESS_STOP = 6
+# 连续几步「做了、画面也变了，但没人核实成没成」就让程序兜底看一次全屏（spec 2026-09-18 C2）。
+# ⚠ 和 NO_PROGRESS_* 是两个计数：没核实的一步既不算进展也不算打转。只有一个计数的话，
+#   连续十步没核实会让 no_progress 原地不动，STOP 永远等不到 —— 熔断就被拆了。
+UNVERIFIED_WARN = 3
 # 连续这么多次点击完全没反应，就走恢复阶梯（harness/recovery.py），而不是告诉模型「可能没点中」。
 # 取 3：一次可能是点空了，两次可能是运气，三次连画面都不动就不是模型的事了。
 DEAD_TAPS_ALERT = 3
@@ -278,6 +282,34 @@ KNOWLEDGE_DIR = _Path(".iphone/knowledge")
 SKILLS_DIR_SHARED = _Path("skills")          # skills/<skill>/SKILL.md [+ procedure.json]
 SKILLS_DIR = _Path(".iphone/skills")
 SKILL_INDEX_MAX_LINES = 60                   # 注入索引的行数上限，同 MEMORY.md「只加载前 N 行」的形状
+
+# ---- 剧本工具的总开关（IPHONE_SKILL_TOOLS）----
+# ⚠ 2026-09-17：真机三次尝试全部以 expect_mismatch 收场 —— 每次白费一步、给那条剧本记一次失败，
+#   两次失败之后剧本转 stale（PROC_STALE_STREAK）。也就是说，现在把剧本端给模型，
+#   不是「有时省几步」，是**稳定地浪费一步再把自己判死**。在指纹重建、严格匹配恢复、
+#   离线自检这三件事做完之前，这套机制不可信，所以默认不给模型。
+#   ⚠ 关的只是「端上桌」这一半：草稿照旧从成功的运行里提取（extract_from_run 不看这个开关）——
+#   提取是免费的，而且它是将来重建指纹的原料，停了就等于把学习也停了。
+SKILL_TOOLS_VALUES = ("on", "off")
+SKILL_TOOLS_DEFAULT = "off"
+
+
+def check_skill_tools(value: str) -> str:
+    """剧本工具开关的**唯一**合法性判据（CLAUDE.md §7 一个规则一个入口）。
+    env 解析（skill_tools_mode）和直接构造 RunConfig 都走这里，不各写一遍。"""
+    if value not in SKILL_TOOLS_VALUES:
+        raise ValueError(f"IPHONE_SKILL_TOOLS={value!r} 不认识：可选 on / off")
+    return value
+
+
+def skill_tools_mode(raw: str | None = None) -> str:
+    """IPHONE_SKILL_TOOLS 的唯一解析入口，形状同 screen_parse_mode：raw=None 时在**调用时**读 env。
+    唯一的调用方是 RunConfig.from_env。空 / 未设置 → SKILL_TOOLS_DEFAULT；
+    其他值报错并写明可选值 —— 不静默回退，写错了要让人当场知道。"""
+    v = (os.environ.get("IPHONE_SKILL_TOOLS", "") if raw is None else raw).strip().lower()
+    return check_skill_tools(v or SKILL_TOOLS_DEFAULT)
+
+
 PROC_TOOLS_MAX = 15                          # 路由未命中时，全库合格剧本不超过这么多才全放进工具列表
 PROC_MAX_ACTIONS = 12                        # 一条剧本内部动作数上限（含 find 的滚动）：一次调用不能做太多事
 PROC_STALE_STREAK = 2                        # 连续这么多次 expect 对不上就转 stale；与 SCROLL_END_CONFIRMATIONS 同形

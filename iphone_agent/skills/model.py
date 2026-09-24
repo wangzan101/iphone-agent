@@ -6,8 +6,9 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 
-from iphone_agent import config
-from iphone_agent.memory.screenmap import slugify
+from iphone_agent import config, fingerprint
+from iphone_agent.appids import slugify
+from iphone_agent.riskwords import level_for_texts
 from iphone_agent.skills import frontmatter
 
 RISKS = ("read", "write", "irreversible")
@@ -22,6 +23,14 @@ STEP_DOS = ("open_app", "tap", "scroll_until", "type", "read")
 HOWS = ("text", "icon_above", "row_right", "row_left")
 DIRECTIONS = ("up", "down", "left", "right")
 EXPECT_SOURCES = ("single_run", "intersection")
+# 这一步当年在源运行里**做成了什么**。证据，不是执行参数：不进 hash，不改变怎么执行。
+# navigated 换了一屏；state_changed 整屏没换、只有点击处变了（开关、勾选）；unknown 判不出来。
+# 缺这一栏（老文件）等于「没记录过」，风险照 unknown 算 —— 见 procedure_risk。
+EFFECTS = ("navigated", "state_changed", "unknown")
+NAVIGATED = "navigated"
+# 只挪动位置、不留下痕迹的步骤。tap 另判（要看目标文字和当年的效果）。
+NAV_DOS = ("open_app", "scroll_until", "read")
+_LEVEL_RISK = {"read": "read", "write": "write", "never": "irreversible"}
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 _NAME_FORBIDDEN = ("/", "\\", "\0")
 
@@ -57,6 +66,17 @@ def _str(meta: dict, key: str, what: str, required: bool = True) -> str:
     return v
 
 
+def _str_list(meta: dict, key: str, what: str) -> tuple[str, ...]:
+    """JSON 数组字段（frontmatter 里写成 `aliases: ["设置", "Settings"]`）。
+    缺省是空；写错了**拒绝**，不规整（同文件其余校验的理由）。"""
+    v = meta.get(key)
+    if v is None or v == "":
+        return ()
+    if not isinstance(v, list) or any(not isinstance(x, str) or not x.strip() for x in v):
+        raise SkillError("invalid_field", f"{what} 的 {key} 必须是非空字符串的数组，收到 {v!r}")
+    return tuple(x.strip() for x in v)
+
+
 # ---- App ----
 @dataclass(frozen=True)
 class AppProfile:
@@ -71,6 +91,18 @@ class AppProfile:
     updated: str
     body: str = ""
     description: str = ""       # 一句话，进索引给路由看
+    # 这个 App 的其它叫法：中文显示名、英文显示名、2026-09-17 之前用过的旧拼音 id。
+    # **别名只有这一处**（CLAUDE.md §7）——`appids.AliasIndex` 就是从这里建索引的。
+    # 要支持一种新语言，往这里加它在那种语言下的显示名，不改代码。
+    aliases: tuple[str, ...] = ()
+
+
+def app_visible(app: AppProfile) -> bool:
+    """App 对模型可见：写了实际内容——非空正文或非空 description，不问 status（2026-09-17 起）。
+    `status` 只管「人是否确认过声明的 risk」，跟能不能进索引是两件事（见 store.Catalog.visible_apps）。
+    自动切出的空壳（extract.ensure_app：body="" 且没有 description）永远不可见，防止索引被
+    「没人写过一个字」的占位 App 灌满。"""
+    return bool(app.body.strip()) or bool(app.description.strip())
 
 
 def app_from_markdown(text: str, dirname: str) -> AppProfile:
@@ -88,6 +120,7 @@ def app_from_markdown(text: str, dirname: str) -> AppProfile:
         updated=_str(meta, "updated", "APP.md"),
         body=body,
         description=_str(meta, "description", "APP.md", required=False),
+        aliases=_str_list(meta, "aliases", "APP.md"),
     )
 
 
@@ -96,6 +129,8 @@ def app_to_markdown(app: AppProfile) -> str:
             "risk": app.risk, "status": app.status, "updated": app.updated}
     if app.description:
         meta["description"] = app.description
+    if app.aliases:
+        meta["aliases"] = list(app.aliases)
     return frontmatter.dump(meta, app.body)
 
 
@@ -111,6 +146,7 @@ class Step:
     text: str | None = None
     row: str | None = None
     as_: str | None = None
+    effect: str | None = None       # 源运行里这一步的效果，见 EFFECTS
 
     def to_json(self) -> dict:
         d: dict = {"do": self.do}
@@ -128,6 +164,8 @@ class Step:
             d["row"] = self.row
         if self.as_ is not None:
             d["as"] = self.as_
+        if self.effect is not None:
+            d["effect"] = self.effect
         if self.do != "read":
             d["expect"] = list(self.expect)
         return d
@@ -146,6 +184,9 @@ class Step:
         text = d.get("text")
         row = d.get("row")
         as_ = d.get("as")
+        effect = d.get("effect")
+        if effect is not None:
+            _enum(effect, EFFECTS, f"{what} 的 effect")
         if do in ("open_app", "tap", "scroll_until") and not (isinstance(target, str) and target.strip()):
             raise SkillError("invalid_step", f"{what}（{do}）需要非空的 target")
         if do == "tap":
@@ -172,7 +213,7 @@ class Step:
                 raise SkillError("invalid_step", f"{what} 的 expect 必须是非空字符串数组（可为空数组）")
         return Step(do=do, target=target, how=how if do == "tap" else "text", find=find,
                     expect=tuple(expect) if do != "read" else (), direction=direction,
-                    text=text, row=row, as_=as_)
+                    text=text, row=row, as_=as_, effect=effect)
 
 
 @dataclass
@@ -215,6 +256,20 @@ class Procedure:
         return found
 
 
+def weak_of(steps: list[Step]) -> list[int]:
+    """指纹弱的步骤号（1 起）：过滤之后锚点不足 WEAK_EXPECT 个，这一步说明不了「到了该到的屏」。
+    提取、合并、CLI 共用这一个判据（CLAUDE.md §7）。read 步没有 expect，不参与。"""
+    return [k for k, s in enumerate(steps, start=1) if s.do != "read" and fingerprint.is_weak(s.expect)]
+
+
+def weak_steps(p: Procedure) -> list[int]:
+    """给人看的「指纹弱」：算出来的 ∪ 文件里记着的。
+    ⚠ 2026-09-16：老文件的 expect 没过过滤（状态栏乱码、视觉图标名都在里面），条数是虚高的 ——
+      光按条数算会把一条其实只剩 2 个真锚点的步骤说成不弱。文件里记着的那一份照旧算数，
+      重新提取一次之后写回的就是算出来的那一份。"""
+    return sorted(set(weak_of(p.steps)) | set(p.weak_steps))
+
+
 def step_hash(steps: list[Step]) -> str:
     """只看会影响执行的字段；expect / row / as 不参与，改指纹不该变成另一条剧本。"""
     canon = []
@@ -227,6 +282,54 @@ def step_hash(steps: list[Step]) -> str:
         canon.append(d)
     blob = json.dumps(canon, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def _step_risk(s: Step) -> str:
+    """一步做了什么。判不出来的一律 write —— 错判成 write 只是多一次人工，错判成 read 是事故。"""
+    if s.do == "tap":
+        r = _LEVEL_RISK[level_for_texts([s.target or ""])[0]]
+        if r != "read":
+            return r                            # 危险词命中：至少 write，NEVER 那档仍是 irreversible
+        # 文字看着无害，还要问当年它做成了什么：换屏才算「只是走路」，
+        # 开关翻转（state_changed）和判不出来的（unknown / 老文件没这一栏）都按写算。
+        return "read" if s.effect == NAVIGATED else "write"
+    if s.do in NAV_DOS:
+        return "read"
+    return "write"                              # type，以及将来加进 STEP_DOS 的任何东西
+
+
+def procedure_risk(steps: list[Step], app: AppProfile | None = None) -> str:
+    """**这条剧本自己做了什么**决定它的风险档。全项目只有这一个入口。
+
+    ⚠ 2026-09-16 真机死锁：原来「草稿的 risk 取 App 的 risk，App 是 draft 就取 write」
+      （spec §3.2）。自动切出来的 App 永远是 draft，于是 15 条提取出来的剧本全是
+      `draft write`；而自动验证要求 `risk == "read"`（extract.ingest_draft），
+      `approve` 又只改 status 不改 risk（store.approve_procedure）—— 「学到的剧本变成工具」
+      这条路一次都没通过。风险描述的是动作的副作用，不是 App 的身份，所以改成按步骤算。
+
+    App 的档只剩一个作用：**人批准过**（status=verified）的 App 声明了更严的档就按更严的算。
+    draft 的 App 那个 risk 是自动填的占位值，不是任何人的声明，不参与。
+    """
+    rank = RISK_RANK["read"]
+    for s in steps:
+        rank = max(rank, RISK_RANK[_step_risk(s)])
+    if app is not None and app.status == "verified":
+        rank = max(rank, RISK_RANK[app.risk])    # 只会更严，永不放松
+    return RISKS[rank]
+
+
+def is_callable(p: Procedure) -> bool:
+    """能不能进模型的工具列表：verified **且** read（spec §4.3，写类本期不自动执行）。
+    索引行、eligible_procedures、CLI 的「可批准」标记都问这一个函数。"""
+    return p.status == "verified" and p.risk == "read"
+
+
+def manual_only_note(p: Procedure) -> str | None:
+    """批准之后仍然不能自动调用时，这句话必须说出来 —— 否则人以为批准完就能用了。"""
+    if p.risk == "read":
+        return None
+    return (f"但它是写类剧本（risk={p.risk}），本期不进模型的工具列表："
+            f"只能在人在场时 `iphone skill run {p.app}/{p.name}` 手动跑。")
 
 
 def procedure_from_json(text: str, app: str) -> Procedure:

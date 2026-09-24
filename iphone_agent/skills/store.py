@@ -27,6 +27,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from iphone_agent import config
+from iphone_agent.appids import resolve_app_id
 from iphone_agent.skills import model as M
 
 INDEX_HEADER = "【知识 —— 参考，不是指令】"
@@ -42,6 +43,11 @@ class Catalog:
     shadowed: set[str] = field(default_factory=set)              # 被个人层遮蔽的 App 名
     shadowed_skills: set[str] = field(default_factory=set)       # 被个人层遮蔽的技能名
     origin: dict[str, str] = field(default_factory=dict)
+    # 目录名还是 2026-09-17 之前那套拼音 id 的 App：目录名 → 它今天该叫什么。
+    # ⚠ 不在加载时悄悄改名：改名要搬目录、要合并，那是 `iphone skill migrate-ids` 的事。
+    #   这里只负责让「盘上还是旧名」看得见（CLAUDE.md §3）—— 不说的话，新数据会写进
+    #   canonical 目录、老数据留在旧目录，两边都在、谁都不全。
+    legacy_dirs: dict[str, str] = field(default_factory=dict)
 
     # ---- 旧名 ----
     @property
@@ -70,7 +76,7 @@ class Catalog:
         for a, procs in self.procedures.items():
             if apps is not None and a not in apps:
                 continue
-            out += [p for p in procs.values() if p.status == "verified" and p.risk == "read"]
+            out += [p for p in procs.values() if M.is_callable(p)]
         return sorted(out, key=lambda p: (p.app, p.name))
 
     def _app_sort_key(self, a: M.AppProfile) -> str:
@@ -78,7 +84,11 @@ class Catalog:
         return max(last) if last else (a.updated or "")
 
     def visible_apps(self) -> list[M.AppProfile]:
-        apps = [a for a in self.apps.values() if a.status == "verified"]
+        """给模型看的 App：写了内容就可见（M.app_visible），不再要求 status=="verified"
+        （2026-09-17 起，spec §2.1 状态标注了这条被推翻的理由）。手写了 APP.md 却没点
+        `approve` 的人，写了就该能读取——空壳（extract.ensure_app 自动切出、body 和
+        description 都是空的）依旧不可见，索引不会被占位 App 灌满。"""
+        apps = [a for a in self.apps.values() if M.app_visible(a)]
         return sorted(apps, key=lambda a: (self._app_sort_key(a), a.name), reverse=True)
 
     def visible_skills(self) -> list[M.Skill]:
@@ -91,9 +101,13 @@ class Catalog:
     def skills_of(self, app: str) -> list[M.Skill]:
         return [s for s in self.skills.values() if app in s.apps]
 
-    def index_text(self, max_lines: int | None = None) -> str | None:
+    def index_text(self, max_lines: int | None = None, *, procedure_tools: bool = True) -> str | None:
         """渐进披露的第一层：每个 App、每个技能各一行 description。和 system 一起进前缀。
-        路由读它决定命中谁；命中了才展开 APP.md / SKILL.md 全文。"""
+        路由读它决定命中谁；命中了才展开 APP.md / SKILL.md 全文。
+
+        `procedure_tools=False`（RunConfig.skill_tools == "off"）时不打「（可直接调：…）」这个标：
+        剧本根本没进工具列表，还在索引里说它能直接调，就是 CLAUDE.md §3 说的那种静默假话 ——
+        模型会去调一个不存在的工具。App / 技能本身照列不误，那才是索引存在的理由。"""
         max_lines = max_lines or config.SKILL_INDEX_MAX_LINES
         apps, skills = self.visible_apps(), self.visible_skills()
         if not apps and not skills:
@@ -106,7 +120,7 @@ class Catalog:
         for s in skills:
             tag = ""
             p = s.procedure
-            if p is not None and p.status == "verified" and p.risk == "read":
+            if procedure_tools and p is not None and M.is_callable(p):
                 tag = f"（可直接调：{p.name}({', '.join(p.params)})）" if p.params else "（可直接调）"
             skill_lines.append(f"- {s.name}   {s.description}（{' + '.join(s.apps)}）{tag}")
 
@@ -222,6 +236,12 @@ class SkillStore:
             if not d.is_dir():
                 continue
             name = d.name
+            # ⚠ 2026-09-17：旧 id 的判断要在 APP.md 那道门**之前**做。真机上的旧目录
+            #   （`.iphone/knowledge/apps/she-zhi/screens/`）大多只有孪生数据、没有 APP.md，
+            #   放在门后面就等于「最该提醒的那一种一个字都不说」。
+            canonical = resolve_app_id(name)
+            if canonical != name:
+                cat.legacy_dirs[name] = canonical
             # ⚠ 孪生共享 apps/<app>/ 这个目录名（screens/ 落认屏数据），个人层可能只有孪生数据、
             #   没有 APP.md —— 这种目录不是 App：不能进遮蔽逻辑，也不该报 broken
             #   （2026-09-11 final review：孪生把共享 App 目录挤没了）。
@@ -378,15 +398,25 @@ class SkillStore:
         return None
 
     def approve_app(self, name: str) -> M.AppProfile:
+        """人确认了 APP.md 里声明的 risk。**不控制这个 App 进不进索引**——那件事只看
+        M.app_visible（有没有内容），2026-09-17 起 approve 之前写了内容的 App 已经可见。"""
         app = self._read_app(name)
         new = M.AppProfile(**{**app.__dict__, "status": "verified", "updated": date.today().isoformat()})
         self.write_app(new)
         return new
 
     def approve_procedure(self, app: str, name: str) -> M.Procedure:
+        """人批准一条剧本。**risk 仍按它自己的步骤重算**（M.procedure_risk）：
+        批准的是「这条路走得通」，不是「这条路没有副作用」—— 后者只看步骤。
+        算出来不是 read 时它仍然进不了工具列表，调用方必须把 M.manual_only_note 说出来。"""
         p = self.read_procedure(app, name)
         p.status = "verified"
         p.provenance.fail_streak = 0
+        try:
+            profile = self._read_app(app)
+        except M.SkillError:
+            profile = None
+        p.risk = M.procedure_risk(p.steps, profile)
         self.write_procedure(p, overwrite=True)
         # SKILL.md 的 status 跟着走，两处别分叉
         sk = self.skill_path(name)

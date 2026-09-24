@@ -145,9 +145,12 @@ def test_personal_scenario_shadowing_shared_is_reported(roots):
     assert "daily-report" in cat.shadowed_scenarios
 
 
-def test_index_lists_only_verified_apps_eligible_procedures_and_manual_scenarios(roots):
+def test_index_lists_content_bearing_apps_eligible_procedures_and_manual_scenarios(roots):
+    """2026-09-17：App 进不进索引看有没有内容，不再看 status=="verified"——
+    wechat 是没人写过一个字的空壳（body 和 description 都空），依旧不进索引；
+    draft-one / proposed-one 不受影响，剧本能不能自动调、场景给不给模型看走的是各自的判据。"""
     roots.write_app(app())
-    roots.write_app(app(name="wechat", status="draft"))
+    roots.write_app(app(name="wechat", status="draft", body=""))
     roots.write_procedure(proc())
     roots.write_procedure(proc(name="draft-one", status="draft"))
     roots.write_procedure(proc(name="write-one", risk="write"))
@@ -161,6 +164,22 @@ def test_index_lists_only_verified_apps_eligible_procedures_and_manual_scenarios
     assert "- write-one   读 iOS 版本（settings）\n" in text, "写类剧本不能自动执行，但技能本身还是给模型看"
     assert "- daily-expense   记账（alipay + jizhangben）" in text
     assert text.endswith("以当前屏幕为准。")
+
+
+def test_index_includes_a_draft_app_that_has_written_content(roots):
+    """人写了 APP.md、还没点 approve：draft，但有正文——写了就该能读取，这是这次改动要修的问题。"""
+    roots.write_app(app(name="weather", status="draft", body="打开后停在上次查过的城市。"))
+    text = roots.load().index_text()
+    assert "- weather 设置 ✓   打开后停在上次查过的城市。" in text
+
+
+def test_visible_apps_excludes_an_empty_stub_even_when_verified(roots):
+    """auto-created 的空壳（extract.ensure_app：body="" 且没有 description）一个字都没有，
+    verified 也救不了——批准的是 risk，不是内容；没内容进索引只会是一行空话。"""
+    roots.write_app(app(status="verified", body=""))
+    cat = roots.load()
+    assert cat.apps["settings"].status == "verified"
+    assert cat.visible_apps() == [] and cat.index_text() is None
 
 
 def test_index_shows_params_of_procedures(roots):

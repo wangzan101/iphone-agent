@@ -38,6 +38,8 @@ class FakeDevice:
         self.rect = frames[0][0].window_rect
         self.released = False
         self.raise_on = {}
+        self.exposed = True              # 镜像露没露出来（run_task 开跑前查一次）
+        self.exposure_checks = 0
 
     def _next(self):
         f = self._frames[min(self._i, len(self._frames) - 1)]
@@ -57,6 +59,12 @@ class FakeDevice:
     def window_rect(self):
         return self.rect
 
+    def mirror_exposed(self):
+        self.exposure_checks += 1
+        if "mirror_exposed" in self.raise_on:
+            raise self.raise_on["mirror_exposed"]
+        return self.exposed
+
     def ensure_frame_valid(self, frame):
         if not self.rect.same_as(frame.window_rect):
             from iphone_agent.driver.device import WindowMoved
@@ -70,7 +78,9 @@ class FakeDevice:
     def tap(self, x, y): self._act("tap", x, y)
     def scroll(self, d, a): self._act("scroll", d, a)
     def swipe(self, k): self._act("swipe", k)
-    def type(self, t): self._act("type", t)
+    def type(self, t):
+        self._act("type", t)
+        return getattr(self, "type_via", "keystrokes")     # 真设备返回 'keystrokes' / 'shifted' / 'paste'（device.py:246）
     def key(self, n): self._act("key", n)
     def toggle_ime(self): self._act("toggle_ime")
     def backspace(self, n): self._act("backspace", n)

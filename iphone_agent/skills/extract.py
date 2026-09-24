@@ -12,6 +12,8 @@ from datetime import date
 from pathlib import Path
 
 from iphone_agent import config
+from iphone_agent import fingerprint as F
+from iphone_agent.appids import resolve_app_id
 from iphone_agent.memory.screenmap import (
     SYSTEM,
     UNKNOWN,
@@ -29,7 +31,7 @@ SKIP = {"observe", "wait", "recall", "recall_runs", "use_skill"}
 # 目前两边一致；那边加/删元动作时记得回来同步，否则这道「任一动作失败就整条不提」
 # 的闸门会悄悄漏掉新的元动作类型。
 EXPECT_WORDS = 8      # 每步 expect 最多取几个词
-WEAK_EXPECT = 4       # 交集少于这么多词的步骤标「指纹弱」，保留旧 expect
+WEAK_EXPECT = F.WEAK_EXPECT   # 锚点少于这么多的步骤标「指纹弱」；定义只有 fingerprint 一份
 
 
 def records_of(run_dir: Path) -> list[dict]:
@@ -52,16 +54,35 @@ def records_of(run_dir: Path) -> list[dict]:
 
 
 def _expect_of(record: dict | None) -> tuple[str, ...]:
+    """这一步走完之后「该到的屏」长什么样。
+
+    ⚠ 2026-09-16：进指纹的只能是**稳定证据**（fingerprint.stable_texts：OCR 那一路、状态栏以下）。
+      原来这里照单全收，于是状态栏时钟（`今 ④5`）和整屏解析给图标起的名字（`电池图标（绿色电池）`）
+      都进了指纹，而 on_demand 下它们一个都不会再出现 —— 那之前学到的剧本全废在第一步。
+    """
     if not record:
         return ()
+    o = record.get("observation") or {}
     out: list[str] = []
-    for e in (record.get("observation") or {}).get("elements") or []:
-        t = (e.get("text") or "").strip()
-        if t and label_like(t) and t not in out:
+    for t in F.stable_texts(o.get("elements"), int(o.get("height_px") or 0)):
+        if label_like(t):
             out.append(t)
         if len(out) >= EXPECT_WORDS:
             break
     return tuple(out)
+
+
+def _tap_effect(res: dict) -> str:
+    """这次 tap 在源运行里**做成了什么**（M.EFFECTS）。只认肯定信号，其余一律 unknown。
+
+    - `local_mad` 在结果里 = 整屏判据说没变、只有点击处那一小块变了 —— 开关翻转那一类
+      （executor._after 的 ⚠ 注释：开关翻两次，汉明和文本差都是 0，局部 MAD 17.0），不是导航；
+    - 有新文字出现（`appeared`，transition 的集合差，一个入口）才算换了一屏。
+    没有 appeared 的成功点击（纯图标页、OCR 没读出新字、看图复核翻过来的 changed）都判不了，
+    判不了就是 unknown，风险按写算。孪生那份 outcome_of 更准，但它要认屏结果，提取这里没有。"""
+    if "local_mad" in res:
+        return "state_changed"
+    return M.NAVIGATED if res.get("appeared") else "unknown"
 
 
 def _id_text(record: dict, eid) -> str | None:
@@ -139,7 +160,7 @@ def candidate_steps(records: list[dict]) -> tuple[str, list[M.Step]] | None:
             if text is None:
                 return None          # 坐标点击还原不出文字，不进长期知识
             steps.append(M.Step(do="tap", target=text, how=args.get("target") or "text",
-                                find=pending_find, expect=expect))
+                                find=pending_find, expect=expect, effect=_tap_effect(res)))
             pending_find = None
             continue
         if pending_find:
@@ -164,11 +185,6 @@ def candidate_steps(records: list[dict]) -> tuple[str, list[M.Step]] | None:
     return app, steps
 
 
-def _risk_for(catalog: Catalog, app: str) -> str:
-    a = catalog.app(app)
-    return a.risk if a is not None and a.status == "verified" else "write"
-
-
 def draft_procedure(run_dir: Path, catalog: Catalog, records: list[dict] | None = None) -> M.Procedure | None:
     try:
         meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
@@ -184,10 +200,13 @@ def draft_procedure(run_dir: Path, catalog: Catalog, records: list[dict] | None 
     macos = ((meta.get("config") or {}).get("platform") or {}).get("macos")
     return M.Procedure(
         name=M.auto_name(task or "proc", h), app=app, description=task or "（无任务文本）",
-        params={}, returns=[], risk=_risk_for(catalog, app), status="draft", expect_source="single_run",
+        params={}, returns=[], risk=M.procedure_risk(steps, catalog.app(app)),
+        status="draft", expect_source="single_run",
         provenance=M.Provenance(runs=[run_dir.name], verified_count=1, last_ok=date.today().isoformat(),
                                 macos=macos),
-        steps=steps)
+        # ⚠ 2026-09-16：指纹弱原来只在合并时才标 —— 单次运行提出来的草稿哪怕一步只剩两个锚点，
+        #   盘上也写着「不弱」，CLI 跟着说假话。过滤之后锚点够不够，建的时候就知道。
+        steps=steps, weak_steps=M.weak_of(steps))
 
 
 def _one_line(s: str, fallback: str) -> str:
@@ -202,12 +221,20 @@ def _one_line(s: str, fallback: str) -> str:
 
 
 def ensure_app(store: SkillStore, catalog: Catalog, app_id: str, display: str) -> M.AppProfile:
+    """自动切出一个 App 的空壳。
+
+    ⚠ 2026-09-17：id 在这里再过一次 `resolve_app_id`。调用方给的可能是旧拼音 id
+    （老留档里记着 `she-zhi`），也可能是英文机上的显示名 —— 两边都得落到同一个 `settings`，
+    否则同一个 App 会在盘上切出两份知识，而且谁也不知道另一份在哪（appids.py 的模块注释）。
+    自动切出来的 App 把**当时那个显示名**记进 aliases：下次它以另一种叫法出现时认得回来。"""
+    app_id = resolve_app_id(app_id, catalog)
     a = catalog.app(app_id)
     if a is not None:
         return a
     display = _one_line(display, app_id)
+    aliases = (display,) if display and display != app_id else ()
     a = M.AppProfile(name=app_id, display=display, open=display, risk="write", status="draft",
-                     updated=date.today().isoformat(), body="")
+                     updated=date.today().isoformat(), body="", aliases=aliases)
     store.write_app(a)
     catalog.apps[app_id] = a
     catalog.procedures.setdefault(app_id, {})
@@ -215,22 +242,39 @@ def ensure_app(store: SkillStore, catalog: Catalog, app_id: str, display: str) -
     return a
 
 
+def _merge_effect(old: str | None, new: str | None) -> str | None:
+    """两次运行对同一步的效果记录。None = 这一栏根本没记过（2026-09-16 之前提的老草稿），
+    不是「记成了不导航」—— 所以拿新的来补。两边都记了又不一致时取更保守的那个：
+    只有两次都说 navigated 才算 navigated。"""
+    if old is None:
+        return new
+    if new is None or old == new:
+        return old
+    return "unknown" if M.NAVIGATED in (old, new) else old
+
+
 def _merge_expect(old: M.Procedure, new: M.Procedure) -> None:
-    weak: list[int] = []
+    """指纹取交集；顺带把新运行记下的效果合进老步骤（风险由调用方按合并后的步骤重算）。
+
+    ⚠ 2026-09-16：新那一份是过过滤的（只剩稳定 OCR 行），所以取交集**顺带把老文件里的
+      状态栏乱码和视觉图标名冲掉** —— 老剧本只要再被同一条路径提取一次，指纹就自愈了。
+      交集太少时保留旧 expect（那是仅有的一份），但这一步要标「指纹弱」。"""
+    weak: set[int] = set()
     merged: list[M.Step] = []
     for k, (o, n) in enumerate(zip(old.steps, new.steps, strict=True), start=1):
+        o = replace(o, effect=_merge_effect(o.effect, n.effect))
         if o.do == "read":
             merged.append(o)
             continue
         inter = tuple(w for w in o.expect if w in set(n.expect))
         if len(inter) < WEAK_EXPECT:
-            weak.append(k)
+            weak.add(k)              # 两次运行对不上这么多词：这一步的指纹本身就不可靠
             merged.append(o)
         else:
             merged.append(replace(o, expect=inter))
     old.steps = merged
-    old.weak_steps = weak
-    old.expect_source = "single_run" if weak else "intersection"
+    old.weak_steps = sorted(weak | set(M.weak_of(merged)))
+    old.expect_source = "single_run" if old.weak_steps else "intersection"
 
 
 def _queue_pending(store: SkillStore, draft: M.Procedure) -> str:
@@ -271,6 +315,9 @@ def ingest_draft(store: SkillStore, catalog: Catalog, draft: M.Procedure, run_id
     same.provenance.last_ok = date.today().isoformat()
     _merge_expect(same, draft)
     status = "merged"
+    if same.status == "draft":
+        # 草稿期间风险每次都按**当前这份步骤**重算（合并可能补上了效果记录）；verified 之后不再动。
+        same.risk = M.procedure_risk(same.steps, catalog.app(same.app))
     if same.status == "draft" and same.provenance.verified_count >= 2 and same.risk == "read":
         same.status = "verified"
         status = "verified"
@@ -321,12 +368,15 @@ def sync(store: SkillStore, runs_root: Path) -> dict:
             continue
         drafts.append({"app": draft.app, "name": draft.name,
                        "status": ingest_draft(store, catalog, draft, f.parent.name)})
-    # 草稿的风险跟着 App 走：人批准 App 之后，草稿可能因此够格自动 verified
+    # 草稿的风险每次 sync 都按**它自己的步骤**重算（M.procedure_risk），重算之后可能够格自动 verified。
+    # ⚠ 2026-09-16：重算是唯一的降档路径 —— 盘上写着 write 的老草稿只有在它自己的步骤
+    #   全都算得出 read 时才会变 read（老文件没有 effect 那一栏，算出来仍是 write，
+    #   要等同一条路径再被提取一次、把效果补进来）。verified 的不碰。
     for app_id, procs in list(catalog.procedures.items()):
         for p in list(procs.values()):
             if p.status != "draft":
                 continue
-            r = _risk_for(catalog, app_id)
+            r = M.procedure_risk(p.steps, catalog.app(app_id))
             changed = r != p.risk
             p.risk = r
             if p.provenance.verified_count >= 2 and r == "read":

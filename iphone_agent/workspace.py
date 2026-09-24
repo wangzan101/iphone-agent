@@ -92,9 +92,13 @@ class RunConfig:
     # 整屏解析模式（spec 2026-09-14 §8.4）。直接构造时取代码默认值、不读 env（计划 R4）：
     #   config.screen_parse_mode 只允许 from_env 一个调用方，模式只有一条来路。
     screen_parse: str = field(default_factory=lambda: policy.DEFAULT_MODE)
+    # 剧本（app__proc）要不要端给模型（config.SKILL_TOOLS_* 的注释写了为什么默认关）。
+    # 直接构造时取代码默认值、不读 env，理由同 screen_parse：env 只有 from_env 一条来路。
+    skill_tools: str = field(default_factory=lambda: config.SKILL_TOOLS_DEFAULT)
 
     def __post_init__(self) -> None:
         policy.check_mode(self.screen_parse)
+        config.check_skill_tools(self.skill_tools)
 
     def effective_timeout_s(self) -> float:
         """时限和步数是两个保险丝，得对得上量（docs/20 D8）。"""
@@ -114,5 +118,6 @@ class RunConfig:
             max_steps=config.MAX_STEPS,
             twin_hints=config.env_flag("IPHONE_TWIN_HINTS", config.TWIN_HINTS),
             screen_parse=config.screen_parse_mode(),
+            skill_tools=config.skill_tools_mode(),
         )
         return replace(base, **overrides) if overrides else base

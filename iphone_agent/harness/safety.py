@@ -29,36 +29,22 @@ UI-Venus-2 技术报告 Table 6（docs/28 §8.5），「良性指令 + 屏幕里
 
 ## 一个规则一个入口（CLAUDE.md §7）
 
-DANGER 原来在 eval/explore.py 里（自动探索时不点的词）。两处各写一份迟早只改一个，
-挪到这里，explore 改成 import。
+DANGER 原来在 eval/explore.py 里（自动探索时不点的词）。两处各写一份迟早只改一个。
+⚠ 2026-09-16 再挪一次：词表和「一组文字算哪一档」现在住 `iphone_agent/riskwords.py`，
+这里只是 import 回来（名字不变，safety.DANGER / safety.NEVER 照旧）。
+原因见那个文件的模块注释：剧本风险也要过同一份词表，而 skills/ 不许 import harness。
 """
 from __future__ import annotations
 
-import re
 import subprocess
 from dataclasses import dataclass
 
 from iphone_agent.perceive.elements import display_xy, elements_at
+from iphone_agent.riskwords import DANGER, LEVELS, NEVER, level_for_texts
 
-# 含这些字的元素**不自动点**：有人就问，没人就拒。自动探索（eval/explore.py）也用它决定不点什么。
-DANGER = re.compile(
-    r"发送|发布|删除|移除|清除|购买|支付|付款|订阅|提交|确认|拨打|呼叫|退出|注销|登出|"
-    r"卸载|重置|抹掉|格式化|转账|充值|提现|下单|结算|开通|升级|续费|"
-    r"send|post|delete|remove|buy|pay|purchase|subscribe|submit|confirm|call|"
-    r"sign out|log out|logout|uninstall|reset|erase|checkout|order|"
-    # 跳出 App 去系统设置的入口。2026-09-09 批跑：Chrome 里点了「前往"设置"」，
-    # 系统弹出「设为默认浏览器」的教程视频并推成画中画，此后 20 多个 App 的探索
-    # 全在那个浮窗的遮挡下跑 —— 16 个「打不开」，单独跑却都能开。
-    r"前往.{0,3}设置|打开.{0,3}设置|去.{0,3}设置|go to settings|open settings"
-    , re.I)
-
-# 含这些字的元素**谁说都不点**。钱、账户、整机数据 —— 做错了没有回头路。
-NEVER = re.compile(
-    r"转账|付款|支付|充值|提现|购买|下单|结算|抹掉|格式化|重置|注销|"
-    r"transfer|pay|purchase|buy|checkout|erase all|factory reset|reset|delete account"
-    , re.I)
-
-LEVELS = ("read", "write", "never")
+__all__ = ["DANGER", "NEVER", "LEVELS", "Decision", "TapTarget", "tap_target", "classify", "hint",
+           "HINTS", "ConfirmationRequest", "osascript_confirm", "osascript_handover",
+           "CONFIRM_TIMEOUT_S", "HANDOVER_TIMEOUT_S"]
 
 
 @dataclass(frozen=True)
@@ -126,11 +112,8 @@ def classify(action, obs) -> Decision:
     texts = tt.texts()
     if not texts:
         return Decision("read", "(x,y)" if tt.by == "coord" else "")
-    for level, rx in (("never", NEVER), ("write", DANGER)):
-        hit = next((t for t in texts if rx.search(t)), None)
-        if hit is not None:
-            return Decision(level, hit)
-    return Decision("read", " / ".join(texts))
+    level, hit = level_for_texts(texts)
+    return Decision(level, hit if hit is not None else " / ".join(texts))
 
 
 HINTS = {

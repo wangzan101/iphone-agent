@@ -58,6 +58,18 @@ def test_app_rejects_bad_enum_and_missing_field():
         m.app_from_markdown(APP_MD.replace("open: 设置\n", ""), "settings")
 
 
+def test_app_visible_follows_content_not_status():
+    """2026-09-17：可见性只看有没有内容，不看 status。"""
+    stub = m.AppProfile("x", "X", "X", "write", "draft", "2026-09-08", body="", description="")
+    assert not m.app_visible(stub), "extract.ensure_app 的空壳：body 和 description 都空"
+    draft_with_body = m.AppProfile("x", "X", "X", "write", "draft", "2026-09-08", body="有内容")
+    assert m.app_visible(draft_with_body)
+    draft_with_desc = m.AppProfile("x", "X", "X", "write", "draft", "2026-09-08", body="", description="一句话")
+    assert m.app_visible(draft_with_desc)
+    verified_stub = m.AppProfile("x", "X", "X", "write", "verified", "2026-09-08", body="", description="")
+    assert not m.app_visible(verified_stub), "verified 批的是 risk，不是内容；没内容照旧不可见"
+
+
 def test_procedure_roundtrip_and_tool_name():
     p = m.procedure_from_json(json.dumps(PROC), app="settings")
     assert p.tool_name == "settings__ios-version"

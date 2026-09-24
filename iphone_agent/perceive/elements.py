@@ -6,6 +6,7 @@ from PIL import Image
 
 from iphone_agent import config
 from iphone_agent.driver.geometry import Frame, Rect
+from iphone_agent.fingerprint import below_status_bar
 from iphone_agent.perceive.hashing import ahash, state_key
 from iphone_agent.perceive.marking import draw_marks
 from iphone_agent.perceive.ocr import RawBox, vision_box_to_pixels
@@ -188,7 +189,7 @@ def build_observation(frame: Frame, boxes: list[RawBox], observation_id: int,
     # ⚠ text_set 在下面要用，而它**只能装 OCR 的文字**：视觉模型每次措辞都可能不一样
     #   （'返回箭头' / '返回按钮' / '＜ 图标'），混进变化判定就是满屏假变化，
     #   而假变化会直接喂给熔断器（NO_PROGRESS_STOP）。这条线不能越。
-    ocr_texts = {e.text for e in ocr_els if e.center[1] > H * config.STATUS_BAR_CROP_RATIO}
+    ocr_texts = {e.text for e in ocr_els if below_status_bar(e.center[1], H)}
     merged = fuse(ocr_els, screen_items or [])
     elements: list[Element] = number_elements(merged, H)
     # 头部必须带图像尺寸：模型要用坐标点「OCR 看不见的图标」时，得知道坐标空间多大。
@@ -237,7 +238,8 @@ def build_observation(frame: Frame, boxes: list[RawBox], observation_id: int,
         elements_text="\n".join(lines),
         ahash=ahash(frame.image, crop_top_ratio=config.STATUS_BAR_CROP_RATIO),
         window_rect=frame.window_rect,
-        # ⚠ 变化判定用的文字集合必须和 aHash 一样裁掉状态栏。
+        # ⚠ 变化判定用的文字集合必须和 aHash 一样裁掉状态栏（判据只有 fingerprint.below_status_bar 一个入口；
+        #   剧本指纹也用它 —— 2026-09-16 那条「今 ④5」进了指纹的剧本，就是因为提取那边没裁）。
         #   原来 aHash 裁了、这里没裁 —— 同一条规矩两个入口只在一个入口执行，
         #   这个项目今晚已经栽了五次。时钟每分钟变一次就贡献 2 的文本差。
         #   注意只影响**判定**：模型看到的 elements_text 仍然是全部元素。

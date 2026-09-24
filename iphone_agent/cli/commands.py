@@ -350,7 +350,8 @@ def cmd_model(session, args) -> int:
 
 
 END_WORD = {"stopped": "你停下了它", "max_steps": "步数用完了", "timeout": "超时了",
-             "no_progress": "它绕不出来了", "interrupted": "被中断了"}
+             "no_progress": "它绕不出来了", "interrupted": "被中断了",
+             "mirror_hidden": "镜像被完全挡住了，没有开始"}
 
 
 def human_time(ms: float) -> str:
@@ -632,11 +633,34 @@ def _skill_list(store) -> int:
     """App（知识）/ 带剧本的技能 / 纯文字技能，一次性看完（spec §5 的「看得见」）。
     带剧本的技能挂在它 apps[0] 那个 App 下面显示，纯文字的平铺在后面。"""
     from iphone_agent.skills import model as M
+    from iphone_agent.workspace import RunConfig
     cat = store.load()
     print(f"App {len(cat.apps)} 个、技能 {len(cat.skills)} 个"
           + (f"、损坏 {len(cat.broken)} 个文件" if cat.broken else ""))
+    # ⚠ 2026-09-17：剧本工具默认关掉之后，下面那些 ✓ 会让人以为模型正在用它们。
+    #   把「现在到底给不给模型」明说一行，别让人对着一条永远不被调用的 ✓ 剧本猜。
+    #   值只问 RunConfig 这一个入口，不自己读 env。
+    if RunConfig.from_env().skill_tools == "on":
+        print("  剧本工具：开（IPHONE_SKILL_TOOLS=on）—— ✓ 且 risk=read 的剧本会进模型的工具列表")
+    else:
+        print("  剧本工具：关（默认）—— 下面的 ✓ 剧本不会进模型的工具列表，索引里也不提它们；"
+              "要打开设 IPHONE_SKILL_TOOLS=on")
+    # ⚠ 2026-09-17：目录名还是旧拼音 id 的 App。新数据会按规范 id 写进另一个目录，
+    #   老数据留在旧目录 —— 两边都在、哪边都不全，而且不说的话没人看得见（CLAUDE.md §3）。
+    if cat.legacy_dirs:
+        pairs = "、".join(f"{k} → {v}" for k, v in sorted(cat.legacy_dirs.items()))
+        print(f"  ⚠ 这些目录还是旧 App id：{pairs}。跑 iphone skill migrate-ids 看要怎么迁（默认只预演）")
     for a in sorted(cat.apps.values(), key=lambda a: a.name):
-        marks = ["✓" if a.status == "verified" else "草稿", a.risk]
+        # 「进不进索引」和「risk 有没有人确认过」是两件事（2026-09-17 起，spec §2.1）：
+        # 有内容就对模型可见，status 只管 risk 是否已确认——draft 但有内容的 App 要把
+        # 「模型已经看得到、风险还没人点头」这两层都说出来，不能只报一个「草稿」把人看漏。
+        if a.status == "verified":
+            status_mark = "✓"
+        elif M.app_visible(a):
+            status_mark = "草稿（对模型可见，risk 未确认）"
+        else:
+            status_mark = "草稿（空壳，不可见）"
+        marks = [status_mark, a.risk]
         if a.name in cat.shadowed:
             marks.append("遮蔽了结构层")
         print(f"  {a.name:<20} {a.display:<10} {' '.join(marks)}")
@@ -644,8 +668,15 @@ def _skill_list(store) -> int:
             st = {"verified": "✓", "draft": "草稿", "stale": "✗失效"}[p.status]
             extra = []
             if p.status == "draft" and p.provenance.verified_count >= 2:
-                extra.append("可批准")
-            if p.weak_steps:
+                # ⚠ 2026-09-16：这里原来只看走通次数。真机上 15 条剧本全是 write，
+                #   其中两条顶着「可批准」，而批准完照样进不了工具列表 —— 标记在撒谎。
+                #   标记只在「批准之后真的能用」时出现；不能用就说清卡在哪。
+                #   「批准之后能不能用」只问 M.manual_only_note 这一个入口。
+                extra.append("可批准" if M.manual_only_note(p) is None
+                             else f"走通够了，但 risk={p.risk}：批准也只能手动跑")
+            # 「指纹弱」问 M.weak_steps 这一个入口：老文件的 expect 没过过滤（状态栏乱码、
+            # 视觉图标名都在里面），光看文件里记着的那一栏会把弱的说成不弱。
+            if M.weak_steps(p):
                 extra.append("指纹弱")
             print(f"      {p.name:<28} {st} {p.risk} 走通{p.provenance.verified_count}次 {' '.join(extra)}")
     for s in sorted(cat.skills.values(), key=lambda s: s.name):
@@ -684,8 +715,10 @@ def _skill_show(store, ref: str) -> int:
 def _skill_approve(store, ref: str) -> int:
     app, proc = _skill_ref(ref)
     if proc is not None:
+        from iphone_agent.skills import model as M
         p = store.approve_procedure(app, proc)
-        print(f"{app}/{proc} → {p.status}")
+        note = M.manual_only_note(p)
+        print(f"{app}/{proc} → {p.status}" + (f"，{note}" if note else ""))
         return 0
     cat = store.load()
     if app in cat.scenarios:
@@ -694,7 +727,8 @@ def _skill_approve(store, ref: str) -> int:
         return 0
     if app in cat.apps:
         store.approve_app(app)
-        print(f"App {app} → verified（请确认 APP.md 里的 risk）")
+        print(f"App {app} → verified（确认了 APP.md 里声明的 risk；"
+              f"能不能进模型的索引只看有没有写内容，跟这一步无关）")
         return 0
     print(f"没有 {app}", file=sys.stderr)
     return 1
@@ -779,7 +813,7 @@ def cmd_skill(session, args) -> int:
     sub = args[0] if args else "list"
     usage = ("用法: iphone skill [list | show <app>[/<proc>] | approve <app>[/<proc>] | approve <scenario> | "
              "run <app>/<proc> [k=v …] | mv <app>/<proc> <new> | fork <app> | export <app> <dir> | "
-             "rm <app>/<proc>|<scenario> | sync]")
+             "rm <app>/<proc>|<scenario> | sync | migrate-ids [--apply] [--merge]]")
     try:
         if sub == "list":
             return _skill_list(store)
@@ -797,6 +831,8 @@ def cmd_skill(session, args) -> int:
             return _skill_rm(store, args[1])
         if sub == "sync":
             return _skill_sync(session, store)
+        if sub == "migrate-ids":
+            return _skill_migrate_ids(store, args[1:])
         if sub == "run" and len(args) >= 2:
             return _skill_run(session, store, args[1], args[2:])
     except M.SkillError as e:
@@ -804,6 +840,37 @@ def cmd_skill(session, args) -> int:
         return 1
     print(usage, file=sys.stderr)
     return 2
+
+
+def _skill_migrate_ids(store, flags: list[str]) -> int:
+    """旧拼音 App id → 规范 App id。
+
+    为什么挂在 `iphone skill` 而不是 `iphone twin`：要改名的是**知识/技能库的主键** ——
+    `knowledge/apps/<id>/`、SKILL.md 的 `apps:`、以及由它算出来的剧本工具名 `app__proc`，
+    这三样都归 SkillStore 管；`iphone twin` 那一层管的是设备（布局表、屏文件的重建）。
+    孪生的屏文件正好住在同一个 App 目录下，所以一起搬，但主语是知识库。
+    """
+    from iphone_agent import appmigrate
+    unknown = [f for f in flags if f not in ("--apply", "--merge")]
+    if unknown:
+        print(f"不认识的参数：{' '.join(unknown)}（只有 --apply 和 --merge）", file=sys.stderr)
+        return 2
+    p = appmigrate.plan(store.knowledge_personal / "apps", store.personal)
+    if "--apply" not in flags:
+        print(appmigrate.format_plan(p))
+        return 0
+    if not p.moves and not p.skills:
+        print(appmigrate.format_plan(p))
+        return 0
+    try:
+        r = appmigrate.apply(p, merge="--merge" in flags)
+    except appmigrate.MigrateRefused as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"迁完了：{r.moved} 个 App、{r.skills} 个技能，合并了 {r.merged_screens} 个屏。"
+          f"\n备份在 {r.backup}（确认没问题再自己删）。"
+          f"\n屏 id 已按新 App id 重算，下次 iphone twin rebuild 会长出同样的 id。")
+    return 0
 
 
 def cmd_twin(session, args) -> int:
@@ -878,7 +945,7 @@ def cmd_eval(session: Session, args: list[str]) -> int:
              "几秒，不调模型；--label-agree 另比两种标注（第一次要真调视觉）；"
              "--label-agree-limit N 把 label_agree 限到最多 N 帧（按 App 分层轮询，确定性）\n"
              "  diff <a> <b>     两次 bench 结果对比，列出翻转的样本\n"
-             "  tasks [--n 3] [--only <id>]  真机上每题跑 n 次再判「办成了没」，存 results/tasks-<ts>.json\n"
+             "  tasks [--n 3] [--only <id>] [--set <子目录>]  真机上每题跑 n 次再判「办成了没」，存 results/tasks-<ts>.json\n"
              "  tasks-diff <a> <b>  两次 tasks 结果逐题对比，列出翻转的题\n"
              "  verify <id> <run_dir>  离线：拿一次历史运行对着某道题判\n"
              "  curve [--reps 5] [--only <id>]  学习曲线：开孪生提示 vs 无位置提示，ABBA 交替，存 results/curve-<ts>.json\n"
@@ -959,7 +1026,19 @@ def cmd_eval(session: Session, args: list[str]) -> int:
             for line in V.diff(a, b):
                 print(line)
             return 0
-        tasks, errors = V.load_tasks(root / "tasks")
+        # --set <子目录>：跑 evalset/tasks/<子目录> 里的题（如 hard、vision），不混进日常顶层那几道。
+        task_dir = root / "tasks"
+        if "--set" in args:
+            i = args.index("--set")
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                print("--set 后面要跟 evalset/tasks 下的子目录名", file=sys.stderr)
+                return 2
+            task_dir = task_dir / args[i + 1]
+            del args[i:i + 2]
+            if not task_dir.is_dir():
+                print(f"没有这个题集：{task_dir}", file=sys.stderr)
+                return 2
+        tasks, errors = V.load_tasks(task_dir)
         for e in errors:
             print(f"⚠ 任务文件有问题，已跳过：{e}", file=sys.stderr)
         if what == "verify":
