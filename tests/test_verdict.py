@@ -118,3 +118,44 @@ def test_say_not_met_with_an_existing_hint_adds_nothing():
 def test_quiet_silences_unverified_but_not_missing():
     assert V.say(V.Verdict("unknown", "unverified"), "tap", {}, quiet=True) is None
     assert "没有核实" in V.say(V.Verdict("unknown", "missing"), "tap", {}, quiet=True)
+
+
+@pytest.mark.parametrize("landed,want", [
+    ({"name": "主页信息流", "level": "home"}, "打开后停在「主页信息流」，是这个 App 的首页。"),
+    ({"name": "书库", "level": "top"}, "打开后停在「书库」，是顶层标签页，不是首页。"),
+    ({"name": "关于本机", "level": "inner"},
+     "打开后停在「关于本机」，是从别的页点进来的内页，不是首页；任务要从首页开始的话先退回去。"),
+    ({"name": "书库", "level": None}, "打开后停在「书库」，看不出是不是首页。"),
+    ({"name": None, "level": None, "label": "failed"}, "打开后没看成停在哪一页。"),
+])
+def test_open_app_says_where_it_landed(landed, want):
+    """spec 打开App落点 §3.2：打开是「回到上次离开的那一屏」，开成了就说一句停在哪、是不是首页。"""
+    assert V.say(V.Verdict("met", "identity", seen="x"), "open_app", {"ok": True, "landed": landed}) == want
+
+
+def test_open_app_without_landed_stays_silent():
+    """老留档 / 没开成的结果没有 landed：照旧不说。"""
+    assert V.say(V.Verdict("met", "identity"), "open_app", {"ok": True}) is None
+
+
+@pytest.mark.parametrize("status", ["failed", "missing", "invalid"])
+def test_open_app_says_nothing_landed_when_the_label_really_failed(status):
+    """⚠ 2026-09-22（终审 M-3）：真看了、答坏了（failed/missing/invalid）照旧提醒「没看成」。"""
+    landed = {"name": None, "level": None, "label": status}
+    assert V.say(V.Verdict("met", "identity", seen="x"), "open_app",
+                 {"ok": True, "landed": landed}) == "打开后没看成停在哪一页。"
+
+
+def test_open_app_stays_silent_when_vision_was_deliberately_off():
+    """⚠ 2026-09-22（终审 M-3）：label == "off" 是压根没看图（on_demand 常态），不是「看了说不出来」——
+    「没做」不等于「做失败」（CLAUDE.md §3），这里不该让模型以为出了问题。"""
+    landed = {"name": None, "level": None, "label": "off"}
+    assert V.say(V.Verdict("met", "identity", seen="x"), "open_app", {"ok": True, "landed": landed}) is None
+
+
+def test_open_app_ignores_an_unhashable_level_instead_of_raising():
+    """⚠ 2026-09-22（终审 M-5）：手改过的留档可能把 level 写成一个列表；_LANDED 原来直接拿它当 key，
+    TypeError。只信 LEVELS 里的三个值，筛不过当 None 处理。"""
+    landed = {"name": "书库", "level": ["inner"]}
+    assert V.say(V.Verdict("met", "identity", seen="x"), "open_app",
+                 {"ok": True, "landed": landed}) == "打开后停在「书库」，看不出是不是首页。"

@@ -258,6 +258,19 @@ def spotlight_query(name: str) -> str:
     return "".join(lazy_pinyin(name))
 
 
+def landing(new) -> dict:
+    """打开之后停在哪一页（spec 打开App落点 §3.2）：直接读 _identity 已经补好的标注，不多一次看图。
+
+    没有标注时把标注状态（failed / missing / invalid / off）原样带上 —— 「没看成」和「看了说不出」
+    要分得开（CLAUDE.md §3）。
+    """
+    label = getattr(new, "screen", None)
+    if label is None:
+        status = (getattr(new, "perception", None) or {}).get("screen") or "off"
+        return {"name": None, "level": None, "label": status}
+    return {"name": label.name, "level": label.level}
+
+
 class Executor:
     def __init__(self, device, perceiver, store=None, runs_root=None, catalog=None,
                  asker=None, recovery=None, layout=None, identity=None, layout_path=None):
@@ -1268,6 +1281,9 @@ class Executor:
         # 三条路报 ok 之前都过了 _identity，结论就从它来：核对了 = 开成了，核出别的 App = 没成，
         # 没问成 = 不知道（照旧报 ok，但不许当成开成了）。ok=False 的那一路不下结论（verdict.of 记 n/a）。
         if res.ok:
+            # ⚠ 2026-09-22（spec 打开App落点）：iOS 打开 App 是回到上次离开的那一屏，不一定是首页。
+            #   落点从 _identity 补好的那份标注读，三条路共用这一个出口（CLAUDE.md §7）。
+            res.extra["landed"] = landing(new)
             ident = res.extra.get("identity") or {}
             if isinstance(ident.get("verified"), bool):
                 self._conclude(res, Verdict("met" if ident["verified"] else "not_met", "identity",

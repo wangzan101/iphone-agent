@@ -26,6 +26,10 @@ from types import SimpleNamespace
 
 from iphone_agent.harness.actions import BUILTIN_ACTION_NAMES, screen_neutral
 
+# ⚠ 2026-09-22（终审 M-5）：只借 LEVELS 这个常量当白名单，perceive/screen.py 不反过来导入 harness，
+#   没有循环导入（screen.py 只依赖 dataclasses / collections.abc）。
+from iphone_agent.perceive.screen import LEVELS
+
 STATES = ("met", "not_met", "unknown", "n/a")
 
 
@@ -126,6 +130,13 @@ def of(name: str, args: dict, result: dict) -> Verdict:
     return _by_judged(result) or _by_pixels(result)       # scroll / key / erase
 
 
+_LANDED = {
+    "home": "打开后停在「{name}」，是这个 App 的首页。",
+    "top": "打开后停在「{name}」，是顶层标签页，不是首页。",
+    "inner": "打开后停在「{name}」，是从别的页点进来的内页，不是首页；任务要从首页开始的话先退回去。",
+    None: "打开后停在「{name}」，看不出是不是首页。",
+}
+
 _UNKNOWN_WHY = {
     "missing": "你没写 expect，系统无从核对",
     "unverified": "看图核对没问成",
@@ -150,4 +161,21 @@ def say(v: Verdict, name: str, result: dict, quiet: bool = False) -> str | None:
             return f"想打的字没有按原样落进去：输入框里现在是「{v.seen}」。" if v.seen else "想打的字没有落进输入框。"
         if v.by == "identity" and name == "tap":
             return f"打开的不是你要的那个 App，现在是「{v.seen}」。" if v.seen else "打开的不是你要的那个 App。"
+    # ⚠ 2026-09-22（spec 打开App落点 §3.2）：打开 App 开成了原来什么都不说。iOS 回到的是上次离开的那一屏，
+    #   模型要知道自己是不是在首页 —— on_demand 下它平时不看图，只能由这句话告诉它。只说看图看到的，不掺孪生。
+    if v.state == "met" and name == "open_app" and isinstance(result.get("landed"), dict):
+        landed = result["landed"]
+        if not landed.get("name"):
+            # ⚠ 2026-09-22（终审 M-3）：label == "off" 是没看图（on_demand 下这一步本就不看），
+            #   不是「看了说不出来」——CLAUDE.md §3「没做」不等于「做失败」。别的状态
+            #   （failed/missing/invalid）是真的看了、答坏了，照旧说一句「没看成」提醒别当成已经确认。
+            if landed.get("label") == "off":
+                return None
+            return "打开后没看成停在哪一页。"
+        # ⚠ 2026-09-22（终审 M-5）：level 只信 LEVELS 里的三个值——手改过的留档可能塞进一个列表
+        # 这类不可哈希的东西，_LANDED.get 直接用它当 key 会 TypeError。先用 in（对 tuple 不需要哈希）
+        # 筛一遍，筛不过就当没答，跟 None 走同一句话。
+        level = landed.get("level")
+        level = level if level in LEVELS else None
+        return _LANDED.get(level, _LANDED[None]).format(name=landed["name"])
     return None
