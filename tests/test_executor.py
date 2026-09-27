@@ -78,32 +78,19 @@ def test_device_error_returns_none_observation(fake_env):
     assert res.error == "device_error" and new_obs is None
 
 
-def test_type_verified_true_when_new_text_appears_near_last_tap(fake_env):
+def test_type_verified_true_when_new_text_appears_near_last_tap(action_env):
     # ⚠ 目标文本用 ASCII（"safari"）而不是中文：非 ASCII 现在走输入法编排
     #    （发拼音 → 看候选 → 点选），那条路自己出结果，没有 verified 字段。
     #    这条测的是 ASCII 直打之后的落屏校验，两件事。
     # 裁决三：重新设计帧序列，让「type 之前的基线」确定不含目标文本。
     #
-    # fast_timing fixture 把 IOS_TIMING 的每一项都换成 Timing(0, 10, 20, 1000)：
-    # poll_ms=10、stable_span_ms=20，比例 2:1，与生产环境 IOS_TIMING 各项的比例一致
-    # （例如 tap: poll_ms=150, stable_span_ms=400 ≈ 2.67；这里取整数 2 简化）。
-    # 在这个比例下，settle() 判定「稳定」需要连续看到 4 帧内容不变（1 次 last + 3 次轮询），
-    # 因为 stable_since 在第一次相邻帧相同时才置位，之后还要再等满 stable_span_ms（=2 个
-    # poll 间隔）才会返回。
-    #
-    # 于是把帧序列分两段、每段 4 帧一模一样：
-    #   [0]            —— tap 之前的初始观察（"搜索"）
-    #   [1..4] "搜索"   —— tap 动作后的 settle 消耗这 4 帧，稳定后返回 [4]（仍是干净的"搜索"，
-    #                      不含 "safari"，所以 type 的基线一定干净）
-    #   [5..8] "搜索","设置" —— type 动作后的 settle 接着消耗这 4 帧，稳定后返回 [8]
-    #                      （新增了目标文本 "safari"）
-    # FakeDevice 的帧索引只增不减，一旦某段落用完当前 4 帧也会正好在该段落末尾稳定下来，
-    # 不会提前越界读到下一段——这样基线（tap 后）与回读（type 后）确定分别是"干净"与"命中"。
-    dev, per, frames = fake_env([
-        ["搜索"],
-        ["搜索"], ["搜索"], ["搜索"], ["搜索"],
-        ["搜索", "safari"], ["搜索", "safari"], ["搜索", "safari"], ["搜索", "safari"],
-    ])
+    # ⚠ 2026-09-27：原来靠「按 settle 固定消耗的帧数分两段」扛住轮询消耗几帧——
+    #   steady_settle_clock 落地后轮询次数不再看机器快慢，但落地时机是浮点边界，实测
+    #   POLL_COST_S=0.05 时 settle 3 次抓帧封顶，=0.0 时因为卡在 stable_span_ms 的浮点
+    #   边界上要多抓 2 次，这堆按帧数分段的假设照样对不上。改用 action_env/ActionDrivenDevice：
+    #   页面只随真正执行的 tap / type 切换，跟 settle 转几圈无关——tap 不切页（基线一定还是
+    #   "搜索"，不含 "safari"），type 才切到含 "safari" 的页。
+    dev, per, _ = action_env([["搜索"], ["搜索", "safari"]], {(0, "type"): 1})
     obs = per.observe(dev.capture())
     ex = Executor(dev, per)
     _, obs = ex.run(act("tap", x=100, y=65), obs)
@@ -200,9 +187,16 @@ def screens(*groups, initial):
     return [initial] + [g for g in groups for _ in range(4)]
 
 
-def test_scroll_until_scrolls_several_screens_within_one_call(fake_env):
-    """全部价值在这里：一次 run() 里滚了两屏，对外只是一个动作。"""
-    dev, per, _ = fake_env(screens(S2, S3, initial=S1))
+def test_scroll_until_scrolls_several_screens_within_one_call(action_env):
+    """全部价值在这里：一次 run() 里滚了两屏，对外只是一个动作。
+
+    ⚠ 2026-09-27：原来靠 screens()（每屏垫 4 张相同帧）扛住 settle 轮询消耗几帧——
+      steady_settle_clock 落地后轮询次数不再看机器快慢（且 POLL_COST_S=0.0 时因浮点边界
+      要多抓 2 帧，垫的 4 张不够用，会读到下一屏的帧），这堆按帧数垫料的假设跟着对不上了。
+      改用 action_env/ActionDrivenDevice：页面只随真正执行的 scroll 切换，跟 settle
+      转几圈无关。
+    """
+    dev, per, _ = action_env([S1, S2, S3], {(0, "scroll"): 1, (1, "scroll"): 2})
     obs = per.observe(dev.capture())
     res, new_obs = Executor(dev, per).run(
         act("scroll_until", direction="down", text="关于本机"), obs)
@@ -265,10 +259,12 @@ def test_collect_dedupes_overlapping_screens_and_keeps_first_seen_order(fake_env
     assert new_obs is not None
 
 
-def test_collect_stops_at_the_screen_cap_and_says_it_is_not_the_bottom(fake_env, monkeypatch):
+def test_collect_stops_at_the_screen_cap_and_says_it_is_not_the_bottom(action_env, monkeypatch):
+    """⚠ 2026-09-27：原来靠 screens() 垫帧数，POLL_COST_S=0.0 时会多读进 S1 那屏——
+    改用 action_env：到了 SCROLL_MAX_SCREENS=1 就不会再滚，S1 根本用不上，删掉了。"""
     from iphone_agent import config
     monkeypatch.setattr(config, "SCROLL_MAX_SCREENS", 1)
-    dev, per, _ = fake_env(screens(L2, S1, initial=L1))
+    dev, per, _ = action_env([L1, L2], {(0, "scroll"): 1})
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("collect", direction="down"), obs)
     assert res.extra["screens"] == 1 and res.extra["reached_end"] is False
@@ -311,9 +307,10 @@ def _session(dev, per):
     return SimpleNamespace(dev=dev, per=per, asker=None)
 
 
-def test_cli_scroll_until_goes_through_the_executor(fake_env, capsys):
+def test_cli_scroll_until_goes_through_the_executor(action_env, capsys):
+    """⚠ 2026-09-27：换成 action_env，理由同 test_scroll_until_scrolls_several_screens_within_one_call。"""
     from iphone_agent.cli.commands import dispatch
-    dev, per, _ = fake_env(screens(S2, S3, initial=S1))
+    dev, per, _ = action_env([S1, S2, S3], {(0, "scroll"): 1, (1, "scroll"): 2})
     assert dispatch(_session(dev, per), ["scroll_until", "down", "关于本机"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["found"] is True and out["screens"] == 2
@@ -335,13 +332,15 @@ def test_cli_rejects_a_bad_direction_before_touching_the_device(fake_env, capsys
     assert dev.calls == []
 
 
-def test_scroll_until_hands_back_the_last_observation_when_the_device_fails_midway(fake_env):
+def test_scroll_until_hands_back_the_last_observation_when_the_device_fails_midway(action_env):
     """滚到一半设备炸了，也要把最后一次成功的观察交回去。
 
     已经滚过的屏把画面挪走了，模型手里那份观察就过期了 —— 只报错不给新观察，
     它下一步会点在一个不存在的画面上（这个项目为这一类错栽过）。
+
+    ⚠ 2026-09-27：换成 action_env，理由同 test_scroll_until_scrolls_several_screens_within_one_call。
     """
-    dev, per, _ = fake_env(screens(S2, S3, initial=S1))
+    dev, per, _ = action_env([S1, S2, S3], {(0, "scroll"): 1, (1, "scroll"): 2})
     obs = per.observe(dev.capture())
     ex = Executor(dev, per)
     calls = {"n": 0}
@@ -386,15 +385,21 @@ def test_one_lost_scroll_does_not_end_the_collect_early(fake_env):
 _PAD = [f"占位{i}" for i in range(10)]       # 把候选顶到 y > 640 的带里
 
 
-def _ime_env(fake_env, *candidates, after_pick=None):
+def _ime_env(action_env, *candidates, after_pick=None):
+    """⚠ 2026-09-27：原来靠「打拼音后 4 帧 + 点候选后 4 帧」扛住 settle 轮询消耗几帧——
+    steady_settle_clock 落地后轮询次数不再看机器快慢（POLL_COST_S=0.0 时因浮点边界还要
+    多抓，垫的 4 帧不够，会读到下一段的帧），这堆按帧数分段的假设跟着对不上了。
+    改用 action_env/ActionDrivenDevice：页面只随真正执行的 type（发拼音）/ tap（点候选）
+    切换，跟 settle 转几圈无关。
+    """
     typing = _PAD + list(candidates) + ["Q 搜索"]      # 最后一个是输入框（最底下）
     picked = after_pick if after_pick is not None else ["设置", "飞行模式"]
-    return fake_env([["Q 搜索"]] + [typing] * 4 + [picked] * 4)
+    return action_env([["Q 搜索"], typing, picked], {(0, "type"): 1, (1, "tap"): 2})
 
 
-def test_chinese_goes_through_the_ime_not_raw_keystrokes(fake_env):
+def test_chinese_goes_through_the_ime_not_raw_keystrokes(action_env):
     """打进去的必须是拼音，不是汉字 —— 汉字发不出 keycode。"""
-    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制")
+    dev, per, _ = _ime_env(action_env, "1设置", "2 摄制")
     obs = per.observe(dev.capture())
     res, new = Executor(dev, per).run(act("type", text="设置"), obs)
     assert ("type", "shezhi") in dev.calls, f"没有发拼音，实际发了 {dev.calls}"
@@ -404,12 +409,12 @@ def test_chinese_goes_through_the_ime_not_raw_keystrokes(fake_env):
     assert new is not None
 
 
-def test_ime_only_picks_an_exact_candidate(fake_env):
+def test_ime_only_picks_an_exact_candidate(action_env):
     """只认「剥掉编号后正好等于目标」的候选。
 
     '设置' 和 '摄制' 只差一个音，包含匹配会点错 —— 而点错没有回头路，字已经上屏。
     """
-    dev, per, _ = _ime_env(fake_env, "1 摄制", "2 摄制组")
+    dev, per, _ = _ime_env(action_env, "1 摄制", "2 摄制组")
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("type", text="设置"), obs)
     assert res.ok is False and res.error == "candidate_not_found"
@@ -417,9 +422,9 @@ def test_ime_only_picks_an_exact_candidate(fake_env):
     assert "没上屏" in res.hint, "得说清楚字还没上屏，模型才知道可以重试"
 
 
-def test_ime_does_not_tap_when_nothing_matches(fake_env):
+def test_ime_does_not_tap_when_nothing_matches(action_env):
     """找不到候选时绝对不能瞎点一个 —— 点错了字就上屏了，没有撤销。"""
-    dev, per, _ = _ime_env(fake_env, "1 摄制")
+    dev, per, _ = _ime_env(action_env, "1 摄制")
     obs = per.observe(dev.capture())
     Executor(dev, per).run(act("type", text="设置"), obs)
     assert not any(c[0] == "tap" for c in dev.calls), f"没匹配上却点了：{dev.calls}"
@@ -434,13 +439,13 @@ def test_ascii_still_takes_the_direct_path(fake_env):
     assert "pinyin" not in res.extra
 
 
-def test_candidate_not_found_reports_that_the_screen_changed(fake_env):
+def test_candidate_not_found_reports_that_the_screen_changed(action_env):
     """打拼音让候选栏冒出来了，屏幕**真的变了**，必须如实报。
 
     以前这里不设 changed，默认 None；guard 里 `if changed and ...` 对 None 是假，
     于是这一步被记成无进展。逐字输入三个字就自己撞上 NO_PROGRESS_WARN。
     """
-    dev, per, _ = _ime_env(fake_env, "1 摄制", "2 摄制组")
+    dev, per, _ = _ime_env(action_env, "1 摄制", "2 摄制组")
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("type", text="设置"), obs)
     assert res.error == "candidate_not_found"
@@ -448,10 +453,10 @@ def test_candidate_not_found_reports_that_the_screen_changed(fake_env):
     assert res.hamming is not None and res.text_diff is not None
 
 
-def test_candidate_not_found_tells_the_model_it_can_tap_the_candidate(fake_env):
+def test_candidate_not_found_tells_the_model_it_can_tap_the_candidate(action_env):
     """候选栏就在下一张截图上，模型能直接点。以前的提示只说「换更短的词再试」，
     把它往错的方向引 —— 而 OCR 读错单字（「一」读成「—」）时，只有眼睛能救。"""
-    dev, per, _ = _ime_env(fake_env, "1 摄制", "2 摄制组")
+    dev, per, _ = _ime_env(action_env, "1 摄制", "2 摄制组")
     obs = per.observe(dev.capture())
     res, new = Executor(dev, per).run(act("type", text="设置"), obs)
     assert "tap" in res.hint, "没告诉模型可以直接点候选"
@@ -538,13 +543,13 @@ def test_empty_candidate_bar_is_reported_as_wrong_ime_mode(fake_env):
     assert "换个词再试没有用" in res.hint, "得说清楚这条路走不通，别让它继续试"
 
 
-def test_it_undoes_exactly_what_it_typed_and_no_more(fake_env):
+def test_it_undoes_exactly_what_it_typed_and_no_more(action_env):
     """⚠ 绝不能盲目连按 delete —— 在备忘录、聊天框里会删掉本来就有的内容。
 
     候选栏为空时会先切一次输入法重试，所以退格发生两次：一次为了重试、
     一次为了放弃。**每一次都必须正好是自己打进去的那么多个字符。**
     """
-    dev, per, _ = _ime_env(fake_env)
+    dev, per, _ = _ime_env(action_env)
     obs = per.observe(dev.capture())
     Executor(dev, per).run(act("type", text="设置"), obs)
     backs = [c for c in dev.calls if c[0] == "backspace"]
@@ -562,9 +567,9 @@ def test_an_empty_candidate_bar_triggers_one_ime_switch_and_retry(fake_env):
     assert res.error == "ime_not_chinese"
 
 
-def test_candidate_not_found_also_undoes_the_pinyin(fake_env):
+def test_candidate_not_found_also_undoes_the_pinyin(action_env):
     """否则下一次输入会叠在残留上。"""
-    dev, per, _ = _ime_env(fake_env, "1 摄制", "2 摄制组")
+    dev, per, _ = _ime_env(action_env, "1 摄制", "2 摄制组")
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("type", text="设置"), obs)
     assert res.error == "candidate_not_found"
@@ -606,11 +611,11 @@ def test_switch_ime_forgets_the_believed_mode(fake_env):
     assert ex._ime_chinese is None, "翻转了而不是置为未知"
 
 
-def test_a_known_english_mode_does_not_block_switching_to_chinese(fake_env):
+def test_a_known_english_mode_does_not_block_switching_to_chinese(action_env):
     """⚠ 第一版把重试条件写成「信念不是英文才重试」，结果恰恰在**明知道在英文模式**时
     跳过了切换 —— 逻辑正好反了。真机表现：打完 safari 再打中文必然失败。
     决定要不要切的是刚拿到的**证据**（候选栏空不空），不是旧信念。"""
-    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制")
+    dev, per, _ = _ime_env(action_env, "1设置", "2 摄制")
     obs = per.observe(dev.capture())
     ex = Executor(dev, per)
     ex._ime_chinese = False               # 上一步打过英文
@@ -620,7 +625,7 @@ def test_a_known_english_mode_does_not_block_switching_to_chinese(fake_env):
 
 
 
-def test_letters_that_never_reached_the_screen_are_a_different_diagnosis(fake_env):
+def test_letters_that_never_reached_the_screen_are_a_different_diagnosis(action_env):
     """⚠ 候选栏空**而且拼音也没出现在屏幕上** = 按键根本没进去，
     不是「输入法模式不对」。这两种说法差很远：模式不对可以切一下，
     按键进不去时切几次都没用。
@@ -628,18 +633,18 @@ def test_letters_that_never_reached_the_screen_are_a_different_diagnosis(fake_en
     2026-09-08 批跑踩到：34 次 Spotlight 打字全部没落进去，而报的是
     「字母是直接上屏的」—— 屏幕上一个字母都没有。
     """
-    dev, per, _ = _ime_env(fake_env)          # 屏上既没候选也没拼音
+    dev, per, _ = _ime_env(action_env)          # 屏上既没候选也没拼音
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("type", text="设置"), obs)
     assert res.error == "keystrokes_not_landing", res.error
     assert not any(c[0] == "toggle_ime" for c in dev.calls), "字母都没进去，切输入法没意义"
 
 
-def test_typing_failure_states_the_fact_and_does_not_coach_the_model(fake_env):
+def test_typing_failure_states_the_fact_and_does_not_coach_the_model(action_env):
     """⚠ 以前这里劝模型：第一次「先 tap 输入框聚焦」，第三次「别再试了」。两种都是把设备故障
     交给模型 —— 09-08 批跑 8 个任务白烧几十步，09-10 改了说法模型照样换 20 种方式试。
     现在只陈述事实；真正的处理在恢复阶梯（recovery.py），有阶梯时模型根本看不到这句。"""
-    dev, per, _ = _ime_env(fake_env)
+    dev, per, _ = _ime_env(action_env)
     res, _ = Executor(dev, per).run(act("type", text="设置"), obs=per.observe(dev.capture()))
     assert res.error == "keystrokes_not_landing"
     assert "通道" in res.hint
@@ -680,12 +685,12 @@ def test_typing_that_lands_after_the_cheap_rung_is_reported_as_plain_success(fak
     assert [e["rung"] for e in rec.events] == ["resolve"]
 
 
-def test_typing_dead_for_good_climbs_to_restart_then_raises(fake_env):
+def test_typing_dead_for_good_climbs_to_restart_then_raises(action_env):
     """一直不落：resolve → connect → restart 都试过、重启不超过 RECOVERY_MAX_RESTARTS，
     最后抛 DeviceChannelDead —— loop 把它记成 device_error 结束任务，不再让模型烧步数。"""
     from iphone_agent import config
     from iphone_agent.harness.recovery import DeviceChannelDead, Recovery
-    dev, per, _ = _ime_env(fake_env)
+    dev, per, _ = _ime_env(action_env)
     restarts = []
     rec = Recovery(dev, per, restart=lambda: restarts.append(1) or 0.5,
                    ensure=lambda d, p, obs=None: (True, "连接正常", None))
@@ -1453,8 +1458,8 @@ def test_shifted_path_does_not_trust_the_text_check(action_env):
     assert asker.calls == 1 and res.extra["typed_via"] == "shifted" and res.extra["verified"] == "wrong"
 
 
-def test_picking_a_candidate_is_verified_like_any_typing(fake_env):
-    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制")           # 选完之后的画面是 ["设置", "飞行模式"]
+def test_picking_a_candidate_is_verified_like_any_typing(action_env):
+    dev, per, _ = _ime_env(action_env, "1设置", "2 摄制")           # 选完之后的画面是 ["设置", "飞行模式"]
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per, asker=_Reads({"landed": True, "field_changed": True, "seen": "设置"})).run(
         act("type", text="设置"), obs)
@@ -1465,10 +1470,10 @@ def test_picking_a_candidate_is_verified_like_any_typing(fake_env):
     _aligned("type", {"text": "设置"}, res)
 
 
-def test_a_candidate_that_did_not_land_is_not_a_dead_keyboard(fake_env):
+def test_a_candidate_that_did_not_land_is_not_a_dead_keyboard(action_env):
     # 点候选走的是 tap 通道。读回说「框里没变」也不许写成 verified="false" —— 那会去爬键盘恢复阶梯。
     # 这一帧是「候选栏没了、拼音还留在输入框里」：文字判据看得见画面动过，但答不出字上屏没有。
-    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制", after_pick=_PAD + ["Q shezhi"])
+    dev, per, _ = _ime_env(action_env, "1设置", "2 摄制", after_pick=_PAD + ["Q shezhi"])
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per, asker=_Reads({"landed": False, "field_changed": False, "seen": ""})).run(
         act("type", text="设置"), obs)
@@ -1478,7 +1483,7 @@ def test_a_candidate_that_did_not_land_is_not_a_dead_keyboard(fake_env):
     assert v.state == "not_met" and "按键" not in v.why, "点击没生效，不许说成键盘没落字"
 
 
-def test_a_candidate_bar_still_on_screen_means_the_tap_did_nothing(fake_env):
+def test_a_candidate_bar_still_on_screen_means_the_tap_did_nothing(action_env):
     """点完候选，候选栏还在原处 —— 真机上「点了候选却什么都没发生」最常见的样子。
 
     ⚠ 2026-09-18（Task 4 评审实测）：这一帧曾经被报成 met/text、changed 抬成 True、读回一次都不问。
@@ -1486,7 +1491,7 @@ def test_a_candidate_bar_still_on_screen_means_the_tap_did_nothing(fake_env):
       目标词（"设置" in "1设置"），点击没生效时它反而算「新出现的文字」，文字判据恒答 true。
       基线必须是**点候选之前那一帧**（带候选栏的那一帧）。
     """
-    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制", after_pick=_PAD + ["1设置", "2 摄制", "Q 搜索"])
+    dev, per, _ = _ime_env(action_env, "1设置", "2 摄制", after_pick=_PAD + ["1设置", "2 摄制", "Q 搜索"])
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per, asker=_Reads({"landed": False, "field_changed": False, "seen": ""})).run(
         act("type", text="设置"), obs)
@@ -1497,9 +1502,9 @@ def test_a_candidate_bar_still_on_screen_means_the_tap_did_nothing(fake_env):
     _aligned("type", {"text": "设置"}, res)
 
 
-def test_a_candidate_bar_still_on_screen_needs_no_asker(fake_env):
+def test_a_candidate_bar_still_on_screen_needs_no_asker(action_env):
     """一字不差 = 点击没生效，这是文字判据自己答得出的否定结论，不用看图的一方也不会报假成功。"""
-    dev, per, _ = _ime_env(fake_env, "1设置", "2 摄制", after_pick=_PAD + ["1设置", "2 摄制", "Q 搜索"])
+    dev, per, _ = _ime_env(action_env, "1设置", "2 摄制", after_pick=_PAD + ["1设置", "2 摄制", "Q 搜索"])
     obs = per.observe(dev.capture())
     res, _ = Executor(dev, per).run(act("type", text="设置"), obs)          # asker=None
     assert res.extra["verified"] == "wrong"

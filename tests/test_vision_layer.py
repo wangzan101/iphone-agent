@@ -216,22 +216,22 @@ def test_action_describe_leaves_out_the_models_own_reasoning():
 
 # ---------- 接进执行层之后：2026-09-09 那个 bug 的回归 ----------
 
-def _no_bar_env(fake_env):
+def _no_bar_env(action_env):
     """OCR 里没有任何候选栏形状的东西 —— 几何规则必然找不到。
 
     真机上对应的场景是：候选栏在屏幕上部（贴光标），当时的 y 下限只看下部 30%。
     这里不去复刻那个 y 下限（它已经删了），直接构造「几何这一路交白卷」。
     """
-    return _ime_env(fake_env, "nihao", after_pick=["你好"])
+    return _ime_env(action_env, "nihao", after_pick=["你好"])
 
 
-def test_vision_finds_the_bar_and_the_ime_must_not_be_toggled(fake_env):
+def test_vision_finds_the_bar_and_the_ime_must_not_be_toggled(action_env):
     """**这是今天那个 bug 的回归。**
 
     几何规则漏了候选栏，视觉找到了 —— 键盘本来就是中文的。这时候切输入法
     等于把一个正确的状态毁掉，重打更没候选，最后报 ime_not_chinese。
     """
-    dev, per, _ = _no_bar_env(fake_env)
+    dev, per, _ = _no_bar_env(action_env)
     obs = per.observe(dev.capture())
     asker = FakeAsker({"found": True,
                        "items": [{"text": "你好", "box": [100, 200, 200, 240]}]})
@@ -242,12 +242,12 @@ def test_vision_finds_the_bar_and_the_ime_must_not_be_toggled(fake_env):
     assert res.extra["picked"] == "你好"
 
 
-def test_vision_sees_the_bar_but_not_the_target_is_candidate_not_found(fake_env):
+def test_vision_sees_the_bar_but_not_the_target_is_candidate_not_found(action_env):
     """候选栏在、只是没有目标词 —— 这是 candidate_not_found，不是 ime_not_chinese。
 
     两句话给模型指的路正好相反：前者「换个词再试」有意义，后者明说了「换词没用」。
     """
-    dev, per, _ = _no_bar_env(fake_env)
+    dev, per, _ = _no_bar_env(action_env)
     obs = per.observe(dev.capture())
     asker = FakeAsker({"found": True,
                        "items": [{"text": "泥好", "box": [100, 200, 200, 240]}]})
@@ -257,26 +257,26 @@ def test_vision_sees_the_bar_but_not_the_target_is_candidate_not_found(fake_env)
     assert res.extra["candidates"] == ["泥好"]
 
 
-def test_vision_confirms_there_is_no_bar_so_toggling_is_earned(fake_env):
+def test_vision_confirms_there_is_no_bar_so_toggling_is_earned(action_env):
     """模型看过了说确实没有 —— 这时候切输入法是有依据的，老行为该照走。"""
-    dev, per, _ = _no_bar_env(fake_env)
+    dev, per, _ = _no_bar_env(action_env)
     obs = per.observe(dev.capture())
     asker = FakeAsker({"found": False, "why": "键盘是英文模式"})
     Executor(dev, per, asker=asker).run(act("type", text="你好"), obs)
     assert ("toggle_ime",) in dev.calls, "模型都说没有候选栏了，该切一次试试"
 
 
-def test_no_asker_behaves_exactly_like_before(fake_env):
+def test_no_asker_behaves_exactly_like_before(action_env):
     """降级路必须一直留着：没有 asker 时行为和 2026-09-09 之前一模一样。"""
-    dev, per, _ = _no_bar_env(fake_env)
+    dev, per, _ = _no_bar_env(action_env)
     obs = per.observe(dev.capture())
     Executor(dev, per).run(act("type", text="你好"), obs)
     assert ("toggle_ime",) in dev.calls
 
 
-def test_a_failed_vision_call_does_not_change_the_outcome(fake_env):
+def test_a_failed_vision_call_does_not_change_the_outcome(action_env):
     """问不成 = 什么都不该断定 = 退回老行为。"""
-    dev, per, _ = _no_bar_env(fake_env)
+    dev, per, _ = _no_bar_env(action_env)
     obs = per.observe(dev.capture())
     Executor(dev, per, asker=FakeAsker()).run(act("type", text="你好"), obs)
     assert ("toggle_ime",) in dev.calls
@@ -327,18 +327,19 @@ def test_a_garbage_answer_never_flips_the_verdict(fake_env, bad):
     assert "judged" not in res.extra
 
 
-def _committed_env(fake_env):
+def _committed_env(action_env):
     """字上屏了，但前后两屏差别小到低于阈值 —— 真机上中文输入就长这样。
 
     实测 hamming=1、text_diff=1，阈值是 2 / 8，两个都不到。
+
+    ⚠ 2026-09-27：原来靠「打拼音后 4 帧 + 点候选后 4 帧」扛住 settle 轮询消耗几帧——
+    steady_settle_clock 落地后轮询次数不再看机器快慢，这堆按帧数分段的假设跟着对不上了。
+    形状和 _ime_env 一样（打拼音 → 点候选），直接借它的 action_env 编排。
     """
-    first = _PAD + ["Q 搜索"]
-    typing = _PAD + ["1你好", "2 你号", "Q 搜索"]
-    picked = _PAD + ["你好", "Q 搜索"]
-    return fake_env([first] + [typing] * 4 + [picked] * 4)
+    return _ime_env(action_env, "1你好", "2 你号", after_pick=_PAD + ["你好", "Q 搜索"])
 
 
-def test_a_committed_chinese_word_is_not_reported_as_no_change(fake_env):
+def test_a_committed_chinese_word_is_not_reported_as_no_change(action_env):
     """中文上屏了却报「没变化」—— 2026-09-09 真机实测的浪费，钉住它。
 
     'nihao' 变成 '你好' 只贡献 hamming=1、text_diff=6，两个都低于阈值（2 / 8）。
@@ -350,7 +351,7 @@ def test_a_committed_chinese_word_is_not_reported_as_no_change(fake_env):
       一次看图都不用花。原来那个自问 did_action_work、自拼 judged 的分支整段没了，
       所以断言从 judged 换成了 verdict / verified；「不能报没变化」这条事故本身没改。
     """
-    dev, per, _ = _committed_env(fake_env)
+    dev, per, _ = _committed_env(action_env)
     obs = per.observe(dev.capture())
     asker = FakeAsker({"landed": True, "field_changed": True, "seen": "你好"})
     res, _new = Executor(dev, per, asker=asker).run(act("type", text="你好"), obs)
@@ -361,14 +362,14 @@ def test_a_committed_chinese_word_is_not_reported_as_no_change(fake_env):
     assert asker.prompts == [], "文字判据已经给出肯定结论了，不该再花一次看图"
 
 
-def test_a_committed_word_without_an_asker_still_lands_by_text(fake_env):
+def test_a_committed_word_without_an_asker_still_lands_by_text(action_env):
     """降级路：没有 asker 也不靠像素下结论 —— 「你好」是点完才出现的新文字，文字判据说了算。
 
     ⚠ 2026-09-18（Task 4）：这条原来叫 ..._keeps_the_old_verdict，断言 changed is False
       （没有看图的一方就退回像素判据）。现在像素判据不再是最后一句话：同一条核对里，
       文字判据的肯定结论（CLAUDE.md §2）先于像素，所以没有 asker 也报 changed=True。
     """
-    dev, per, _ = _committed_env(fake_env)
+    dev, per, _ = _committed_env(action_env)
     obs = per.observe(dev.capture())
     res, _new = Executor(dev, per).run(act("type", text="你好"), obs)
     assert res.ok and "judged" not in res.extra
@@ -428,7 +429,7 @@ def test_erase_refuses_a_bad_count_instead_of_clamping(bad):
         validate_action(Action("erase", {"count": bad}, "", None, "c1"), None)
 
 
-def test_vision_splits_candidates_that_ocr_glued_together(fake_env):
+def test_vision_splits_candidates_that_ocr_glued_together(action_env):
     """OCR 把几个候选粘成一个元素时，看图的那一方能拆开。
 
     2026-09-09 真机：打 'ming'，OCR 吐出 ['1名', '2明 3命4鸣']。剥掉编号是
@@ -436,7 +437,7 @@ def test_vision_splits_candidates_that_ocr_glued_together(fake_env):
     回头路），所以整体放弃，报 candidate_not_found。模型试了两次都卡在这儿。
     而它们在屏幕上本来就是分开的三个词，视觉能给出各自的坐标。
     """
-    dev, per, _ = _ime_env(fake_env, "1名", "2明 3命4鸣", after_pick=["明"])
+    dev, per, _ = _ime_env(action_env, "1名", "2明 3命4鸣", after_pick=["明"])
     obs = per.observe(dev.capture())
     asker = FakeAsker({"found": True, "items": [
         {"text": "名", "box": [100, 200, 160, 240]},
@@ -448,10 +449,10 @@ def test_vision_splits_candidates_that_ocr_glued_together(fake_env):
     assert res.extra["picked"] == "明"
 
 
-def test_glued_candidates_still_fail_cleanly_when_the_target_is_absent(fake_env):
+def test_glued_candidates_still_fail_cleanly_when_the_target_is_absent(action_env):
     """拆开之后确实没有目标 —— 照旧报 candidate_not_found，但把拆开后的候选交回去，
     比交一串粘着的有用。"""
-    dev, per, _ = _ime_env(fake_env, "1名", "2明 3命4鸣", after_pick=["名"])
+    dev, per, _ = _ime_env(action_env, "1名", "2明 3命4鸣", after_pick=["名"])
     obs = per.observe(dev.capture())
     asker = FakeAsker({"found": True, "items": [
         {"text": "名", "box": [100, 200, 160, 240]},

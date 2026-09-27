@@ -73,6 +73,25 @@ def run(fake_env, specs, script, tmp_path, task_text="t", asker=None, **kw):
     return r, dev, model
 
 
+def run_action(action_env, pages, transitions, script, tmp_path, task_text="t", asker=None, **kw):
+    """action_env 版的 run()：页面只随真正执行的动作切换，跟 settle 轮询几次无关。
+
+    ⚠ 2026-09-27：`run()` 靠 INITIAL_SETTLE_FRAMES 垫开局 key(home) 那次 settle 消耗的帧数——
+    steady_settle_clock 落地后轮询次数不再看机器快慢，垫的帧数跟着对不上了。这里不需要垫：
+    ActionDrivenDevice 的页面只随真正上设备的动作切换，key(home) 不在任何测试的 transitions
+    里，多少次抓帧都停在同一页，天然不用管 settle 转几圈。
+    """
+    from iphone_agent.workspace import Workspace
+    dev, per, frames = action_env(pages, transitions)
+    if asker is not None:
+        per.asker = asker
+    model = ScriptedModel(script)
+    kw.setdefault("store", isolated_store(tmp_path))
+    kw.setdefault("workspace", Workspace(tmp_path))
+    r = run_task(task_text, dev, per, model, tmp_path, **kw)
+    return r, dev, model
+
+
 def test_prefix_order_memory_then_history_then_runs_then_task(fake_env, tmp_path):
     """装配顺序必须是 system → 记忆索引 → 对话前几轮 → 最近运行 → 任务
     （docs/19 §2 的第 1、3、2 层）：记忆索引几乎不变，排最前吃前缀缓存；
@@ -135,27 +154,16 @@ def test_no_progress_stops_after_six(fake_env, tmp_path):
     assert any("无进展" in json.dumps(x, ensure_ascii=False) for x in m.seen[3])  # 第 3 步后警告已注入
 
 
-def test_max_steps(fake_env, tmp_path):
-    # 简报原序列 [[f"s{i // 5}"] for i in range(200)]（每屏 5 帧）会失败：
-    # fast_timing 下 settle 稳定判定固定消耗 4 次额外抓帧，而 5 帧一屏时，
-    # 第 1 次 scroll 的 4 次抓帧（index1-4）仍落在 index0 所在的同一屏（0-4），
-    # 导致 changed=False；guard 记录该签名后，后续同屏同参数的 scroll 永远
-    # 判定 repeated_action（不计入 steps），脚本被拒绝的尝试耗尽后落到默认
-    # done(failed)，测试得到 end_reason="done_failed"、steps=2，而非期望的
-    # max_steps/5。
-    # 改为：index0 单独作为初始屏；index>=1 每 4 帧一屏（与 settle 实测固定
-    # 消耗的 4 次抓帧对齐），每屏用两个互不相同的文字（与其他屏的文字也不
-    # 重叠），确保 did_change 通过 text_diff（而不是运气好的 ahash 汉明距离）
-    # 判定为真变化。经反复运行验证（数十次）稳定给出 5 个真实执行的 step。
-    def spec_for(i):
-        if i == 0:
-            return ["boot0", "boot1"]
-        block = (i - 1) // 4
-        return [f"scr{block}a", f"scr{block}b"]
-
-    specs = [spec_for(i) for i in range(100)]
+def test_max_steps(action_env, tmp_path):
+    # ⚠ 2026-09-27：原来按帧数编排（index0 初始屏 + 之后每 4 帧一屏，对齐 settle 固定消耗的
+    #   4 次抓帧）——那本身就是上一轮为同一类问题打的补丁（简报注释还留着教训）。
+    #   steady_settle_clock 落地后轮询次数不再看机器快慢，"4 帧一屏" 这个数又对不上了。
+    #   根治办法是不再靠帧数：每 scroll 一次就用 action_env 切到下一个没见过的画面，
+    #   跟 settle 转几圈无关。5 个不同的屏够 max_steps=5 用。
+    pages = [["boot0", "boot1"]] + [[f"scr{i}a", f"scr{i}b"] for i in range(5)]
+    transitions = {(i, "scroll"): i + 1 for i in range(5)}
     script = [[("scroll", {"direction": "down", "amount": "page"})] for _ in range(50)]
-    r, dev, m = run(fake_env, specs, script, tmp_path, max_steps=5)
+    r, dev, m = run_action(action_env, pages, transitions, script, tmp_path, max_steps=5)
     assert r.end_reason == "max_steps" and r.steps == 5
 
 
@@ -322,7 +330,7 @@ def test_initial_observation_waits_for_the_home_press_to_settle(fake_env, tmp_pa
     assert "翻页中" not in shown
 
 
-def test_two_state_oscillation_is_stopped(fake_env, tmp_path):
+def test_two_state_oscillation_is_stopped(action_env, tmp_path):
     """验收第 5 次的真实失败：主屏 App 页 ⇄ 小组件页来回七步。
 
     每一步画面都真的变了，所以旧的 record_outcome 每步都把无进展计数清零，
@@ -331,38 +339,36 @@ def test_two_state_oscillation_is_stopped(fake_env, tmp_path):
     合法的「点进去 → 返回 → 再点进去」完全一样（都是同屏同动作），无条件记录签名
     会把合法回退一起误伤。真正的判据是「有没有到达一个没见过的画面」。
 
-    帧按 test_max_steps 的排布：index0 单独作初始屏，index>=1 每 4 帧一屏
-    （与 fast_timing 下 settle 固定消耗的 4 次抓帧对齐），两屏交替。
+    ⚠ 2026-09-27：原来按 test_max_steps 那套帧数排布（index0 初始屏 + 每 4 帧一屏对齐
+      settle 固定消耗的 4 次抓帧）——steady_settle_clock 落地后轮询次数不再看机器快慢，
+      这堆帧数假设跟着对不上了。改用 action_env：两屏用同一个 scroll 动作来回切换，
+      跟 settle 转几圈无关。
     """
-    def spec_for(i):
-        if i == 0:
-            return ["boot0", "boot1"]
-        return (["homeA", "homeB"] if ((i - 1) // 4) % 2 == 0
-                else ["widgetA", "widgetB"])
-
-    specs = [spec_for(i) for i in range(80)]
+    pages = [["boot0", "boot1"], ["homeA", "homeB"], ["widgetA", "widgetB"]]
+    transitions = {(0, "scroll"): 1, (1, "scroll"): 2, (2, "scroll"): 1}
     script = [[("scroll", {"direction": "left", "amount": "page"})] for _ in range(20)]
-    r, _dev, _m = run(fake_env, specs, script, tmp_path)
+    r, _dev, _m = run_action(action_env, pages, transitions, script, tmp_path)
     assert r.end_reason == "no_progress"
     assert r.steps < 10, f"震荡跑了 {r.steps} 步都没被拦住"
 
 
-def test_scroll_until_costs_one_step_no_matter_how_many_screens(fake_env, tmp_path):
+def test_scroll_until_costs_one_step_no_matter_how_many_screens(action_env, tmp_path):
     """高阶滚动的**全部价值**：把 N 次滚动压成一步。
 
     单步 scroll 滚一屏就是一步 + 一次模型调用（约 3.5 秒）；MAX_STEPS 是保险丝，
     这里用小值只是让用例快。这条用例守的就是「滚 3 屏只花 1 步、只问模型 1 次」这件事，
     它一旦退化成一屏一步，长列表任务立刻做不了。
 
-    帧按 test_two_state_oscillation 的排布：index0 是初始屏，之后每 4 帧一屏
-    （fast_timing 下 settle 固定消耗 4 次抓帧）。
+    ⚠ 2026-09-27：原来按帧数排布（每 4 帧一屏，对齐 settle 固定消耗的 4 次抓帧）——
+      steady_settle_clock 落地后轮询次数不再看机器快慢，这堆帧数假设跟着对不上了。
+      改用 action_env：页面只随 scroll_until 内部真正执行的 scroll 切换。
     """
     from tests.test_executor import L1, S1, S2, S3
     pages = [L1, S1, S2, S3]
-    specs = [pages[0]] + [pages[min(1 + i // 4, len(pages) - 1)] for i in range(40)]
+    transitions = {(0, "scroll"): 1, (1, "scroll"): 2, (2, "scroll"): 3}
     script = [[("scroll_until", {"direction": "down", "text": "关于本机"})],
               [("done", {"status": "success", "result": "找到了"})]]
-    r, dev, m = run(fake_env, specs, script, tmp_path)
+    r, dev, m = run_action(action_env, pages, transitions, script, tmp_path)
 
     assert r.end_reason == "done_success"
     assert r.steps == 2, "高阶滚动被按屏计步了"
@@ -1053,19 +1059,26 @@ def test_procedure_call_is_one_step_with_substeps_logged_and_provenance_updated(
     assert r.run_dir.name in p.provenance.runs and p.provenance.fail_streak == 0
 
 
-def test_procedure_substeps_do_not_jump_ahead_of_the_pending_action_record(fake_env, tmp_path):
+def test_procedure_substeps_do_not_jump_ahead_of_the_pending_action_record(action_env, tmp_path):
     """子记录必须排在**已经挂起**的上一条动作记录后面。
 
     动作记录延迟一拍落盘（见 loop.py `_flush`）：剧本子记录如果直接 `log.procedure_step`
     写盘，就会插到上一步那条还挂着的记录前面 —— steps.jsonl 的先后顺序跟真实发生顺序不一样了。
+
+    ⚠ 2026-09-27：原来靠「4 帧一屏 + 6 帧一屏」扛住 settle 轮询消耗几帧——
+      steady_settle_clock 落地后轮询次数不再看机器快慢，这堆帧数假设跟着对不上了。
+      改用 action_env：页面只随真正执行的 tap 切换（外层那次 tap 和剧本内部那次 tap），
+      跟 settle 转几圈无关。
     """
     store = _skill_store(tmp_path)
     script = [[("route", {"scenario": "", "apps": ["settings"]})],
               [("tap", {"id": 1})],
               [("settings__ios-version", {})],
               [("done", {"status": "success", "result": "x"})]]
-    specs = [["设置", "通用"]] + [["通用", "关于本机"]] * 4 + [["关于本机", "iOS版本"]] * 6
-    r, dev, m = run(fake_env, specs, script, tmp_path, skill_store=store, run_config=tools_on())
+    pages = [["设置", "通用"], ["通用", "关于本机"], ["关于本机", "iOS版本"]]
+    transitions = {(0, "tap"): 1, (1, "tap"): 2}
+    r, dev, m = run_action(action_env, pages, transitions, script, tmp_path,
+                           skill_store=store, run_config=tools_on())
     assert r.end_reason == "done_success" and r.steps == 3
     steps = RunLog.read_steps(r.run_dir)
     names = [("sub" if s.get("kind") == "procedure_step" else (s.get("action") or {}).get("name"))
