@@ -302,6 +302,42 @@ def settle_clock(monkeypatch, request):
     return clock
 
 
+#: 模拟一次轮询在真机上的额外开销（截图 + 算哈希）。见 steady_settle_clock。
+POLL_COST_S = 0.05
+
+
+@pytest.fixture(autouse=True)
+def steady_settle_clock(monkeypatch):
+    """settle 轮询几次，不许跟着机器快慢变（autouse；测 settle 自己的用例用 settle_clock 覆盖它）。
+
+    ⚠ 2026-09-27（public 的 CI 上 7 条挂在这里，开发机上全绿）：settle 按**真实时钟**轮询
+      `device.capture()`，而 FakeDevice 的帧是按 capture 次数往后走的 —— 慢机器上一次轮询就够
+      stable_span，帧少翻一格，「点完画面变没变」跟着变，步数、结论、注入的话全跟着偏。
+      2026-09-16 为同一类问题改过一次（帧按动作走的 ActionDrivenDevice），但那只是「别这么写」，
+      新写的用例照样会踩 —— 这里把闸设在唯一的入口上：这只钟只在 settle 模块里生效，
+      sleep 推多少就走多少、计算本身不耗时，于是轮询次数只由 poll_ms / stable_span_ms 算出来
+      （fast_timing 下固定 3 次），开发机和 CI 一模一样。别拿它模拟超时 —— 那是 settle_clock 的活。
+    """
+    import iphone_agent.harness.settle as settle_mod
+
+    class Clock:
+        def __init__(self):
+            self.now = time.time()
+
+        def time(self):
+            return self.now
+
+        def sleep(self, seconds):
+            # 每次轮询除了睡够 poll_ms，还「耗掉」POLL_COST_S：真实机器上算哈希、截图都要时间，
+            # 判稳因此比零成本的钟早一次轮询。这个数只要 ≥ stable_span_ms 就落在同一档上。
+            self.now += max(seconds, 0) + (POLL_COST_S if seconds else 0)
+
+        def __getattr__(self, name):        # perf_counter 等一律照旧
+            return getattr(time, name)
+
+    monkeypatch.setattr(settle_mod, "time", Clock())
+
+
 @pytest.fixture
 def loop_clock(monkeypatch):
     """冻结 loop 看到的 `time.time()`，只由测试显式推进（别的时间函数照旧走真实 time）。

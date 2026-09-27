@@ -1690,12 +1690,19 @@ def _text_of(messages):
     return json.dumps(messages, ensure_ascii=False)
 
 
-def test_tap_without_expect_is_rejected_once_then_let_through_as_unknown(fake_env, tmp_path):
+def test_tap_without_expect_is_rejected_once_then_let_through_as_unknown(action_env, tmp_path):
     """⚠ 2026-09-18：tap 的 expect 09-11 就是必填了，执行层从来不校验 —— 模型 61% 不写，
-    点击预期核对六成时间在挨饿。先拒一次（不上设备），紧接着同一个动作再缺就放行，由执行层标「没核实」。"""
+    点击预期核对六成时间在挨饿。先拒一次（不上设备），紧接着同一个动作再缺就放行，由执行层标「没核实」。
+
+    ⚠ 2026-09-27：原来靠「垫 3 帧『通用』+ 6 帧『关于本机』」扛住 settle 轮询消耗几帧——
+      steady_settle_clock 落地后轮询次数不再看机器快慢，但也不再和这堆帧数对得上（public CI 上挂了）。
+      改用 action_env/ActionDrivenDevice：页面只随真正上设备的 tap 切换，被拒的那次 tap 不上设备、
+      不消耗切换，紧接着放行执行的那次 tap 才真的把页面从「通用」翻到「关于本机」。"""
     tap = ("tap", {"x": 100, "y": 65, "expect": None})
-    r, dev, model = run(fake_env, [["通用"]] * 3 + [["关于本机"]] * 6,
-                        [[tap], [tap], [("done", {"status": "success", "result": "x"})]], tmp_path)
+    from iphone_agent.workspace import Workspace
+    dev, per, _ = action_env([["通用"], ["关于本机"]], {(0, "tap"): 1})
+    model = ScriptedModel([[tap], [tap], [("done", {"status": "success", "result": "x"})]])
+    r = run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
     taps = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"]
     assert taps[0]["validation"] == "missing_required" and "expect" in taps[0]["result"]["hint"]
     assert len([c for c in dev.actions if c[0] == "tap"]) == 1          # 被拒的那次没上设备
@@ -1765,10 +1772,13 @@ def test_after_an_action_executes_the_missing_gate_starts_a_fresh_rejection_stre
     assert len([c for c in dev.actions if c[0] == "tap"]) == 1
 
 
-def test_a_tap_with_expect_passes_the_gate(fake_env, tmp_path):
-    r, dev, _ = run(fake_env, [["通用"]] * 3 + [["关于本机"]] * 6,
-                    [[("tap", {"x": 100, "y": 65, "expect": "出现「关于本机」"})],
-                     [("done", {"status": "success", "result": "x"})]], tmp_path)
+def test_a_tap_with_expect_passes_the_gate(action_env, tmp_path):
+    """⚠ 2026-09-27：同上一条，换成 action_env——页面翻不翻只看这次 tap 有没有真的上设备。"""
+    from iphone_agent.workspace import Workspace
+    dev, per, _ = action_env([["通用"], ["关于本机"]], {(0, "tap"): 1})
+    model = ScriptedModel([[("tap", {"x": 100, "y": 65, "expect": "出现「关于本机」"})],
+                          [("done", {"status": "success", "result": "x"})]])
+    r = run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
     tap = [s for s in _steps(r.run_dir) if (s.get("action") or {}).get("name") == "tap"][0]
     assert "validation" not in tap and tap["result"]["verdict"]["state"] == "met"
 
@@ -1893,9 +1903,22 @@ def test_a_broken_verdict_line_never_takes_the_task_down(action_env, tmp_path, m
 # ⚠ 2026-09-18 现场 一次真机运行的第 12 步：点歪进了微博登录页，没写 expect →
 #   没人核对 →「变了且是新画面」→ 计数清零。错页面被记成进展，同一个坐标后面又点了两轮。
 
-_UNVERIFIED_SPECS = [["a"]] * 3 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6
+# ⚠ 2026-09-27：原来靠「3 帧 a + 6 帧 b + 6 帧 c + 6 帧 d」扛住 settle 轮询消耗几帧——
+#   steady_settle_clock 落地后轮询次数不再看机器快慢，这堆帧数跟着对不上了（public CI 上挂了）。
+#   改用 action_env/ActionDrivenDevice：页面只随真正执行的 tap 切换，跟 settle 转几圈无关。
+_UNVERIFIED_PAGES = [["a"], ["b"], ["c"], ["d"]]
+_UNVERIFIED_MOVES = {(0, "tap"): 1, (1, "tap"): 2, (2, "tap"): 3}
 _UNVERIFIED_TAPS = [[("tap", {"x": 100 + i, "y": 65})] for i in range(3)]
 _DONE_FAILED = [("done", {"status": "failed", "result": "x"})]
+
+
+def _run_unverified(action_env, tmp_path, *, asker, **kw):
+    from iphone_agent.workspace import Workspace
+    dev, per, _ = action_env(_UNVERIFIED_PAGES, _UNVERIFIED_MOVES)
+    per.asker = asker
+    model = ScriptedModel(_UNVERIFIED_TAPS + [_DONE_FAILED])
+    r = run_task("t", dev, per, model, tmp_path, store=isolated_store(tmp_path), workspace=Workspace(tmp_path), **kw)
+    return r, dev, model
 
 
 def _cannot_answer():
@@ -1912,26 +1935,24 @@ def _cannot_answer():
     return Labeler()
 
 
-def test_three_unverified_taps_in_a_row_are_called_out(fake_env, tmp_path):
+def test_three_unverified_taps_in_a_row_are_called_out(action_env, tmp_path):
     # 有看图的一方但一句都答不出 + 预期对不上文字 → 每一下都是 unknown/unverified；三下之后要明说。
     # 生产默认是 window 视图（config.CONTEXT_MODE），这一条就跑在它上面。
-    r, dev, model = run(fake_env, _UNVERIFIED_SPECS, _UNVERIFIED_TAPS + [_DONE_FAILED], tmp_path,
-                        asker=_cannot_answer())
+    r, dev, model = _run_unverified(action_env, tmp_path, asker=_cannot_answer())
     assert "连续 3 步没有核实" in _text_of(model.seen[3])
     assert "先 observe" in _text_of(model.seen[3]), "补不了看就得让模型自己去看"
 
 
-def test_the_same_call_out_reaches_the_state_view(fake_env, tmp_path):
+def test_the_same_call_out_reaches_the_state_view(action_env, tmp_path):
     """两个视图的模型都要读到这句话（CLAUDE.md §3、§7）：window 走 user_text，state 走【上一步结果】。"""
-    r, dev, model = run(fake_env, _UNVERIFIED_SPECS, _UNVERIFIED_TAPS + [_DONE_FAILED], tmp_path,
-                        asker=_cannot_answer(), run_config=RunConfig(context_mode="state"))
+    r, dev, model = _run_unverified(action_env, tmp_path, asker=_cannot_answer(),
+                                    run_config=RunConfig(context_mode="state"))
     assert "连续 3 步没有核实" in _text_of(model.seen[3])
 
 
-def test_the_call_out_does_not_end_the_task_or_burn_a_step(fake_env, tmp_path):
+def test_the_call_out_does_not_end_the_task_or_burn_a_step(action_env, tmp_path):
     """它只是一句话（补不了看的时候）：不改结束原因、不多记一步、不碰恢复阶梯。"""
-    r, dev, model = run(fake_env, _UNVERIFIED_SPECS, _UNVERIFIED_TAPS + [_DONE_FAILED], tmp_path,
-                        asker=_cannot_answer())
+    r, dev, model = _run_unverified(action_env, tmp_path, asker=_cannot_answer())
     assert r.end_reason == "done_failed" and r.steps == 4, r.error
     assert not [s for s in _steps(r.run_dir) if s.get("by") == "program"]
 

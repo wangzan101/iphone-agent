@@ -231,14 +231,22 @@ def test_after_the_no_progress_fallback_the_state_view_drops_the_old_transition(
 # ⚠ 2026-09-18 现场 一次真机运行的第 12 步：点歪进了微博登录页，没写 expect → 没人核对 →
 #   「变了且是新画面」→ 计数清零。连续几步都这样，程序补看一次全屏并明说给模型。
 #   这份额度和另两种触发共用「每任务至多一次」。
-UNVERIFIED_SPECS = [["a"]] * 3 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6
+# ⚠ 2026-09-27：原来靠「3 帧 a + 6 帧 b + 6 帧 c + 6 帧 d（+ 80 帧 e）」扛住 settle 轮询消耗几帧——
+#   steady_settle_clock 落地后轮询次数不再看机器快慢，这堆帧数跟着对不上了（public CI 上挂了）。
+#   改用 action_env/ActionDrivenDevice：页面只随真正执行的 tap 切换，跟 settle 转几圈无关；
+#   到了 d 之后没再列的 tap 转移就停在 d 上不动（画面不变），三条用例共用同一张状态图。
+UNVERIFIED_PAGES = [["a"], ["b"], ["c"], ["d"]]
+UNVERIFIED_MOVES = {(0, "tap"): 1, (1, "tap"): 2, (2, "tap"): 3}
 UNVERIFIED_TAPS = [[("tap", {"x": 100 + i, "y": 65})] for i in range(3)]
 
 
-def test_three_unverified_steps_buy_one_full_screen_look(fake_env, tmp_path):
+def test_three_unverified_steps_buy_one_full_screen_look(action_env, tmp_path):
     """有看图的一方、但它一句都没问成（CountingAsker）→ 每步 unknown/unverified，第三步兜底补看。"""
-    r, dev, per, m = run_with(fake_env, UNVERIFIED_SPECS, UNVERIFIED_TAPS + [FAILED], tmp_path,
-                              asker=CountingAsker())
+    dev, per, _ = action_env(UNVERIFIED_PAGES, UNVERIFIED_MOVES)
+    per.asker = CountingAsker()
+    m = ScriptedModel(UNVERIFIED_TAPS + [FAILED])
+    r = run_task("t", dev, per, m, tmp_path, run_config=RunConfig(screen_parse="on_demand"),
+                 store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
     assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0, "unverified": 1}
     prog = [x for x in _recs(r) if x.get("by") == "program"]
     assert len(prog) == 1 and prog[0]["fallback"] == {"reason": "unverified"}
@@ -247,27 +255,33 @@ def test_three_unverified_steps_buy_one_full_screen_look(fake_env, tmp_path):
     assert "连续 3 步没有核实" in said and "补看了一次全屏" in said
 
 
-def test_unverified_takes_the_quota_first_and_no_progress_gets_none(fake_env, tmp_path):
+def test_unverified_takes_the_quota_first_and_no_progress_gets_none(action_env, tmp_path):
     """⚠ 2026-09-18（最终评审 I4）：三种触发共用「每任务至多一次」那一份额度，**先到先得**。
 
     「连续没核实」发生在熔断之前，于是它先把额度花掉；之后真的 no_progress → stop 时就没得补看了，
     任务直接以 no_progress 结束。这是**已知取舍**（计划 R6），不是缺陷：没核实那几步正是最需要
     一张完整元素表的时候，而熔断那一刻程序至少还能把「连续几步无进展」的说法交回模型。
     这条用例把这个先后顺序钉死，免得以后有人「顺手」把熔断排到前面而没人发现。"""
-    specs = [["a"]] * 3 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6 + [["e"]] * 80
-    r, dev, per, m = run_with(fake_env, specs, UNVERIFIED_TAPS + TAPS, tmp_path, asker=CountingAsker())
+    dev, per, _ = action_env(UNVERIFIED_PAGES, UNVERIFIED_MOVES)
+    per.asker = CountingAsker()
+    m = ScriptedModel(UNVERIFIED_TAPS + TAPS)
+    r = run_task("t", dev, per, m, tmp_path, run_config=RunConfig(screen_parse="on_demand"),
+                 store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
     assert r.end_reason == "no_progress", r.error
     assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 0, "no_progress": 0, "unverified": 1}
     prog = [x for x in _recs(r) if x.get("by") == "program"]
     assert len(prog) == 1 and prog[0]["fallback"] == {"reason": "unverified"}, "熔断那次没有再补看"
 
 
-def test_a_used_up_quota_leaves_only_the_sentence(fake_env, tmp_path):
+def test_a_used_up_quota_leaves_only_the_sentence(action_env, tmp_path):
     """额度被 done(failed) 先用掉了：只把那句话告诉模型，不再补看（计划 R6）。"""
-    # 头两帧留给 done(failed) 那次兜底（它也要截一帧），后面每一下点击才落到新画面上。
-    specs = [["a"]] * 2 + [["b"]] * 6 + [["c"]] * 6 + [["d"]] * 6 + [["e"]] * 6
-    r, dev, per, m = run_with(fake_env, specs, [FAILED] + UNVERIFIED_TAPS + [FAILED],
-                              tmp_path, asker=CountingAsker())
+    # 第一个 done(failed) 发生在状态 a 上（done 不是设备动作，不消耗转移）；
+    # 后面每一下点击才真的把页面往前翻一格。
+    dev, per, _ = action_env(UNVERIFIED_PAGES, UNVERIFIED_MOVES)
+    per.asker = CountingAsker()
+    m = ScriptedModel([FAILED] + UNVERIFIED_TAPS + [FAILED])
+    r = run_task("t", dev, per, m, tmp_path, run_config=RunConfig(screen_parse="on_demand"),
+                 store=isolated_store(tmp_path), workspace=Workspace(tmp_path))
     assert _meta(r)["perception"]["fallback_by"] == {"done_failed": 1, "no_progress": 0, "unverified": 0}
     # done(failed) 那次兜底是就地改写那条动作记录（不是 by=program 的补看），所以这里一条程序记录都不该有
     assert not [x for x in _recs(r) if x.get("by") == "program"]
